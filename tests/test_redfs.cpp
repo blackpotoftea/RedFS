@@ -1,0 +1,1343 @@
+// RedFS unit tests. No game install required -- every input is synthesized by
+// tests/fixtures.cpp, so these run anywhere and can cover malformed data that no
+// real install would ever produce.
+//
+// Run under ASan (cmake -DREDFS_SANITIZE=address) to turn every parser test into
+// a memory-safety test as well.
+
+#include "framework.hpp"
+#include "fixtures.hpp"
+
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include <windows.h>
+
+#include "redfs.h"
+
+using fixture::ArchiveBuilder;
+using fixture::Cr2wBuilder;
+
+namespace {
+
+std::string temp_path(const char* name) {
+    char buf[512];
+    const char* tmp = std::getenv("TEMP");
+    std::snprintf(buf, sizeof buf, "%s\\redfs_test_%s", tmp ? tmp : ".", name);
+    return buf;
+}
+
+// Opens a depot over a single synthetic archive written to disk.
+struct TempDepot {
+    std::string path;
+    redfs_depot* depot = nullptr;
+
+    TempDepot(const char* name, const std::vector<uint8_t>& archive_bytes) {
+        path = temp_path(name);
+        ArchiveBuilder::write(path, archive_bytes);
+        // Mount by hand: depot_open expects a full install layout.
+        redfs_depot_open_empty(&depot);
+        if (depot) redfs_depot_mount(depot, path.c_str());
+    }
+    ~TempDepot() {
+        if (depot) redfs_depot_close(depot);
+        std::remove(path.c_str());
+    }
+};
+
+}  // namespace
+
+// =============================================================================
+// hashing
+// =============================================================================
+
+TEST(hash, fnv_vectors) {
+    // Canonical FNV-1a 64 vectors -- an external oracle, not our expectations.
+    CHECK_EQ(redfs_hash("a"), 0xaf63dc4c8601ec8cull);
+    CHECK_EQ(redfs_hash("foobar"), 0x85944171f73967e8ull);
+    CHECK_EQ(redfs_hash("hello"), 0xa430d84680aabd0bull);
+    CHECK_EQ(redfs_hash("127.0.0.1"), 0xaabafe7104d914beull);
+    CHECK_EQ(redfs_hash("feedfacedeadbeef"), 0xcac54572bb1a6fc8ull);
+}
+
+TEST(hash, normalisation) {
+    const uint64_t want = redfs_hash("base\\icon\\foo.xbm");
+    CHECK_EQ(redfs_hash("Base/Icon/Foo.XBM"), want);       // case + separators
+    CHECK_EQ(redfs_hash("base//icon\\\\foo.xbm"), want);   // repeated separators
+    CHECK_EQ(redfs_hash("  base\\icon\\foo.xbm  "), want); // surrounding space
+    CHECK_EQ(redfs_hash("\"base/icon/foo.xbm\""), want);   // quotes
+    CHECK_EQ(redfs_hash("/base/icon/foo.xbm"), want);      // leading separator
+}
+
+TEST(hash, edge_cases) {
+    CHECK_EQ(redfs_hash(nullptr), 0ull);
+    CHECK_EQ(redfs_hash(""), 0ull);
+    CHECK_EQ(redfs_hash("///"), 0ull);  // normalises to empty
+}
+
+TEST(hash, decimal_round_trip) {
+    char buf[REDFS_HASH_STRING_MAX];
+    const size_t n = redfs_hash_string("base\\icon\\foo.xbm", buf, sizeof buf);
+    CHECK(n > 0 && n < REDFS_HASH_STRING_MAX);
+    CHECK_EQ(redfs_hash_parse(buf), redfs_hash("base\\icon\\foo.xbm"));
+
+    // A hash with the high bit set must survive the text round trip; this is the
+    // case a double would silently mangle.
+    char small[4];
+    CHECK_EQ(redfs_hash_string("base\\icon\\foo.xbm", small, sizeof small), 0u);  // no room
+}
+
+// =============================================================================
+// archive container
+// =============================================================================
+
+TEST(archive, roundtrip_single_file) {
+    const std::vector<uint8_t> payload = {'h', 'e', 'l', 'l', 'o', ' ', 'r', 'e', 'd'};
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\test\\file.bin");
+    ab.add(key, payload);
+
+    TempDepot d("archive_single.archive", ab.build());
+    CHECK(d.depot != nullptr);
+    if (!d.depot) return;
+
+    CHECK_EQ(redfs_depot_file_count(d.depot), 1ull);
+    CHECK_EQ(redfs_exists(d.depot, key), 1);
+    CHECK_EQ(redfs_exists(d.depot, key ^ 1), 0);
+
+    redfs_file_info info{};
+    CHECK_OK(redfs_stat(d.depot, key, &info));
+    CHECK_EQ(info.size, payload.size());
+    CHECK_EQ(info.buffer_count, 0u);
+
+    redfs_blob blob{};
+    CHECK_OK(redfs_read(d.depot, key, REDFS_PART_ALL, &blob));
+    CHECK_EQ(blob.size, payload.size());
+    CHECK(blob.data && std::memcmp(blob.data, payload.data(), payload.size()) == 0);
+    redfs_blob_free(&blob);
+    CHECK(blob.data == nullptr);  // free must clear the struct
+}
+
+TEST(archive, buffers_are_separate_parts) {
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\test\\multi.bin");
+    ab.add(key, {'M', 'A', 'I', 'N'}, {{'B', '0'}, {'B', 'U', 'F', '1', '!'}});
+
+    TempDepot d("archive_multi.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_file_info info{};
+    CHECK_OK(redfs_stat(d.depot, key, &info));
+    CHECK_EQ(info.buffer_count, 2u);
+    CHECK_EQ(info.size, 4u + 2u + 5u);
+
+    redfs_blob main{}, b0{}, b1{}, all{};
+    CHECK_OK(redfs_read(d.depot, key, REDFS_PART_MAIN, &main));
+    CHECK_EQ(main.size, 4u);
+    CHECK_OK(redfs_read(d.depot, key, 0, &b0));
+    CHECK_EQ(b0.size, 2u);
+    CHECK_OK(redfs_read(d.depot, key, 1, &b1));
+    CHECK_EQ(b1.size, 5u);
+    CHECK_OK(redfs_read(d.depot, key, REDFS_PART_ALL, &all));
+    CHECK_EQ(all.size, 11u);
+
+    // PART_ALL must be the concatenation, in order.
+    CHECK(std::memcmp(all.data, "MAINB0BUF1!", 11) == 0);
+
+    // Out-of-range buffer index is an error, not a crash.
+    redfs_blob oops{};
+    CHECK_ERR(redfs_read(d.depot, key, 7, &oops), REDFS_E_RANGE);
+
+    redfs_blob_free(&main);
+    redfs_blob_free(&b0);
+    redfs_blob_free(&b1);
+    redfs_blob_free(&all);
+}
+
+TEST(archive, missing_file_reports_not_found) {
+    ArchiveBuilder ab;
+    ab.add(redfs_hash("base\\a.bin"), {'a'});
+    TempDepot d("archive_missing.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_file_info info{};
+    CHECK_ERR(redfs_stat(d.depot, redfs_hash("base\\nope.bin"), &info), REDFS_E_NOT_FOUND);
+    redfs_blob blob{};
+    CHECK_ERR(redfs_read(d.depot, redfs_hash("base\\nope.bin"), REDFS_PART_ALL, &blob),
+              REDFS_E_NOT_FOUND);
+    CHECK(blob.data == nullptr);  // nothing allocated on the failure path
+}
+
+TEST(archive, read_into_reports_required_size) {
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\sized.bin");
+    ab.add(key, std::vector<uint8_t>(100, 0xAB));
+    TempDepot d("archive_sized.archive", ab.build());
+    if (!d.depot) return;
+
+    uint8_t small[10];
+    uint64_t written = 0;
+    CHECK_ERR(redfs_read_into(d.depot, key, REDFS_PART_ALL, small, sizeof small, &written),
+              REDFS_E_RANGE);
+    CHECK_EQ(written, 100ull);  // required size still reported
+
+    std::vector<uint8_t> big(100);
+    CHECK_OK(redfs_read_into(d.depot, key, REDFS_PART_ALL, big.data(), big.size(), &written));
+    CHECK_EQ(written, 100ull);
+    CHECK_EQ(big[0], 0xABu);
+    CHECK_EQ(big[99], 0xABu);
+}
+
+TEST(archive, mount_order_decides_overrides) {
+    const uint64_t key = redfs_hash("base\\contested.bin");
+
+    ArchiveBuilder first, second;
+    first.add(key, {'O', 'L', 'D'});
+    second.add(key, {'N', 'E', 'W'});
+
+    const std::string p1 = temp_path("override_a.archive");
+    const std::string p2 = temp_path("override_b.archive");
+    ArchiveBuilder::write(p1, first.build());
+    ArchiveBuilder::write(p2, second.build());
+
+    redfs_depot* depot = nullptr;
+    redfs_depot_open_empty(&depot);
+    CHECK(depot != nullptr);
+    if (depot) {
+        CHECK_OK(redfs_depot_mount(depot, p1.c_str()));
+        CHECK_OK(redfs_depot_mount(depot, p2.c_str()));
+        CHECK_EQ(redfs_depot_file_count(depot), 1ull);  // deduplicated
+
+        redfs_blob blob{};
+        CHECK_OK(redfs_read(depot, key, REDFS_PART_ALL, &blob));
+        CHECK(blob.size == 3 && std::memcmp(blob.data, "NEW", 3) == 0);  // later wins
+        redfs_blob_free(&blob);
+        redfs_depot_close(depot);
+    }
+    std::remove(p1.c_str());
+    std::remove(p2.c_str());
+}
+
+TEST(archive, rejects_garbage) {
+    const std::string p = temp_path("garbage.archive");
+    ArchiveBuilder::write(p, std::vector<uint8_t>(512, 0x7F));  // no RDAR magic
+
+    redfs_depot* depot = nullptr;
+    redfs_depot_open_empty(&depot);
+    if (depot) {
+        CHECK(redfs_depot_mount(depot, p.c_str()) != REDFS_OK);
+        redfs_depot_close(depot);
+    }
+    std::remove(p.c_str());
+}
+
+TEST(archive, rejects_truncated_index) {
+    ArchiveBuilder ab;
+    ab.add(redfs_hash("base\\a.bin"), {'a'});
+    std::vector<uint8_t> bytes = ab.build();
+    // Claim an index far larger than the file.
+    const uint32_t huge = 0x7FFFFFFF;
+    std::memcpy(bytes.data() + 16, &huge, 4);
+
+    const std::string p = temp_path("truncated.archive");
+    ArchiveBuilder::write(p, bytes);
+    redfs_depot* depot = nullptr;
+    redfs_depot_open_empty(&depot);
+    if (depot) {
+        CHECK(redfs_depot_mount(depot, p.c_str()) != REDFS_OK);
+        redfs_depot_close(depot);
+    }
+    std::remove(p.c_str());
+}
+
+// =============================================================================
+// layering -- the real deployment shape: base archives, mod archives that
+// override the base and each other, and mods that add entirely new files
+// =============================================================================
+
+namespace {
+
+// Mounts a stack of archives in order, cleaning up the files afterwards.
+struct LayeredDepot {
+    std::vector<std::string> paths;
+    redfs_depot* depot = nullptr;
+
+    explicit LayeredDepot(const char* tag) : tag_(tag) {
+        redfs_depot_open_empty(&depot);
+    }
+    ~LayeredDepot() {
+        if (depot) redfs_depot_close(depot);
+        for (const auto& p : paths) std::remove(p.c_str());
+    }
+
+    // Adds one archive on top of the stack. `files` is (depot path, contents).
+    bool push(const std::vector<std::pair<std::string, std::string>>& files) {
+        ArchiveBuilder ab;
+        for (const auto& [path, body] : files)
+            ab.add(redfs_hash(path.c_str()),
+                   std::vector<uint8_t>(body.begin(), body.end()));
+
+        char name[128];
+        std::snprintf(name, sizeof name, "%s_%02zu.archive", tag_, paths.size());
+        const std::string p = temp_path(name);
+        if (!ArchiveBuilder::write(p, ab.build())) return false;
+        paths.push_back(p);
+        return depot && redfs_depot_mount(depot, p.c_str()) == REDFS_OK;
+    }
+
+    // Contents of a file, or "" if absent.
+    std::string read(const std::string& path) const {
+        redfs_blob blob{};
+        if (redfs_read(depot, redfs_hash(path.c_str()), REDFS_PART_ALL, &blob) != REDFS_OK)
+            return {};
+        std::string s(reinterpret_cast<const char*>(blob.data), (size_t)blob.size);
+        redfs_blob_free(const_cast<redfs_blob*>(&blob));
+        return s;
+    }
+
+private:
+    const char* tag_;
+};
+
+}  // namespace
+
+TEST(layering, mods_override_base_and_each_other) {
+    LayeredDepot d("layer");
+    if (!d.depot) return;
+
+    // Base game: three files.
+    CHECK(d.push({{"base\\a.bin", "base-a"},
+                  {"base\\b.bin", "base-b"},
+                  {"base\\c.bin", "base-c"}}));
+
+    // Mod 1: overrides a, adds a brand-new file.
+    CHECK(d.push({{"base\\a.bin", "mod1-a"}, {"base\\new1.bin", "mod1-new"}}));
+
+    // Mod 2: overrides a again (wins, mounted later) and b; adds another new file.
+    CHECK(d.push({{"base\\a.bin", "mod2-a"},
+                  {"base\\b.bin", "mod2-b"},
+                  {"base\\new2.bin", "mod2-new"}}));
+
+    // Last mount wins for every contested path.
+    CHECK_STR(d.read("base\\a.bin").c_str(), "mod2-a");   // base -> mod1 -> mod2
+    CHECK_STR(d.read("base\\b.bin").c_str(), "mod2-b");   // base -> mod2
+    CHECK_STR(d.read("base\\c.bin").c_str(), "base-c");   // untouched
+    // Files a mod introduces are readable like any other.
+    CHECK_STR(d.read("base\\new1.bin").c_str(), "mod1-new");
+    CHECK_STR(d.read("base\\new2.bin").c_str(), "mod2-new");
+
+    // Five distinct paths across three archives: overrides collapse, new files add.
+    CHECK_EQ(redfs_depot_file_count(d.depot), 5ull);
+    CHECK_EQ(redfs_depot_archive_count(d.depot), 3u);
+
+    // stat must report the winning archive, not the first one that had the path.
+    redfs_file_info info{};
+    CHECK_OK(redfs_stat(d.depot, redfs_hash("base\\a.bin"), &info));
+    CHECK_EQ(info.archive_index, 2u);
+}
+
+TEST(layering, many_archives_deep_override_chain) {
+    // The realistic shape: a lot of base archives, a lot of mods, a path that
+    // every single mod overrides. Also checks that mounting scales -- each
+    // archive costs a file handle, a mapping and an index view.
+    constexpr int kBase = 12;
+    constexpr int kMods = 60;
+
+    LayeredDepot d("deep");
+    if (!d.depot) return;
+
+    for (int i = 0; i < kBase; ++i) {
+        std::vector<std::pair<std::string, std::string>> files;
+        for (int f = 0; f < 20; ++f)
+            files.emplace_back("base\\pack" + std::to_string(i) + "\\f" + std::to_string(f),
+                               "base" + std::to_string(i));
+        files.emplace_back("base\\contested.bin", "base" + std::to_string(i));
+        CHECK(d.push(files));
+    }
+
+    for (int m = 0; m < kMods; ++m) {
+        CHECK(d.push({{"base\\contested.bin", "mod" + std::to_string(m)},
+                      {"mod\\added" + std::to_string(m) + ".bin", "new" + std::to_string(m)}}));
+    }
+
+    CHECK_EQ(redfs_depot_archive_count(d.depot), (uint32_t)(kBase + kMods));
+
+    // The last mod mounted owns the contested path, through 71 layers of override.
+    CHECK_STR(d.read("base\\contested.bin").c_str(),
+              ("mod" + std::to_string(kMods - 1)).c_str());
+
+    // Every mod's added file survives, and every base file is still reachable.
+    for (int m = 0; m < kMods; ++m)
+        CHECK_STR(d.read("mod\\added" + std::to_string(m) + ".bin").c_str(),
+                  ("new" + std::to_string(m)).c_str());
+    CHECK_STR(d.read("base\\pack0\\f0").c_str(), "base0");
+    CHECK_STR(d.read("base\\pack11\\f19").c_str(), "base11");
+
+    // kBase*20 base files + 1 contested + kMods added.
+    CHECK_EQ(redfs_depot_file_count(d.depot), (uint64_t)(kBase * 20 + 1 + kMods));
+}
+
+namespace {
+
+// Builds a fake install tree so redfs_depot_open's own scanning can be tested:
+//   <root>/archive/pc/content     base game
+//   <root>/archive/pc/ep1         expansion
+//   <root>/archive/pc/mod         legacy .archive mods
+//   <root>/mods/<name>/archives   REDmod
+struct FakeInstall {
+    std::string root;
+
+    explicit FakeInstall(const char* tag) {
+        root = temp_path(tag);
+        mkdir_p(root);
+        for (const char* sub : {"archive", "archive\\pc", "archive\\pc\\content",
+                                "archive\\pc\\ep1", "archive\\pc\\mod", "mods"})
+            mkdir_p(root + "\\" + sub);
+    }
+    ~FakeInstall() { remove_tree(root); }
+
+    void add(const char* relative_dir, const char* filename,
+             const std::vector<std::pair<std::string, std::string>>& files) {
+        const std::string dir = root + "\\" + relative_dir;
+        mkdir_p(dir);
+        ArchiveBuilder ab;
+        for (const auto& [path, body] : files)
+            ab.add(redfs_hash(path.c_str()),
+                   std::vector<uint8_t>(body.begin(), body.end()));
+        ArchiveBuilder::write(dir + "\\" + filename, ab.build());
+    }
+
+    // CreateDirectory makes exactly one level, so nested paths like
+    // mods\Foo\archives need every ancestor created first.
+    static void mkdir_p(const std::string& p) {
+        for (size_t i = 0; i <= p.size(); ++i) {
+            if (i == p.size() || p[i] == '\\' || p[i] == '/') {
+                if (i == 0) continue;
+                const std::string part = p.substr(0, i);
+                // Skip the drive letter ("C:").
+                if (part.size() == 2 && part[1] == ':') continue;
+                ::CreateDirectoryA(part.c_str(), nullptr);
+            }
+        }
+    }
+
+    static void remove_tree(const std::string& dir) {
+        WIN32_FIND_DATAA fd{};
+        HANDLE h = ::FindFirstFileA((dir + "\\*").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (std::strcmp(fd.cFileName, ".") == 0 || std::strcmp(fd.cFileName, "..") == 0)
+                    continue;
+                const std::string child = dir + "\\" + fd.cFileName;
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                    remove_tree(child);
+                else
+                    ::DeleteFileA(child.c_str());
+            } while (::FindNextFileA(h, &fd));
+            ::FindClose(h);
+        }
+        ::RemoveDirectoryA(dir.c_str());
+    }
+};
+
+std::string read_from(redfs_depot* d, const char* path) {
+    redfs_blob blob{};
+    if (redfs_read(d, redfs_hash(path), REDFS_PART_ALL, &blob) != REDFS_OK) return {};
+    std::string s(reinterpret_cast<const char*>(blob.data), (size_t)blob.size);
+    redfs_blob_free(&blob);
+    return s;
+}
+
+}  // namespace
+
+TEST(layering, install_scan_order_matches_the_game) {
+    // The deployment shape a mod manager produces, and the order the game
+    // resolves it in: content -> ep1 -> REDmod -> legacy mods, later winning.
+    FakeInstall fi("install");
+
+    fi.add("archive\\pc\\content", "basegame_1.archive",
+           {{"base\\shared.bin", "content"}, {"base\\only_base.bin", "base"}});
+    fi.add("archive\\pc\\ep1", "ep1_1.archive",
+           {{"base\\shared.bin", "ep1"}, {"base\\only_ep1.bin", "ep1"}});
+    fi.add("mods\\SomeRedMod\\archives", "redmod.archive",
+           {{"base\\shared.bin", "redmod"}, {"base\\only_redmod.bin", "redmod"}});
+    fi.add("archive\\pc\\mod", "zz_legacy.archive",
+           {{"base\\shared.bin", "legacy"}, {"base\\only_legacy.bin", "legacy"}});
+
+    redfs_depot* d = nullptr;
+    CHECK_OK(redfs_depot_open(fi.root.c_str(), REDFS_SCAN_ALL, &d));
+    if (!d) return;
+
+    CHECK_EQ(redfs_depot_archive_count(d), 4u);
+
+    // Legacy mods sit on top of everything, REDmod above the base game.
+    CHECK_STR(read_from(d, "base\\shared.bin").c_str(), "legacy");
+    // Everything each layer contributes uniquely is still reachable.
+    CHECK_STR(read_from(d, "base\\only_base.bin").c_str(), "base");
+    CHECK_STR(read_from(d, "base\\only_ep1.bin").c_str(), "ep1");
+    CHECK_STR(read_from(d, "base\\only_redmod.bin").c_str(), "redmod");
+    CHECK_STR(read_from(d, "base\\only_legacy.bin").c_str(), "legacy");
+
+    redfs_depot_close(d);
+}
+
+TEST(layering, scan_flags_select_layers) {
+    FakeInstall fi("flags");
+    fi.add("archive\\pc\\content", "basegame_1.archive", {{"base\\shared.bin", "content"}});
+    fi.add("mods\\ARedMod\\archives", "a.archive", {{"base\\shared.bin", "redmod"}});
+    fi.add("archive\\pc\\mod", "zz.archive", {{"base\\shared.bin", "legacy"}});
+
+    // Vanilla only: mods are not consulted at all.
+    redfs_depot* d = nullptr;
+    CHECK_OK(redfs_depot_open(fi.root.c_str(), REDFS_SCAN_CONTENT, &d));
+    if (d) {
+        CHECK_EQ(redfs_depot_archive_count(d), 1u);
+        CHECK_STR(read_from(d, "base\\shared.bin").c_str(), "content");
+        redfs_depot_close(d);
+    }
+
+    // Base + REDmod, but no legacy: REDmod wins.
+    d = nullptr;
+    CHECK_OK(redfs_depot_open(fi.root.c_str(), REDFS_SCAN_CONTENT | REDFS_SCAN_REDMOD, &d));
+    if (d) {
+        CHECK_EQ(redfs_depot_archive_count(d), 2u);
+        CHECK_STR(read_from(d, "base\\shared.bin").c_str(), "redmod");
+        redfs_depot_close(d);
+    }
+}
+
+TEST(layering, redmod_folders_mount_in_name_order) {
+    FakeInstall fi("redmod");
+    fi.add("archive\\pc\\content", "basegame_1.archive", {{"base\\shared.bin", "content"}});
+    fi.add("mods\\AAA_first\\archives", "m.archive", {{"base\\shared.bin", "aaa"}});
+    fi.add("mods\\ZZZ_last\\archives", "m.archive", {{"base\\shared.bin", "zzz"}});
+
+    redfs_depot* d = nullptr;
+    CHECK_OK(redfs_depot_open(fi.root.c_str(), REDFS_SCAN_ALL, &d));
+    if (!d) return;
+    CHECK_EQ(redfs_depot_archive_count(d), 3u);
+    // Folders mount in name order, so the last-named REDmod wins.
+    CHECK_STR(read_from(d, "base\\shared.bin").c_str(), "zzz");
+    redfs_depot_close(d);
+}
+
+TEST(layering, remount_after_adding_a_mod) {
+    // Installing a mod mid-session: mount it on top and the winner changes,
+    // without disturbing anything else.
+    LayeredDepot d("remount");
+    if (!d.depot) return;
+
+    CHECK(d.push({{"base\\x.bin", "original"}, {"base\\y.bin", "keep"}}));
+    CHECK_STR(d.read("base\\x.bin").c_str(), "original");
+
+    CHECK(d.push({{"base\\x.bin", "replaced"}}));
+    CHECK_STR(d.read("base\\x.bin").c_str(), "replaced");
+    CHECK_STR(d.read("base\\y.bin").c_str(), "keep");
+    CHECK_EQ(redfs_depot_file_count(d.depot), 2ull);
+}
+
+// =============================================================================
+// CR2W
+// =============================================================================
+
+namespace {
+// Parses a CR2W blob and hands the handle to a body, cleaning up after.
+template <typename Fn>
+void with_cr2w(const std::vector<uint8_t>& bytes, Fn&& fn) {
+    redfs_cr2w* f = nullptr;
+    const redfs_status st = redfs_cr2w_open(bytes.data(), bytes.size(), &f);
+    if (st != REDFS_OK) {
+        ++test::checks();
+        test::report(__FILE__, __LINE__, "redfs_cr2w_open", redfs_last_error());
+        return;
+    }
+    fn(f);
+    redfs_cr2w_close(f);
+}
+}  // namespace
+
+TEST(cr2w, scalar_values) {
+    Cr2wBuilder b;
+    b.begin_chunk("TestClass");
+    b.prop_bool("flagTrue", true);
+    b.prop_bool("flagFalse", false);
+    b.prop_u8("small", 200);
+    b.prop_u16("medium", 40000);
+    b.prop_u32("large", 3000000000u);
+    b.prop_u64("huge", 0xDEADBEEFCAFEBABEull);
+    b.prop_i32("negative", -12345);
+    b.prop_f32("ratio", 0.5f);
+    b.prop_cname("label", "SomeName");
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        CHECK_STR(redfs_cr2w_root_type(f), "TestClass");
+        CHECK_EQ(redfs_cr2w_chunk_count(f), 1u);
+
+        redfs_value v{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "flagTrue", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_BOOL);
+        CHECK_EQ(v.as.u, 1ull);
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "flagFalse", &v));
+        CHECK_EQ(v.as.u, 0ull);
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "small", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_UINT);
+        CHECK_EQ(v.as.u, 200ull);
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "medium", &v));
+        CHECK_EQ(v.as.u, 40000ull);
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "large", &v));
+        CHECK_EQ(v.as.u, 3000000000ull);
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "huge", &v));
+        CHECK_EQ(v.as.u, 0xDEADBEEFCAFEBABEull);
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "negative", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_INT);
+        CHECK_EQ(v.as.i, -12345ll);
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "ratio", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_FLOAT);
+        CHECK_NEAR(v.as.f, 0.5, 1e-9);
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "label", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_NAME);
+        CHECK_STR(v.as.s, "SomeName");
+    });
+}
+
+TEST(cr2w, enums_decode_as_names) {
+    // The behaviour the texture format mapping depends on: an enum is a
+    // name-table index, so it resolves to its symbolic string, not an ordinal.
+    Cr2wBuilder b;
+    b.begin_chunk("TestClass");
+    b.prop_enum("compression", "ETextureCompression", "TCM_QualityColor");
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        redfs_value v{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "compression", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_NAME);
+        CHECK_STR(v.as.s, "TCM_QualityColor");
+        CHECK_STR(v.type, "ETextureCompression");
+    });
+}
+
+TEST(cr2w, nested_structs_via_dotted_path) {
+    Cr2wBuilder b;
+    b.begin_chunk("Outer");
+    b.begin_struct("header", "HeaderType");
+    b.begin_struct("sizeInfo", "SizeInfo");
+    b.prop_in_u16("width", 1024);
+    b.prop_in_u16("height", 512);
+    b.end_struct();
+    b.prop_in_u32("version", 7);
+    b.end_struct();
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        redfs_value v{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "header.sizeInfo.width", &v));
+        CHECK_EQ(v.as.u, 1024ull);
+        CHECK_OK(redfs_cr2w_get(f, 0, "header.sizeInfo.height", &v));
+        CHECK_EQ(v.as.u, 512ull);
+        CHECK_OK(redfs_cr2w_get(f, 0, "header.version", &v));
+        CHECK_EQ(v.as.u, 7ull);
+
+        // Intermediate node is a struct.
+        CHECK_OK(redfs_cr2w_get(f, 0, "header", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_STRUCT);
+
+        // Paths that do not exist, at each level.
+        CHECK_ERR(redfs_cr2w_get(f, 0, "header.sizeInfo.depth", &v), REDFS_E_NOT_FOUND);
+        CHECK_ERR(redfs_cr2w_get(f, 0, "nope.width", &v), REDFS_E_NOT_FOUND);
+        // Descending through a scalar is not a struct traversal.
+        CHECK_ERR(redfs_cr2w_get(f, 0, "header.version.nope", &v), REDFS_E_NOT_FOUND);
+    });
+}
+
+TEST(cr2w, handles_and_buffers) {
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+    b.prop_handle("blob", "handle:SomeBlob", 1);
+    b.prop_handle("nothing", "handle:SomeBlob", -1);
+    b.prop_deferred_buffer("textureData", 0);
+    b.prop_data_buffer("renderBuffer", 3);
+    b.end_chunk();
+    b.begin_chunk("SomeBlob");
+    b.prop_u32("marker", 42);
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        CHECK_EQ(redfs_cr2w_chunk_count(f), 2u);
+        CHECK_STR(redfs_cr2w_chunk_type(f, 1), "SomeBlob");
+        CHECK_EQ(redfs_cr2w_find_chunk(f, "SomeBlob"), 1);
+        CHECK_EQ(redfs_cr2w_find_chunk(f, "Nonexistent"), -1);
+
+        redfs_value v{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "blob", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_HANDLE);
+        CHECK_EQ(v.as.chunk, 1);
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "nothing", &v));
+        CHECK_EQ(v.as.chunk, -1);  // null handle
+
+        // Both buffer spellings must resolve to a buffer index.
+        CHECK_OK(redfs_cr2w_get(f, 0, "textureData", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_BUFFER);
+        CHECK_EQ(v.as.buffer, 0u);
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "renderBuffer", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_BUFFER);
+        CHECK_EQ(v.as.buffer, 3u);
+
+        // Follow the handle and read through it.
+        CHECK_OK(redfs_cr2w_get(f, 1, "marker", &v));
+        CHECK_EQ(v.as.u, 42ull);
+    });
+}
+
+TEST(cr2w, deferred_buffer_lowercase_spelling) {
+    // Regression: texture resources spell this type with a leading lowercase 's'
+    // while everything else capitalises it. Matching case-sensitively made the
+    // value fall through to the 2-byte enum branch and decode as a name.
+    for (const char* spelling :
+         {"serializationDeferredDataBuffer", "SerializationDeferredDataBuffer"}) {
+        Cr2wBuilder b;
+        b.begin_chunk("Root");
+        b.prop_deferred_buffer("textureData", 2, spelling);
+        b.end_chunk();
+
+        with_cr2w(b.build(), [](redfs_cr2w* f) {
+            redfs_value v{};
+            CHECK_OK(redfs_cr2w_get(f, 0, "textureData", &v));
+            CHECK_EQ((int)v.kind, (int)REDFS_KIND_BUFFER);
+            CHECK_EQ(v.as.buffer, 2u);
+        });
+    }
+}
+
+TEST(cr2w, imports_are_readable) {
+    Cr2wBuilder b;
+    b.import("base\\materials\\thing.mt", "IMaterial");
+    b.import("base\\worlds\\place.mlsetup", "Multilayer_Setup");
+    b.begin_chunk("Root");
+    b.prop_rref("material", "rRef:IMaterial", 1);
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        CHECK_EQ(redfs_cr2w_import_count(f), 2u);
+        CHECK_STR(redfs_cr2w_import_path(f, 0), "base\\materials\\thing.mt");
+        CHECK_STR(redfs_cr2w_import_path(f, 1), "base\\worlds\\place.mlsetup");
+        CHECK_STR(redfs_cr2w_import_type(f, 0), "IMaterial");
+        CHECK_STR(redfs_cr2w_import_path(f, 99), "");  // out of range is empty, not a crash
+
+        // rRef resolves through the import table.
+        redfs_value v{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "material", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_STRING);
+        CHECK_STR(v.as.s, "base\\materials\\thing.mt");
+    });
+}
+
+namespace {
+struct PropCount {
+    int n = 0;
+    std::vector<std::string> names;
+};
+int count_props(const char* name, const redfs_value*, void* user) {
+    auto* c = static_cast<PropCount*>(user);
+    ++c->n;
+    c->names.emplace_back(name);
+    return 1;
+}
+int stop_after_first(const char*, const redfs_value*, void*) { return 0; }
+}  // namespace
+
+TEST(cr2w, walk_enumerates_and_can_stop) {
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+    b.prop_u32("a", 1);
+    b.prop_u32("b", 2);
+    b.prop_u32("c", 3);
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        PropCount c;
+        CHECK_OK(redfs_cr2w_walk(f, 0, nullptr, count_props, &c));
+        CHECK_EQ(c.n, 3);
+        CHECK_STR(c.names[0].c_str(), "a");
+        CHECK_STR(c.names[2].c_str(), "c");
+
+        // Returning 0 must stop the walk.
+        PropCount stopped;
+        CHECK_OK(redfs_cr2w_walk(f, 0, nullptr, stop_after_first, &stopped));
+    });
+}
+
+namespace {
+struct ElemCollect {
+    std::vector<uint64_t> values;
+    std::vector<std::string> names;
+};
+int collect_elems(uint32_t, const redfs_value* v, void* user) {
+    auto* c = static_cast<ElemCollect*>(user);
+    if (v->kind == REDFS_KIND_UINT) c->values.push_back(v->as.u);
+    if (v->kind == REDFS_KIND_NAME) c->names.emplace_back(v->as.s ? v->as.s : "");
+    return 1;
+}
+}  // namespace
+
+TEST(cr2w, arrays_of_fixed_width_elements) {
+    const uint32_t nums[4] = {10, 20, 30, 40};
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+    b.prop_array("numbers", "Uint32", 4, nums, sizeof nums);
+    b.prop_array_cname("materials", {"mat_a", "mat_b", "mat_c"});
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        redfs_value arr{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "numbers", &arr));
+        CHECK_EQ((int)arr.kind, (int)REDFS_KIND_ARRAY);
+        CHECK_EQ(arr.as.u, 4ull);
+
+        ElemCollect c;
+        CHECK_OK(redfs_cr2w_walk_array(f, &arr, collect_elems, &c));
+        CHECK_EQ(c.values.size(), 4u);
+        if (c.values.size() == 4) {
+            CHECK_EQ(c.values[0], 10ull);
+            CHECK_EQ(c.values[3], 40ull);
+        }
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "materials", &arr));
+        CHECK_EQ(arr.as.u, 3ull);
+        ElemCollect m;
+        CHECK_OK(redfs_cr2w_walk_array(f, &arr, collect_elems, &m));
+        CHECK_EQ(m.names.size(), 3u);
+        if (m.names.size() == 3) CHECK_STR(m.names[1].c_str(), "mat_b");
+    });
+}
+
+TEST(cr2w, rejects_malformed) {
+    redfs_cr2w* f = nullptr;
+
+    // Too small to hold a header.
+    const uint8_t tiny[8] = {};
+    CHECK_ERR(redfs_cr2w_open(tiny, sizeof tiny, &f), REDFS_E_CORRUPT);
+
+    // Right size, wrong magic.
+    std::vector<uint8_t> bad(0x200, 0);
+    CHECK_ERR(redfs_cr2w_open(bad.data(), bad.size(), &f), REDFS_E_CORRUPT);
+
+    // Correct magic, unsupported version.
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+    b.prop_u32("x", 1);
+    b.end_chunk();
+    auto bytes = b.build(42);  // below the 163 floor
+    CHECK_ERR(redfs_cr2w_open(bytes.data(), bytes.size(), &f), REDFS_E_UNSUPPORTED);
+
+    // Valid header, string table claiming to run past the end.
+    auto truncated = b.build();
+    const uint32_t huge = 0x7000000;
+    std::memcpy(truncated.data() + 0x28 + 4, &huge, 4);  // table[0].item_count
+    CHECK_ERR(redfs_cr2w_open(truncated.data(), truncated.size(), &f), REDFS_E_CORRUPT);
+}
+
+TEST(cr2w, chunk_index_out_of_range) {
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+    b.prop_u32("x", 1);
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        redfs_value v{};
+        CHECK_ERR(redfs_cr2w_get(f, 99, "x", &v), REDFS_E_RANGE);
+        CHECK_STR(redfs_cr2w_chunk_type(f, 99), "");
+    });
+}
+
+// =============================================================================
+// typed helpers
+// =============================================================================
+
+TEST(texture, descriptor_and_format_mapping) {
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\test\\tex.xbm");
+    // 64x64 BC7_UNORM_SRGB, 7 mips: 16+4+1+1+1+1+1 blocks... computed below.
+    const auto cr2w = fixture::make_texture_cr2w(64, 64, 7, "TCM_QualityColor", "TRF_TrueColor",
+                                                 /*gamma=*/true);
+    // BC7: 16 bytes per 4x4 block. 64x64 -> 16x16 blocks.
+    uint32_t bytes = 0;
+    for (uint32_t m = 0; m < 7; ++m) {
+        const uint32_t w = (64u >> m) ? (64u >> m) : 1u;
+        const uint32_t h = (64u >> m) ? (64u >> m) : 1u;
+        bytes += ((w + 3) / 4) * ((h + 3) / 4) * 16;
+    }
+    ab.add(key, cr2w, {std::vector<uint8_t>(bytes, 0x11)});
+
+    TempDepot d("tex.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_texture_desc t{};
+    CHECK_OK(redfs_texture_desc_of(d.depot, key, &t));
+    CHECK_EQ(t.width, 64u);
+    CHECK_EQ(t.height, 64u);
+    CHECK_EQ(t.mip_count, 7u);
+    CHECK_EQ(t.dxgi_format, 99u);  // BC7_UNORM_SRGB
+    CHECK_EQ(t.data_size, (uint64_t)bytes);
+
+    // A DDS must carry the magic, the 148-byte header, and the whole payload.
+    redfs_blob dds{};
+    CHECK_OK(redfs_texture_read_dds(d.depot, key, &dds));
+    CHECK_EQ(dds.size, 148ull + bytes);
+    CHECK(dds.data && std::memcmp(dds.data, "DDS ", 4) == 0);
+    uint32_t dxgi = 0;
+    if (dds.data) std::memcpy(&dxgi, dds.data + 128, 4);  // DXT10 header
+    CHECK_EQ(dxgi, 99u);
+    redfs_blob_free(&dds);
+}
+
+TEST(texture, rejects_non_texture) {
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\test\\notatexture.mesh");
+    ab.add(key, fixture::make_mesh_cr2w(2, 4, 1.0f, 0.0f),
+           {fixture::make_mesh_geometry(2, 4)});
+
+    TempDepot d("nottex.archive", ab.build());
+    if (!d.depot) return;
+
+    // Regression: this used to describe the mesh's first embedded texture blob
+    // and read `setup` off CMesh, silently reporting the fallback format.
+    redfs_texture_desc t{};
+    CHECK_ERR(redfs_texture_desc_of(d.depot, key, &t), REDFS_E_UNSUPPORTED);
+}
+
+TEST(mesh, chunks_bounds_and_appearances) {
+    const uint32_t chunks = 4, verts = 8;
+    const float scale = 10.0f, offset = 0.0f;
+
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\test\\thing.mesh");
+    ab.add(key, fixture::make_mesh_cr2w(chunks, verts, scale, offset),
+           {fixture::make_mesh_geometry(chunks, verts)});
+
+    TempDepot d("mesh.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_mesh* m = nullptr;
+    CHECK_OK(redfs_mesh_open(d.depot, key, &m));
+    if (!m) return;
+
+    CHECK_EQ(redfs_mesh_chunk_count(m), chunks);
+    CHECK_EQ(redfs_mesh_appearance_count(m), 1u);
+    CHECK_STR(redfs_mesh_appearance_name(m, 0), "default");
+    CHECK_EQ(redfs_mesh_find_appearance(m, "default"), 0);
+    CHECK_EQ(redfs_mesh_find_appearance(m, "nope"), -1);
+    CHECK_STR(redfs_mesh_chunk_material(m, 0, 2), "mat_2");
+    CHECK_STR(redfs_mesh_chunk_material(m, 0, 99), "");  // out of range is empty
+
+    // The fixture places each chunk in its own z band, ascending, so bounds must
+    // come out ordered and disjoint. This is the real assertion: it exercises
+    // stride, offset and dequantization together.
+    float prev_max = -1e30f;
+    for (uint32_t i = 0; i < chunks; ++i) {
+        const redfs_mesh_chunk* c = redfs_mesh_chunk_at(m, i);
+        CHECK(c != nullptr);
+        if (!c) continue;
+        CHECK_EQ(c->index, i);
+        CHECK_EQ(c->vertex_count, verts);
+        CHECK_EQ(c->lod, 1u);
+        CHECK(c->bbox_min[2] <= c->bbox_max[2]);
+        CHECK(c->bbox_min[2] >= prev_max);  // ascending, non-overlapping bands
+        prev_max = c->bbox_max[2];
+        // x is driven to the quantization extremes, so it must span the scale.
+        CHECK_NEAR(c->bbox_min[0], -scale + offset, 0.01);
+        CHECK_NEAR(c->bbox_max[0], scale + offset, 0.01);
+    }
+
+    CHECK(redfs_mesh_chunk_at(m, 999) == nullptr);
+    redfs_mesh_close(m);
+}
+
+TEST(mesh, rejects_non_mesh) {
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\test\\tex.xbm");
+    ab.add(key, fixture::make_texture_cr2w(8, 8, 1, "TCM_None", "TRF_TrueColor", false),
+           {std::vector<uint8_t>(256, 0)});
+
+    TempDepot d("notmesh.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_mesh* m = nullptr;
+    CHECK_ERR(redfs_mesh_open(d.depot, key, &m), REDFS_E_UNSUPPORTED);
+    CHECK(m == nullptr);
+}
+
+// =============================================================================
+// audio (.wem)
+// =============================================================================
+
+namespace {
+
+// A RIFF/WAVE file shaped like Wwise's: fmt, an out-of-spec chunk, then data.
+std::vector<uint8_t> make_wem(uint16_t format_tag, uint16_t channels, uint32_t rate,
+                              uint16_t bits, uint32_t payload_bytes) {
+    fixture::Buf fmt;
+    fmt.u16(format_tag);
+    fmt.u16(channels);
+    fmt.u32(rate);
+    fmt.u32(rate * channels * (bits ? bits / 8 : 1));  // avg bytes/sec
+    fmt.u16(static_cast<uint16_t>(channels * (bits ? bits / 8 : 1)));  // block align
+    fmt.u16(bits);
+    fmt.u16(0);  // cbSize
+
+    fixture::Buf body;
+    body.u32(0x45564157);  // 'WAVE'
+
+    body.u32(0x20746D66);  // 'fmt '
+    body.u32(static_cast<uint32_t>(fmt.size()));
+    body.raw(fmt.bytes.data(), fmt.size());
+
+    // A Wwise-private chunk: the walker must step over it to reach 'data'.
+    body.u32(0x62726F76);  // 'vorb'
+    body.u32(8);
+    body.u64(0);
+
+    body.u32(0x61746164);  // 'data'
+    body.u32(payload_bytes);
+    for (uint32_t i = 0; i < payload_bytes; ++i) body.u8(static_cast<uint8_t>(i));
+
+    fixture::Buf out;
+    out.u32(0x46464952);  // 'RIFF'
+    out.u32(static_cast<uint32_t>(body.size()));
+    out.raw(body.bytes.data(), body.size());
+    return out.bytes;
+}
+
+struct ChunkList {
+    std::vector<std::string> ids;
+};
+int collect_chunk(const char fourcc[4], uint64_t, uint64_t, void* user) {
+    static_cast<ChunkList*>(user)->ids.emplace_back(fourcc, 4);
+    return 1;
+}
+
+}  // namespace
+
+TEST(audio, wem_header_is_parsed) {
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\sound\\voice.wem");
+    ab.add(key, make_wem(0xFFFF, 1, 48000, 0, 512));  // Wwise Vorbis, mono
+    TempDepot d("wem.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_audio_format container = REDFS_AUDIO_UNKNOWN;
+    CHECK_OK(redfs_audio_probe(d.depot, key, &container));
+    CHECK_EQ((int)container, (int)REDFS_AUDIO_WEM);
+
+    redfs_audio_info info{};
+    CHECK_OK(redfs_audio_info_of(d.depot, key, &info));
+    CHECK_EQ((int)info.codec, (int)REDFS_CODEC_VORBIS);
+    CHECK_EQ(info.format_tag, 0xFFFFu);
+    CHECK_EQ(info.channels, 1u);
+    CHECK_EQ(info.sample_rate, 48000u);
+    CHECK_EQ(info.data_size, 512ull);
+    CHECK(info.data_offset > 0);
+    // Vorbis duration is not derivable from the header; reporting a guess would
+    // be worse than reporting nothing.
+    CHECK_EQ((uint64_t)info.duration_seconds, 0ull);
+
+    CHECK_STR(redfs_audio_codec_name(REDFS_CODEC_VORBIS), "Wwise Vorbis");
+}
+
+TEST(audio, pcm_duration_is_derived) {
+    // 16-bit stereo PCM at 44100: the sample count follows from the block size,
+    // so duration is honest here where it is not for compressed codecs.
+    const uint32_t bytes = 44100 * 2 * 2;  // exactly one second
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\sound\\pcm.wem");
+    ab.add(key, make_wem(0x0001, 2, 44100, 16, bytes));
+    TempDepot d("wempcm.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_audio_info info{};
+    CHECK_OK(redfs_audio_info_of(d.depot, key, &info));
+    CHECK_EQ((int)info.codec, (int)REDFS_CODEC_PCM);
+    CHECK_EQ(info.channels, 2u);
+    CHECK_EQ(info.bits_per_sample, 16u);
+    CHECK_EQ(info.total_samples, 44100ull);
+    CHECK_NEAR(info.duration_seconds, 1.0, 1e-6);
+}
+
+TEST(audio, riff_chunks_are_walkable) {
+    // Wwise keeps codec state in non-standard chunks, so a decoder front-end has
+    // to be able to find them.
+    const auto wem = make_wem(0xFFFF, 2, 48000, 0, 64);
+    ChunkList chunks;
+    CHECK_OK(redfs_audio_walk_chunks(wem.data(), wem.size(), collect_chunk, &chunks));
+    CHECK_EQ(chunks.ids.size(), 3u);
+    if (chunks.ids.size() == 3) {
+        CHECK_STR(chunks.ids[0].c_str(), "fmt ");
+        CHECK_STR(chunks.ids[1].c_str(), "vorb");
+        CHECK_STR(chunks.ids[2].c_str(), "data");
+    }
+}
+
+TEST(audio, rejects_malformed_wem) {
+    redfs_audio_info info{};
+    const uint8_t tiny[4] = {'R', 'I', 'F', 'F'};
+    CHECK_ERR(redfs_audio_info_parse(tiny, sizeof tiny, &info), REDFS_E_CORRUPT);
+
+    // Right size, wrong magic.
+    std::vector<uint8_t> junk(64, 0x5A);
+    CHECK_ERR(redfs_audio_info_parse(junk.data(), junk.size(), &info), REDFS_E_CORRUPT);
+
+    // RIFF, but not a WAVE form.
+    auto wem = make_wem(0x0001, 1, 8000, 8, 16);
+    wem[8] = 'X';
+    CHECK_ERR(redfs_audio_info_parse(wem.data(), wem.size(), &info), REDFS_E_UNSUPPORTED);
+
+    // A chunk header that claims more bytes than the file holds must stop the
+    // walk rather than read past the buffer.
+    auto truncated = make_wem(0x0001, 1, 8000, 8, 16);
+    const uint32_t huge = 0x7FFFFFFF;
+    std::memcpy(truncated.data() + 16, &huge, 4);  // fmt chunk size
+    redfs_audio_info_parse(truncated.data(), truncated.size(), &info);  // must not crash
+}
+
+// =============================================================================
+// path dictionary
+// =============================================================================
+
+TEST(paths, reverse_lookup) {
+    ArchiveBuilder ab;
+    const char* p1 = "base\\test\\alpha.mesh";
+    const char* p2 = "base\\test\\beta.xbm";
+    ab.add(redfs_hash(p1), {'a'});
+    ab.add(redfs_hash(p2), {'b'});
+
+    TempDepot d("paths.archive", ab.build());
+    if (!d.depot) return;
+
+    // A plain-text list; one of these lines names a file that is not present.
+    const std::string list = temp_path("paths.txt");
+    {
+        FILE* f = std::fopen(list.c_str(), "wb");
+        std::fprintf(f, "%s\n%s\nbase\\test\\absent.mesh\n", p1, p2);
+        std::fclose(f);
+    }
+
+    uint32_t kept = 0;
+    CHECK_OK(redfs_path_load(d.depot, list.c_str(), &kept));
+    CHECK_EQ(kept, 2u);  // the absent path is filtered out
+
+    CHECK_STR(redfs_path_from_hash(redfs_hash(p1)), p1);
+    CHECK_STR(redfs_path_from_hash(redfs_hash(p2)), p2);
+    CHECK(redfs_path_from_hash(redfs_hash("base\\test\\absent.mesh")) == nullptr);
+    CHECK(redfs_path_from_hash(0xFFFFFFFFFFFFFFFFull) == nullptr);
+
+    std::remove(list.c_str());
+}
+
+TEST(paths, learned_from_imports) {
+    // Reading a file with imports must teach the dictionary those paths.
+    redfs_path_enable();
+
+    Cr2wBuilder b;
+    b.import("base\\learned\\from_import.mt", "IMaterial");
+    b.begin_chunk("Root");
+    b.prop_u32("x", 1);
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w*) {});
+    CHECK_STR(redfs_path_from_hash(redfs_hash("base\\learned\\from_import.mt")),
+              "base\\learned\\from_import.mt");
+}
+
+// =============================================================================
+// API contracts
+// =============================================================================
+
+TEST(api, null_arguments_are_rejected) {
+    // Every entry point must reject nulls rather than dereference them.
+    redfs_depot* d = nullptr;
+    CHECK_ERR(redfs_depot_open(nullptr, REDFS_SCAN_ALL, nullptr), REDFS_E_INVALID_ARG);
+    CHECK_ERR(redfs_depot_mount(nullptr, "x"), REDFS_E_INVALID_ARG);
+    CHECK_ERR(redfs_depot_mount_dir(nullptr, "x", nullptr), REDFS_E_INVALID_ARG);
+
+    redfs_file_info info{};
+    CHECK_ERR(redfs_stat(nullptr, 0, &info), REDFS_E_INVALID_ARG);
+    CHECK_EQ(redfs_exists(nullptr, 0), 0);
+
+    redfs_blob blob{};
+    CHECK_ERR(redfs_read(nullptr, 0, REDFS_PART_ALL, &blob), REDFS_E_INVALID_ARG);
+    CHECK_ERR(redfs_read(d, 0, REDFS_PART_ALL, nullptr), REDFS_E_INVALID_ARG);
+
+    redfs_cr2w* f = nullptr;
+    CHECK_ERR(redfs_cr2w_open(nullptr, 0, &f), REDFS_E_INVALID_ARG);
+
+    redfs_texture_desc t{};
+    CHECK_ERR(redfs_texture_desc_of(nullptr, 0, &t), REDFS_E_INVALID_ARG);
+    redfs_mesh* m = nullptr;
+    CHECK_ERR(redfs_mesh_open(nullptr, 0, &m), REDFS_E_INVALID_ARG);
+
+    // These must tolerate null without crashing.
+    redfs_depot_close(nullptr);
+    redfs_cr2w_close(nullptr);
+    redfs_mesh_close(nullptr);
+    redfs_blob_free(nullptr);
+    CHECK_EQ(redfs_depot_archive_count(nullptr), 0u);
+    CHECK_STR(redfs_depot_archive_path(nullptr, 0), "");
+    CHECK_EQ(redfs_cr2w_chunk_count(nullptr), 0u);
+    CHECK_EQ(redfs_mesh_chunk_count(nullptr), 0u);
+    CHECK(redfs_mesh_chunk_at(nullptr, 0) == nullptr);
+}
+
+TEST(api, double_free_is_safe) {
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\dbl.bin");
+    ab.add(key, {'x', 'y', 'z'});
+    TempDepot d("dbl.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_blob blob{};
+    CHECK_OK(redfs_read(d.depot, key, REDFS_PART_ALL, &blob));
+    redfs_blob_free(&blob);
+    redfs_blob_free(&blob);  // must be a no-op, not a double free
+    CHECK(blob.data == nullptr);
+    CHECK_EQ(blob.size, 0ull);
+}
+
+TEST(api, blob_is_nul_terminated) {
+    // Text payloads should be usable as C strings without copying.
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\text.json");
+    const std::vector<uint8_t> json = {'{', '"', 'a', '"', ':', '1', '}'};
+    ab.add(key, json);
+    TempDepot d("text.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_blob blob{};
+    CHECK_OK(redfs_read(d.depot, key, REDFS_PART_ALL, &blob));
+    CHECK_EQ(blob.size, json.size());
+    CHECK(blob.data && blob.data[blob.size] == 0);
+    redfs_blob_free(&blob);
+}
+
+TEST(api, async_read_and_shutdown) {
+    // The lifecycle a plugin actually follows: queue async work, then shut down
+    // before the DLL can be unloaded. If shutdown did not join the worker, a
+    // FreeLibrary on a statically-linked plugin would unmap running code.
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\async.bin");
+    const std::vector<uint8_t> payload(4096, 0x5A);
+    ab.add(key, payload);
+    TempDepot d("async.archive", ab.build());
+    if (!d.depot) return;
+
+    struct Ctx {
+        redfs_status st = REDFS_E_IO;
+        uint64_t size = 0;
+        int calls = 0;
+    } ctx;
+
+    for (int i = 0; i < 8; ++i) {
+        CHECK_OK(redfs_read_async(d.depot, key, REDFS_PART_ALL,
+                                  [](redfs_status st, redfs_blob b, void* u) {
+                                      auto* c = static_cast<Ctx*>(u);
+                                      c->st = st;
+                                      c->size = b.size;
+                                      ++c->calls;
+                                      redfs_blob_free(&b);
+                                  },
+                                  &ctx));
+    }
+    redfs_drain();
+    CHECK_EQ(ctx.calls, 8);
+    CHECK_EQ((int)ctx.st, (int)REDFS_OK);
+    CHECK_EQ(ctx.size, payload.size());
+
+    // Joins the worker. Must be safe to call twice, and must not wedge.
+    redfs_shutdown();
+    redfs_shutdown();
+
+    // Every callback must have been accounted for -- none left hanging.
+    CHECK_EQ(ctx.calls, 8);
+
+    // Synchronous reads keep working afterwards -- shutdown stops the worker,
+    // it does not invalidate a depot the caller still holds.
+    redfs_blob blob{};
+    CHECK_OK(redfs_read(d.depot, key, REDFS_PART_ALL, &blob));
+    CHECK_EQ(blob.size, payload.size());
+    redfs_blob_free(&blob);
+
+    // Async work posted after shutdown is dropped rather than queued forever.
+    redfs_drain();
+}
+
+TEST(api, shutdown_cancels_queued_work) {
+    // Shutdown must be bounded by the read already in flight, not by however
+    // much the caller queued -- draining a deep queue at game close would look
+    // like a hang. Queued-but-unstarted jobs are reported as cancelled so no
+    // caller is left waiting on a callback that never arrives.
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\bulk.bin");
+    ab.add(key, std::vector<uint8_t>(64 * 1024, 0x33));
+    TempDepot d("bulk.archive", ab.build());
+    if (!d.depot) return;
+
+    struct Ctx {
+        int completed = 0;
+        int cancelled = 0;
+    } ctx;
+
+    auto cb = [](redfs_status st, redfs_blob b, void* u) {
+        auto* c = static_cast<Ctx*>(u);
+        if (st == REDFS_E_CANCELLED)
+            ++c->cancelled;
+        else if (st == REDFS_OK)
+            ++c->completed;
+        redfs_blob_free(&b);
+    };
+
+    constexpr int kJobs = 200;
+    for (int i = 0; i < kJobs; ++i)
+        redfs_read_async(d.depot, key, REDFS_PART_ALL, cb, &ctx);
+
+    redfs_shutdown();
+
+    // The contract: every job resolves exactly once, completed or cancelled, and
+    // no callback is silently dropped. Which side of the split a given job lands
+    // on is timing -- even the in-flight one may abort at a segment boundary
+    // rather than finish, which is the point of the abort token.
+    CHECK_EQ(ctx.completed + ctx.cancelled, kJobs);
+    CHECK(ctx.cancelled > 0);  // the queue was dropped, not drained
+
+    // Shutdown quiesces rather than disables: a later post starts a fresh
+    // worker. That matters when RedFS.dll is shared -- one plugin unloading must
+    // not permanently break async for the others.
+    Ctx after;
+    redfs_read_async(d.depot, key, REDFS_PART_ALL, cb, &after);
+    redfs_drain();
+    CHECK_EQ(after.completed, 1);
+
+    redfs_shutdown();  // leave the suite quiesced for the next test
+}
+
+TEST(api, status_strings_exist) {
+    const redfs_status all[] = {REDFS_OK,          REDFS_E_NOT_FOUND, REDFS_E_IO,
+                                REDFS_E_CORRUPT,   REDFS_E_OODLE,     REDFS_E_INVALID_ARG,
+                                REDFS_E_OOM,       REDFS_E_UNSUPPORTED, REDFS_E_RANGE,
+                                REDFS_E_CANCELLED};
+    for (redfs_status s : all) {
+        const char* str = redfs_status_string(s);
+        CHECK(str != nullptr && str[0] != '\0');
+    }
+    CHECK_EQ(redfs_abi_version(), (uint32_t)REDFS_ABI_VERSION);
+}

@@ -1,0 +1,364 @@
+// Lifecycle and teardown tests.
+//
+// The unit tests cover behaviour inside one process. These cover how RedFS dies:
+// abrupt exit, shutdown while work is in flight, and a real LoadLibrary /
+// FreeLibrary cycle -- which is exactly what RED4ext does to a plugin.
+//
+// Several scenarios are about process teardown, so they cannot run in-process:
+// the harness re-invokes itself as a child and inspects how the child died. A
+// hang is a failure just as much as a crash, so every child is waited on with a
+// timeout.
+//
+//   lifecycle_test              run every scenario
+//   lifecycle_test <scenario>   run one (used for the child processes)
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <chrono>
+#include <string>
+#include <vector>
+
+#include <windows.h>
+
+#include "fixtures.hpp"
+#include "redfs.h"
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+double ms_since(Clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+}
+
+std::string temp_path(const char* name) {
+    char buf[512];
+    const char* tmp = std::getenv("TEMP");
+    std::snprintf(buf, sizeof buf, "%s\\redfs_life_%s", tmp ? tmp : ".", name);
+    return buf;
+}
+
+// An archive holding one file split into many sizeable segments. Many segments
+// is the point: the abort token is checked between them, so this is what proves
+// a long read gives up promptly instead of running to completion.
+std::string make_big_archive(const char* name, uint32_t buffers, uint32_t bytes_each,
+                             uint64_t* out_key) {
+    fixture::ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\big\\payload.bin");
+    std::vector<std::vector<uint8_t>> bufs;
+    for (uint32_t i = 0; i < buffers; ++i)
+        bufs.emplace_back(bytes_each, static_cast<uint8_t>(i));
+    ab.add(key, std::vector<uint8_t>(1024, 0xAA), std::move(bufs));
+
+    const std::string path = temp_path(name);
+    fixture::ArchiveBuilder::write(path, ab.build());
+    *out_key = key;
+    return path;
+}
+
+struct Counters {
+    volatile long completed = 0;
+    volatile long cancelled = 0;
+};
+
+void CALLBACK_count(redfs_status st, redfs_blob b, void* user) {
+    auto* c = static_cast<Counters*>(user);
+    if (st == REDFS_E_CANCELLED)
+        ::InterlockedIncrement(&c->cancelled);
+    else if (st == REDFS_OK)
+        ::InterlockedIncrement(&c->completed);
+    redfs_blob_free(&b);
+}
+
+// --- child scenarios ---------------------------------------------------------
+
+// Queue a lot of large reads and then just return from main, never calling
+// redfs_shutdown. This is the "modder forgot" case. It must not hang and must
+// not crash: at process exit Windows terminates the worker before running
+// DLL_PROCESS_DETACH, and because RedFS never destroys its singletons nothing
+// tries to take a mutex the dead thread was holding.
+int scenario_exit_without_shutdown() {
+    uint64_t key = 0;
+    const std::string path = make_big_archive("exit.archive", 24, 2 * 1024 * 1024, &key);
+
+    redfs_depot* depot = nullptr;
+    if (redfs_depot_open_empty(&depot) != REDFS_OK) return 90;
+    if (redfs_depot_mount(depot, path.c_str()) != REDFS_OK) return 91;
+
+    static Counters counters;
+    for (int i = 0; i < 500; ++i)
+        redfs_read_async(depot, key, REDFS_PART_ALL, CALLBACK_count, &counters);
+
+    // Deliberately no drain, no shutdown, no close. Walk out mid-flight.
+    std::printf("child: exiting with work in flight\n");
+    std::fflush(stdout);
+    return 0;
+}
+
+// The same, but through ExitProcess -- a harder abort than returning from main,
+// because no C++ cleanup runs at all.
+int scenario_abrupt_exit_process() {
+    uint64_t key = 0;
+    const std::string path = make_big_archive("abrupt.archive", 24, 2 * 1024 * 1024, &key);
+
+    redfs_depot* depot = nullptr;
+    if (redfs_depot_open_empty(&depot) != REDFS_OK) return 90;
+    if (redfs_depot_mount(depot, path.c_str()) != REDFS_OK) return 91;
+
+    static Counters counters;
+    for (int i = 0; i < 500; ++i)
+        redfs_read_async(depot, key, REDFS_PART_ALL, CALLBACK_count, &counters);
+
+    std::printf("child: ExitProcess with work in flight\n");
+    std::fflush(stdout);
+    ::ExitProcess(0);
+}
+
+// Shutdown while a deep queue of large reads is running. Prints the latency so
+// the parent can assert it is bounded rather than proportional to the queue.
+int scenario_shutdown_latency() {
+    uint64_t key = 0;
+    // ~96 MB of payload per read, across 48 segments.
+    const std::string path = make_big_archive("latency.archive", 48, 2 * 1024 * 1024, &key);
+
+    redfs_depot* depot = nullptr;
+    if (redfs_depot_open_empty(&depot) != REDFS_OK) return 90;
+    if (redfs_depot_mount(depot, path.c_str()) != REDFS_OK) return 91;
+
+    static Counters counters;
+    constexpr int kJobs = 400;
+    for (int i = 0; i < kJobs; ++i)
+        redfs_read_async(depot, key, REDFS_PART_ALL, CALLBACK_count, &counters);
+
+    // Let the worker actually get into a read before pulling the rug.
+    ::Sleep(20);
+
+    const auto t0 = Clock::now();
+    redfs_shutdown();
+    const double took = ms_since(t0);
+
+    const long done = counters.completed + counters.cancelled;
+    std::printf("child: shutdown took %.1f ms; %ld/%d resolved (%ld done, %ld cancelled)\n", took,
+                done, kJobs, counters.completed, counters.cancelled);
+    std::fflush(stdout);
+
+    redfs_depot_close(depot);
+    std::remove(path.c_str());
+
+    if (done != kJobs) return 80;      // a callback went missing
+    if (took > 2000.0) return 81;      // not bounded -- it drained instead of cancelling
+    return 0;
+}
+
+// The real plugin lifecycle: load the shared library, use it, shut it down,
+// unload it. Repeated, because the failure mode is a thread surviving the
+// unload and faulting later.
+constexpr int kSkipped = 3;
+
+int scenario_dll_load_unload(const char* dll_path) {
+    // Configurations that build only the static library have nothing to load.
+    // That is a skip, not a failure -- reporting it as failure would train
+    // people to ignore this test.
+    if (::GetFileAttributesA(dll_path) == INVALID_FILE_ATTRIBUTES) {
+        std::printf("child: %s not built in this configuration\n", dll_path);
+        return kSkipped;
+    }
+
+    for (int round = 0; round < 3; ++round) {
+        HMODULE mod = ::LoadLibraryA(dll_path);
+        if (!mod) {
+            std::printf("child: LoadLibrary(%s) failed, error %lu\n", dll_path, ::GetLastError());
+            return 92;
+        }
+
+        auto fn_open_empty = reinterpret_cast<redfs_status (*)(redfs_depot**)>(
+            reinterpret_cast<void*>(::GetProcAddress(mod, "redfs_depot_open_empty")));
+        auto fn_mount = reinterpret_cast<redfs_status (*)(redfs_depot*, const char*)>(
+            reinterpret_cast<void*>(::GetProcAddress(mod, "redfs_depot_mount")));
+        auto fn_hash = reinterpret_cast<uint64_t (*)(const char*)>(
+            reinterpret_cast<void*>(::GetProcAddress(mod, "redfs_hash")));
+        auto fn_async = reinterpret_cast<redfs_status (*)(const redfs_depot*, uint64_t, uint32_t,
+                                                          redfs_read_fn, void*)>(
+            reinterpret_cast<void*>(::GetProcAddress(mod, "redfs_read_async")));
+        auto fn_shutdown = reinterpret_cast<void (*)()>(
+            reinterpret_cast<void*>(::GetProcAddress(mod, "redfs_shutdown")));
+        auto fn_close = reinterpret_cast<void (*)(redfs_depot*)>(
+            reinterpret_cast<void*>(::GetProcAddress(mod, "redfs_depot_close")));
+        auto fn_blob_free = reinterpret_cast<void (*)(redfs_blob*)>(
+            reinterpret_cast<void*>(::GetProcAddress(mod, "redfs_blob_free")));
+
+        if (!fn_open_empty || !fn_mount || !fn_hash || !fn_async || !fn_shutdown || !fn_close ||
+            !fn_blob_free) {
+            std::printf("child: missing exports in %s\n", dll_path);
+            return 93;
+        }
+
+        // The archive is built by the statically-linked fixture code, but hashed
+        // by the DLL so the key matches what the DLL's depot will look up.
+        uint64_t key = 0;
+        char name[64];
+        std::snprintf(name, sizeof name, "dll%d.archive", round);
+        const std::string path = make_big_archive(name, 16, 1024 * 1024, &key);
+
+        redfs_depot* depot = nullptr;
+        if (fn_open_empty(&depot) != REDFS_OK) return 94;
+        if (fn_mount(depot, path.c_str()) != REDFS_OK) return 95;
+
+        // The blob is allocated inside the DLL, so it must be released by the
+        // DLL's own redfs_blob_free -- not this module's free(). They happen to
+        // share a CRT here, but relying on that is how cross-module heap bugs
+        // start. The free function travels through the user pointer because a
+        // capturing lambda cannot decay to the C callback type.
+        using FreeFn = void (*)(redfs_blob*);
+        static FreeFn s_free = fn_blob_free;
+        for (int i = 0; i < 200; ++i)
+            fn_async(depot, fn_hash("base\\big\\payload.bin"), REDFS_PART_ALL,
+                     [](redfs_status, redfs_blob b, void* user) {
+                         reinterpret_cast<FreeFn>(user)(&b);
+                     },
+                     reinterpret_cast<void*>(s_free));
+
+        // This is the call under test. Without it, FreeLibrary below unmaps code
+        // the worker is still executing.
+        fn_shutdown();
+        fn_close(depot);
+
+        if (!::FreeLibrary(mod)) {
+            std::printf("child: FreeLibrary failed, error %lu\n", ::GetLastError());
+            return 96;
+        }
+        // If the worker had survived, it would now be running in unmapped memory.
+        // Give it a window to fault before the next round.
+        ::Sleep(30);
+        std::remove(path.c_str());
+        std::printf("child: load/use/shutdown/unload round %d ok\n", round);
+        std::fflush(stdout);
+    }
+    return 0;
+}
+
+// --- parent ------------------------------------------------------------------
+
+struct Result {
+    bool ok;
+    DWORD exit_code;
+    double ms;
+    bool timed_out;
+    std::string output;
+};
+
+Result run_child(const std::string& self, const char* scenario, DWORD timeout_ms) {
+    Result r{false, 0, 0, false, {}};
+
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE read_end = nullptr, write_end = nullptr;
+    if (!::CreatePipe(&read_end, &write_end, &sa, 0)) return r;
+    ::SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
+
+    std::string cmd = "\"" + self + "\" " + scenario;
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = write_end;
+    si.hStdError = write_end;
+    si.hStdInput = ::GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi{};
+
+    const auto t0 = Clock::now();
+    if (!::CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si,
+                          &pi)) {
+        ::CloseHandle(read_end);
+        ::CloseHandle(write_end);
+        return r;
+    }
+    ::CloseHandle(write_end);
+
+    // Drain the pipe while waiting, so a chatty child cannot fill it and block.
+    std::string out;
+    char buf[512];
+    DWORD got = 0;
+    while (::ReadFile(read_end, buf, sizeof buf - 1, &got, nullptr) && got) {
+        buf[got] = 0;
+        out += buf;
+    }
+    ::CloseHandle(read_end);
+
+    const DWORD wait = ::WaitForSingleObject(pi.hProcess, timeout_ms);
+    r.ms = ms_since(t0);
+    r.output = out;
+
+    if (wait == WAIT_TIMEOUT) {
+        r.timed_out = true;
+        ::TerminateProcess(pi.hProcess, 0xDEAD);
+        ::WaitForSingleObject(pi.hProcess, 2000);
+    } else {
+        ::GetExitCodeProcess(pi.hProcess, &r.exit_code);
+        r.ok = (r.exit_code == 0);
+    }
+    ::CloseHandle(pi.hProcess);
+    ::CloseHandle(pi.hThread);
+    return r;
+}
+
+int failures = 0;
+
+void check(const char* name, const Result& r, DWORD budget_ms) {
+    std::printf("%-28s ", name);
+    if (r.timed_out) {
+        std::printf("FAIL  hung (>%lu ms)\n", budget_ms);
+        ++failures;
+    } else if (r.exit_code == 3) {
+        std::printf("skip  %.0f ms\n", r.ms);
+    } else if (!r.ok) {
+        // 0xC0000005 and friends surface here as the exit code.
+        std::printf("FAIL  exit 0x%08lX after %.0f ms\n", r.exit_code, r.ms);
+        ++failures;
+    } else {
+        std::printf("ok    %.0f ms\n", r.ms);
+    }
+    for (const auto& line : std::vector<std::string>{r.output})
+        if (!line.empty()) {
+            std::string indented = "    " + line;
+            for (size_t i = 0; i < indented.size(); ++i)
+                if (indented[i] == '\n' && i + 1 < indented.size())
+                    indented.insert(i + 1, "    "), i += 4;
+            std::printf("%s", indented.c_str());
+            if (indented.back() != '\n') std::printf("\n");
+        }
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    char self_path[MAX_PATH];
+    ::GetModuleFileNameA(nullptr, self_path, MAX_PATH);
+
+    if (argc >= 2) {
+        const char* s = argv[1];
+        if (std::strcmp(s, "exit-without-shutdown") == 0) return scenario_exit_without_shutdown();
+        if (std::strcmp(s, "abrupt-exit") == 0) return scenario_abrupt_exit_process();
+        if (std::strcmp(s, "shutdown-latency") == 0) return scenario_shutdown_latency();
+        if (std::strcmp(s, "dll-unload") == 0) {
+            // RedFS.dll sits next to this executable.
+            std::string dll = self_path;
+            const size_t slash = dll.find_last_of("\\/");
+            dll = dll.substr(0, slash + 1) + "RedFS.dll";
+            return scenario_dll_load_unload(dll.c_str());
+        }
+        std::printf("unknown scenario: %s\n", s);
+        return 2;
+    }
+
+    std::printf("RedFS lifecycle tests\n\n");
+
+    // Each budget is generous next to the expected cost; the point is to catch a
+    // hang, not to benchmark.
+    check("exit without shutdown", run_child(self_path, "exit-without-shutdown", 15000), 15000);
+    check("abrupt ExitProcess", run_child(self_path, "abrupt-exit", 15000), 15000);
+    check("shutdown under load", run_child(self_path, "shutdown-latency", 20000), 20000);
+    check("dll load/unload cycle", run_child(self_path, "dll-unload", 30000), 30000);
+
+    std::printf("\n%s (%d failures)\n", failures ? "LIFECYCLE TESTS FAILED" : "LIFECYCLE TESTS PASSED",
+                failures);
+    return failures ? 1 : 0;
+}
