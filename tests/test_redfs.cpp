@@ -528,6 +528,62 @@ TEST(layering, redmod_folders_mount_in_name_order) {
     redfs_depot_close(d);
 }
 
+TEST(layering, redmod_archives_are_found_in_subfolders) {
+    // mods/<name>/archives is searched RECURSIVELY. RedFS listed only the top
+    // level, so a REDmod that organises its archives into subfolders had them
+    // silently ignored -- the mod simply did not load, with no diagnostic.
+    //
+    // The reference is WolvenKit's ArchiveManager:
+    //   GetFiles(<mod>/archives, "*.archive", SearchOption.AllDirectories)
+    // Only REDmod recurses; archive/pc/mod is TopDirectoryOnly there and here.
+    FakeInstall fi("redmodsub");
+    fi.add("archive\\pc\\content", "basegame_1.archive",
+           {{"base\\shared.bin", "content"}, {"base\\nested_only.bin", "content"}});
+    // Nothing at the top level of this mod's archives folder at all.
+    fi.add("mods\\NestedMod\\archives\\dlc\\deep", "inner.archive",
+           {{"base\\shared.bin", "nested"}, {"base\\nested_only.bin", "nested"}});
+
+    redfs_depot* d = nullptr;
+    CHECK_OK(redfs_depot_open(fi.root.c_str(), REDFS_SCAN_ALL, &d));
+    if (!d) return;
+
+    // Two archives, not one: the nested archive must have been discovered.
+    CHECK_EQ(redfs_depot_archive_count(d), 2u);
+    CHECK_STR(read_from(d, "base\\shared.bin").c_str(), "nested");
+    CHECK_STR(read_from(d, "base\\nested_only.bin").c_str(), "nested");
+    redfs_depot_close(d);
+}
+
+TEST(layering, redmod_orders_nested_archives_by_full_path) {
+    // The sort is over FULL PATHS, then reversed, so a subdirectory interleaves
+    // with the top level by path order rather than being appended after it.
+    //
+    // Picking names that actually distinguish that from a basename sort takes
+    // care. The two orders agree far more often than not -- the discriminating
+    // shape is a top-level name that sorts BEFORE the subdirectory's own name
+    // while its basename sorts AFTER the nested file's:
+    //
+    //   full paths:  archives\m_top.archive  <  archives\sub\a_deep.archive
+    //                ('m' < 's')                 -> reversed: m_top mounts LAST
+    //   basenames:   a_deep.archive          <  m_top.archive
+    //                                            -> reversed: a_deep mounts LAST
+    //
+    // So full-path ordering makes "top" win and basename ordering makes "deep"
+    // win. A first attempt at this test used z_top, where both orders give the
+    // same winner -- it passed against a deliberately wrong sort.
+    FakeInstall fi("redmodorder");
+    fi.add("archive\\pc\\content", "basegame_1.archive", {{"base\\shared.bin", "content"}});
+    fi.add("mods\\OrderMod\\archives", "m_top.archive", {{"base\\shared.bin", "top"}});
+    fi.add("mods\\OrderMod\\archives\\sub", "a_deep.archive", {{"base\\shared.bin", "deep"}});
+
+    redfs_depot* d = nullptr;
+    CHECK_OK(redfs_depot_open(fi.root.c_str(), REDFS_SCAN_ALL, &d));
+    if (!d) return;
+    CHECK_EQ(redfs_depot_archive_count(d), 3u);
+    CHECK_STR(read_from(d, "base\\shared.bin").c_str(), "top");
+    redfs_depot_close(d);
+}
+
 TEST(layering, remount_after_adding_a_mod) {
     // Installing a mod mid-session: mount it on top and the winner changes,
     // without disturbing anything else.

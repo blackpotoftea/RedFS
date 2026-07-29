@@ -104,19 +104,27 @@ bool dir_exists(const std::string& p) {
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-void list_archives(const std::string& dir, std::vector<std::string>* out) {
+// Appends the *.archive files directly in `dir` as full paths, in whatever order
+// the filesystem enumerates them. Callers sort.
+void collect_archives(const std::string& dir, std::vector<std::string>* out) {
     WIN32_FIND_DATAA fd{};
     HANDLE h = ::FindFirstFileA(join(dir, "*.archive").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
-    std::vector<std::string> names;
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        names.push_back(fd.cFileName);
+        out->push_back(join(dir, fd.cFileName));
     } while (::FindNextFileA(h, &fd));
     ::FindClose(h);
+}
+
+void list_archives(const std::string& dir, std::vector<std::string>* out) {
+    std::vector<std::string> found;
+    collect_archives(dir, &found);
     // The game mounts in name order; match it so overrides resolve the same way.
-    std::sort(names.begin(), names.end());
-    for (const auto& n : names) out->push_back(join(dir, n.c_str()));
+    // Sorting full paths is the same as sorting filenames here -- one directory,
+    // one shared prefix -- and it is what the recursive REDmod case needs.
+    std::sort(found.begin(), found.end());
+    out->insert(out->end(), found.begin(), found.end());
 }
 
 void list_subdirs(const std::string& dir, std::vector<std::string>* out) {
@@ -132,12 +140,42 @@ void list_subdirs(const std::string& dir, std::vector<std::string>* out) {
     std::sort(out->begin(), out->end());
 }
 
-// REDmod layout: mods/<name>/archives/*.archive.
+// Appends every *.archive under `dir`, at any depth, as full paths and unsorted.
 //
-// Ordering matches WolvenKit's ArchiveManager, which is the reference for what
-// the game does: mod folders in name order, but the archives *within* one folder
-// sorted then reversed -- so inside a single REDmod the alphabetically-first
-// archive mounts last and therefore wins.
+// Terminates on a junction or symlink loop without a depth counter: each level
+// appends a path component, and FindFirstFileA fails once the path passes
+// MAX_PATH, which also caps recursion depth at roughly 130 frames.
+void collect_archives_recursive(const std::string& dir, std::vector<std::string>* out) {
+    collect_archives(dir, out);
+    std::vector<std::string> subs;
+    list_subdirs(dir, &subs);
+    for (const auto& sub : subs) collect_archives_recursive(join(dir, sub.c_str()), out);
+}
+
+// REDmod layout: mods/<name>/archives, searched RECURSIVELY.
+//
+// Ordering and recursion both match WolvenKit's ArchiveManager, which is the
+// reference for what the game does (Managers/ArchiveManager.cs, the REDmod branch
+// of LoadModsArchives):
+//
+//   GetFiles(<mod>/archives, "*.archive", SearchOption.AllDirectories)
+//   Sort(string.CompareOrdinal)   // full paths, not filenames
+//   Reverse()
+//
+// so inside a single REDmod the ordinally-first path mounts last and wins. Note
+// that a `zz_` prefix therefore LOSES here, the opposite of archive/pc/mod.
+//
+// Two details worth keeping straight:
+//   - Only REDmod recurses. The legacy archive/pc/mod folder is
+//     SearchOption.TopDirectoryOnly in the reference, which is why that path
+//     still uses the flat list_archives.
+//   - The sort is over full paths, so a subdirectory's contents interleave with
+//     the top level by path order rather than being appended after it. Sorting
+//     filenames would give a different mount order for nested archives.
+//
+// We sort the mod folders; the reference relies on Directory.GetDirectories order.
+// In practice NTFS enumerates alphabetically, and being deterministic is worth
+// more than reproducing an unspecified order.
 void list_redmod_archives(const std::string& mods_root, std::vector<std::string>* out) {
     std::vector<std::string> folders;
     list_subdirs(mods_root, &folders);
@@ -146,7 +184,8 @@ void list_redmod_archives(const std::string& mods_root, std::vector<std::string>
         if (!dir_exists(archives_dir)) continue;
 
         std::vector<std::string> found;
-        list_archives(archives_dir, &found);  // already name-sorted
+        collect_archives_recursive(archives_dir, &found);
+        std::sort(found.begin(), found.end());
         std::reverse(found.begin(), found.end());
         out->insert(out->end(), found.begin(), found.end());
     }
@@ -227,7 +266,18 @@ public:
             std::lock_guard<std::mutex> lk(m_);
             if (state_ == State::kQuiescing) return false;
             queue_.push_back(job);
-            ensure_thread();
+            try {
+                ensure_thread();
+            } catch (...) {
+                // Spawning the thread can throw (std::system_error at the OS
+                // thread limit), and the job is already queued at this point. Take
+                // it back out before letting the exception go: the caller will see
+                // a non-OK status, and redfs.h promises that means the callback
+                // never fires -- but an orphaned job would fire it later, once
+                // some other post() succeeds in starting a thread.
+                queue_.pop_back();
+                throw;
+            }
         }
         cv_.notify_one();
         return true;
@@ -508,10 +558,12 @@ int redfs_oodle_available(void) { return oodle::available() ? 1 : 0; }
 
 // --- depot -------------------------------------------------------------------
 
-redfs_status redfs_depot_open(const char* game_dir, uint32_t flags, redfs_depot** out_depot) {
-    if (!out_depot) return REDFS_E_INVALID_ARG;
-    *out_depot = nullptr;
-
+// The depot constructors are the remaining allocating exports, and they allocate
+// a lot: a std::string per archive path, an Archive per file, and reindex()
+// reserves a Ref for every entry across every archive -- 544k on a stock install.
+// Bodies are separated out so REDFS_GUARD can wrap them without re-indenting.
+static redfs_status depot_open_impl(const char* game_dir, uint32_t flags,
+                                   redfs_depot** out_depot) {
     std::string root = game_dir ? game_dir : detect_game_dir();
     if (root.empty()) return fail(REDFS_E_NOT_FOUND, "could not locate the Cyberpunk 2077 install");
     if (!dir_exists(join(root, "archive\\pc")))
@@ -552,8 +604,13 @@ redfs_status redfs_depot_open(const char* game_dir, uint32_t flags, redfs_depot*
     return REDFS_OK;
 }
 
-redfs_status redfs_depot_open_empty(redfs_depot** out_depot) {
+redfs_status redfs_depot_open(const char* game_dir, uint32_t flags, redfs_depot** out_depot) {
     if (!out_depot) return REDFS_E_INVALID_ARG;
+    *out_depot = nullptr;
+    REDFS_GUARD(depot_open_impl(game_dir, flags, out_depot));
+}
+
+static redfs_status depot_open_empty_impl(redfs_depot** out_depot) {
     *out_depot = new redfs_depot();
     // With no game directory to search this can only pick up an already-loaded
     // copy. Not fatal: a compressed read then reports REDFS_E_OODLE rather than
@@ -562,8 +619,13 @@ redfs_status redfs_depot_open_empty(redfs_depot** out_depot) {
     return REDFS_OK;
 }
 
-redfs_status redfs_depot_mount(redfs_depot* depot, const char* archive_path) {
-    if (!depot || !archive_path) return REDFS_E_INVALID_ARG;
+redfs_status redfs_depot_open_empty(redfs_depot** out_depot) {
+    if (!out_depot) return REDFS_E_INVALID_ARG;
+    *out_depot = nullptr;
+    REDFS_GUARD(depot_open_empty_impl(out_depot));
+}
+
+static redfs_status depot_mount_impl(redfs_depot* depot, const char* archive_path) {
     auto* a = new Archive();
     const redfs_status st = a->open(archive_path);
     if (st != REDFS_OK) {
@@ -579,10 +641,13 @@ redfs_status redfs_depot_mount(redfs_depot* depot, const char* archive_path) {
     return REDFS_OK;
 }
 
-redfs_status redfs_depot_mount_dir(redfs_depot* depot, const char* dir, uint32_t* out_mounted) {
-    if (!depot || !dir) return REDFS_E_INVALID_ARG;
-    if (out_mounted) *out_mounted = 0;
+redfs_status redfs_depot_mount(redfs_depot* depot, const char* archive_path) {
+    if (!depot || !archive_path) return REDFS_E_INVALID_ARG;
+    REDFS_GUARD(depot_mount_impl(depot, archive_path));
+}
 
+static redfs_status depot_mount_dir_impl(redfs_depot* depot, const char* dir,
+                                        uint32_t* out_mounted) {
     std::vector<std::string> paths;
     list_archives(dir, &paths);
     if (paths.empty()) return fail(REDFS_E_NOT_FOUND, "no .archive files in %s", dir);
@@ -604,6 +669,12 @@ redfs_status redfs_depot_mount_dir(redfs_depot* depot, const char* dir, uint32_t
     cache_invalidate(depot);  // same reasoning as redfs_depot_mount
     if (out_mounted) *out_mounted = added;
     return REDFS_OK;
+}
+
+redfs_status redfs_depot_mount_dir(redfs_depot* depot, const char* dir, uint32_t* out_mounted) {
+    if (!depot || !dir) return REDFS_E_INVALID_ARG;
+    if (out_mounted) *out_mounted = 0;
+    REDFS_GUARD(depot_mount_dir_impl(depot, dir, out_mounted));
 }
 
 void redfs_depot_close(redfs_depot* depot) {
@@ -719,6 +790,11 @@ redfs_status redfs_enumerate(const redfs_depot* depot, redfs_enum_fn fn, void* u
 }
 
 // --- reading -----------------------------------------------------------------
+//
+// Nothing below here needs REDFS_GUARD. read_part writes into a buffer the caller
+// owns and allocates nothing; blob_alloc uses malloc and reports REDFS_E_OOM
+// rather than throwing; fill_info fills a caller struct. redfs_read_async is the
+// exception -- it queues -- and is guarded at its own definition.
 
 redfs_status redfs_part_size(const redfs_depot* depot, uint64_t hash, uint32_t part,
                              uint64_t* out_size) {
@@ -765,8 +841,12 @@ redfs_status redfs_read_async(const redfs_depot* depot, uint64_t hash, uint32_t 
     // A refusal is reported through the RETURN VALUE, never by invoking the
     // callback here: a callback is exactly where the next read gets queued, so
     // completing it synchronously on refusal recurses until the stack dies.
-    if (!Worker::get().post(Job{depot, hash, part, cb, user})) return REDFS_E_CANCELLED;
-    return REDFS_OK;
+    //
+    // Guarded because post() queues into a deque and may start a thread; it
+    // unqueues on failure, so a throw here still means "never queued, callback
+    // will not fire", which is what the non-OK return tells the caller.
+    REDFS_GUARD(Worker::get().post(Job{depot, hash, part, cb, user}) ? REDFS_OK
+                                                                    : REDFS_E_CANCELLED);
 }
 
 void redfs_drain(void) {

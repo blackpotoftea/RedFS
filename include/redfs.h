@@ -83,6 +83,10 @@ typedef struct redfs_depot redfs_depot;
  * LAST one wins -- which is why modders prefix with zz_. REDmod is the
  * exception: mod folders are taken in name order, but the archives within one
  * folder mount in reverse, so there the alphabetically FIRST one wins.
+ *
+ * REDmod is also the only set searched RECURSIVELY -- mods/<name>/archives and
+ * everything beneath it, ordered by full path. archive/pc/mod is top level only.
+ * Both match the game's own behaviour.
  */
 typedef enum redfs_scan_flags {
     REDFS_SCAN_CONTENT = 1u << 0,  /* archive/pc/content   (base game)          */
