@@ -1083,6 +1083,112 @@ TEST(texture, rejects_non_texture) {
     CHECK_ERR(redfs_texture_desc_of(d.depot, key, &t), REDFS_E_UNSUPPORTED);
 }
 
+namespace {
+
+// Bytes one full mip chain of a BC-compressed surface occupies, computed
+// INDEPENDENTLY of formats.cpp. The point of these checks is that two different
+// derivations of the same number agree; sharing the implementation would make
+// them agree trivially.
+uint64_t bc_chain_bytes(uint32_t w, uint32_t h, uint32_t mips, uint32_t block_bytes) {
+    uint64_t total = 0;
+    for (uint32_t m = 0; m < mips; ++m) {
+        const uint32_t mw = (w >> m) ? (w >> m) : 1u;
+        const uint32_t mh = (h >> m) ? (h >> m) : 1u;
+        total += static_cast<uint64_t>((mw + 3) / 4) * ((mh + 3) / 4) * block_bytes;
+    }
+    return total;
+}
+
+// The DDS we emit, read back the way a loader reads it.
+struct DdsHeader {
+    uint32_t width, height, mips, format, array_size, misc_flags;
+    uint64_t payload;  // bytes after the 148-byte header
+};
+
+DdsHeader parse_dds(const redfs_blob& b) {
+    const uint8_t* p = static_cast<const uint8_t*>(b.data);
+    auto u32 = [p](size_t off) {
+        uint32_t v;
+        std::memcpy(&v, p + off, 4);
+        return v;
+    };
+    DdsHeader d{};
+    d.height = u32(12);      // DDS_HEADER.dwHeight
+    d.width = u32(16);       // dwWidth
+    d.mips = u32(28);        // dwMipMapCount
+    d.format = u32(128);     // DXT10.dxgiFormat
+    d.misc_flags = u32(136); // DXT10.miscFlag
+    d.array_size = u32(140); // DXT10.arraySize
+    d.payload = b.size - 148;
+    return d;
+}
+
+}  // namespace
+
+TEST(texture, emitted_dds_describes_the_payload_it_carries) {
+    // A semantic check rather than a memory-safety one, and the class of check
+    // this suite was missing: the header we WRITE must describe the bytes we
+    // ATTACH. Every existing texture test asserted on redfs_texture_desc, which
+    // is the input to the encoder -- so an encoder bug was invisible.
+    //
+    // 2D first, then a cubemap. The cubemap case is the one that matters: on
+    // disk arraySize counts CUBES and loaders multiply by 6 for
+    // MISC_TEXTURECUBE, so writing the face count there declared 36 faces for a
+    // 6-face payload and every emitted cubemap failed to load. Nothing caught it
+    // because the fixture could not build a cubemap at all.
+    struct Case {
+        const char* name;
+        const char* type;
+        uint32_t slices;
+        uint32_t expect_cube;
+    } cases[] = {
+        {"base\\test\\rt2d.xbm", "TEXTYPE_2D", 1, 0},
+        {"base\\test\\rtcube.xbm", "TEXTYPE_CUBE", 6, 1},
+    };
+
+    for (const Case& c : cases) {
+        const uint32_t w = 64, h = 64, mips = 7;
+        // BC7 -- 16 bytes per 4x4 block.
+        const uint64_t per_surface = bc_chain_bytes(w, h, mips, 16);
+
+        ArchiveBuilder ab;
+        const uint64_t key = redfs_hash(c.name);
+        ab.add(key,
+               fixture::make_texture_cr2w(w, h, mips, "TCM_QualityColor", "TRF_TrueColor", true,
+                                          c.type, c.slices),
+               {std::vector<uint8_t>(static_cast<size_t>(per_surface * c.slices), 0x22)});
+
+        TempDepot d("rt.archive", ab.build());
+        if (!d.depot) return;
+
+        redfs_texture_desc t{};
+        CHECK_OK(redfs_texture_desc_of(d.depot, key, &t));
+        CHECK_EQ(t.is_cubemap, c.expect_cube);
+        CHECK_EQ(t.slice_count, c.slices);
+
+        redfs_blob dds{};
+        CHECK_OK(redfs_texture_read_dds(d.depot, key, &dds));
+        const DdsHeader hdr = parse_dds(dds);
+
+        CHECK_EQ(hdr.width, w);
+        CHECK_EQ(hdr.height, h);
+        CHECK_EQ(hdr.mips, mips);
+        CHECK_EQ(hdr.format, t.dxgi_format);
+        CHECK_EQ(hdr.misc_flags, c.expect_cube ? 0x4u : 0u);
+
+        // The invariant a loader actually applies: arraySize counts cubes, so
+        // multiply it back out and it must equal the surfaces present.
+        const uint64_t declared_faces =
+            static_cast<uint64_t>(hdr.array_size) * (hdr.misc_flags & 0x4 ? 6u : 1u);
+        CHECK_EQ(declared_faces, static_cast<uint64_t>(c.slices));
+
+        // And the header must account for exactly the bytes stapled to it.
+        CHECK_EQ(declared_faces * per_surface, hdr.payload);
+
+        redfs_blob_free(&dds);
+    }
+}
+
 TEST(texture, absurd_mip_count_is_rejected_not_spun_on) {
     // mipCount went from the file straight into a loop bound. 0xFFFFFFFB spun
     // ~3 s per call to mip_chain_bytes and describe_texture makes five of them,
@@ -1520,6 +1626,122 @@ TEST(api, async_read_and_shutdown) {
 
     // Async work posted after shutdown is dropped rather than queued forever.
     redfs_drain();
+}
+
+TEST(mesh, entry_points_agree_about_the_same_facts) {
+    // Two exports describing one file must not disagree. redfs_mesh_desc_of
+    // reported DECLARED array counts straight from the CR2W while
+    // redfs_mesh_chunk_count reported what actually walked -- a caller looping to
+    // one and indexing with the other was the documented pattern.
+    //
+    // Review found that; no test could, because nothing cross-checked two APIs
+    // against each other. This does.
+    const uint32_t chunks = 4, verts = 8;
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\agree.mesh");
+    ab.add(key, fixture::make_mesh_cr2w(chunks, verts, 4.0f, 1.0f),
+           {fixture::make_mesh_geometry(chunks, verts)});
+
+    TempDepot d("agree.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_mesh_desc desc{};
+    CHECK_OK(redfs_mesh_desc_of(d.depot, key, &desc));
+
+    redfs_mesh* m = nullptr;
+    CHECK_OK(redfs_mesh_open(d.depot, key, &m));
+
+    CHECK_EQ(desc.submesh_count, redfs_mesh_chunk_count(m));
+    CHECK_EQ(desc.appearance_count, redfs_mesh_appearance_count(m));
+
+    // Every index the count promises must actually resolve, and one past it
+    // must not -- the bound and the accessor have to come from the same vector.
+    for (uint32_t i = 0; i < redfs_mesh_chunk_count(m); ++i)
+        CHECK(redfs_mesh_chunk_at(m, i) != nullptr);
+    CHECK(redfs_mesh_chunk_at(m, redfs_mesh_chunk_count(m)) == nullptr);
+
+    // Chunk boxes marked valid must sit inside the whole-mesh box, which comes
+    // from a different source entirely (CMesh vs. dequantized vertices).
+    float lo[3], hi[3];
+    redfs_mesh_bounds(m, lo, hi);
+    const float eps = 1e-3f;
+    for (uint32_t i = 0; i < redfs_mesh_chunk_count(m); ++i) {
+        const redfs_mesh_chunk* c = redfs_mesh_chunk_at(m, i);
+        if (!c || !c->bounds_valid) continue;
+        for (int a = 0; a < 3; ++a) {
+            CHECK(c->bbox_min[a] >= lo[a] - eps);
+            CHECK(c->bbox_max[a] <= hi[a] + eps);
+        }
+    }
+    redfs_mesh_close(m);
+}
+
+TEST(api, cache_round_trip_preserves_the_public_view) {
+    // The cache is a second implementation of "what is this mesh", and the only
+    // thing that made it agree with the first was that both were written by the
+    // same person on the same day. Serialize, reload, and compare the PUBLIC
+    // view field by field -- which is what a caller sees, and what the stale-
+    // geometry and lod-clamp defects both corrupted.
+    const uint32_t chunks = 3, verts = 6;
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\roundtrip.mesh");
+    ab.add(key, fixture::make_mesh_cr2w(chunks, verts, 2.5f, -1.0f),
+           {fixture::make_mesh_geometry(chunks, verts)});
+
+    const std::string p = temp_path("roundtrip.archive");
+    const std::string cache_file = temp_path("roundtrip.cache");
+    ArchiveBuilder::write(p, ab.build());
+    std::remove(cache_file.c_str());
+
+    struct Snap {
+        uint32_t lods = 0;
+        std::vector<redfs_mesh_chunk> chunks;
+        std::vector<std::string> materials;
+    };
+    auto capture = [&](Snap* s) {
+        redfs_depot* d = nullptr;
+        redfs_depot_open_empty(&d);
+        if (!d) return false;
+        CHECK_OK(redfs_depot_mount(d, p.c_str()));
+        CHECK_OK(redfs_cache_open(d, cache_file.c_str()));
+        redfs_mesh* m = nullptr;
+        CHECK_OK(redfs_mesh_open(d, key, &m));
+        s->lods = redfs_mesh_lod_count(m);
+        for (uint32_t i = 0; i < redfs_mesh_chunk_count(m); ++i) {
+            s->chunks.push_back(*redfs_mesh_chunk_at(m, i));
+            s->materials.push_back(redfs_mesh_chunk_material(m, 0, i));
+        }
+        redfs_mesh_close(m);
+        CHECK_OK(redfs_cache_flush());
+        redfs_cache_close();
+        redfs_depot_close(d);
+        return true;
+    };
+
+    Snap fresh, cached;
+    if (capture(&fresh) && capture(&cached)) {
+        // Second pass came off disk. Nothing a caller can observe may differ.
+        CHECK_EQ(cached.lods, fresh.lods);
+        CHECK_EQ(cached.chunks.size(), fresh.chunks.size());
+        CHECK_EQ(cached.materials.size(), fresh.materials.size());
+        for (size_t i = 0; i < fresh.chunks.size() && i < cached.chunks.size(); ++i) {
+            const redfs_mesh_chunk& a = fresh.chunks[i];
+            const redfs_mesh_chunk& b = cached.chunks[i];
+            CHECK_EQ(b.index, a.index);
+            CHECK_EQ(b.lod, a.lod);
+            CHECK_EQ(b.vertex_count, a.vertex_count);
+            CHECK_EQ(b.index_count, a.index_count);
+            CHECK_EQ(b.bounds_valid, a.bounds_valid);
+            for (int ax = 0; ax < 3; ++ax) {
+                CHECK_EQ(b.bbox_min[ax], a.bbox_min[ax]);
+                CHECK_EQ(b.bbox_max[ax], a.bbox_max[ax]);
+            }
+        }
+        for (size_t i = 0; i < fresh.materials.size() && i < cached.materials.size(); ++i)
+            CHECK_STR(cached.materials[i].c_str(), fresh.materials[i].c_str());
+    }
+    std::remove(p.c_str());
+    std::remove(cache_file.c_str());
 }
 
 TEST(api, cpp_facade_accepts_named_callables) {

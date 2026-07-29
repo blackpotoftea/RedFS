@@ -254,9 +254,14 @@ private:
 };
 
 // A minimal but structurally complete CBitmapTexture, for the texture path.
+//
+// `texture_type` and `slices` default to a plain 2D surface. Pass "TEXTYPE_CUBE"
+// with slices = 6 to build a cubemap -- the DDS encoding of those differs from
+// the 2D case in ways nothing could test while this was hardcoded.
 std::vector<uint8_t> make_texture_cr2w(uint32_t width, uint32_t height, uint32_t mips,
-                                       const char* compression, const char* raw_format,
-                                       bool gamma);
+                                       const char* compression, const char* raw_format, bool gamma,
+                                       const char* texture_type = "TEXTYPE_2D",
+                                       uint32_t slices = 1);
 
 // A minimal but structurally complete CMesh with `chunks` submeshes.
 std::vector<uint8_t> make_mesh_cr2w(uint32_t chunk_count, uint32_t verts_per_chunk,

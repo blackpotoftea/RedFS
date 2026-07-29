@@ -249,8 +249,8 @@ bool ArchiveBuilder::write(const std::string& path, const std::vector<uint8_t>& 
 // --- higher-level fixtures ---------------------------------------------------
 
 std::vector<uint8_t> make_texture_cr2w(uint32_t width, uint32_t height, uint32_t mips,
-                                       const char* compression, const char* raw_format,
-                                       bool gamma) {
+                                       const char* compression, const char* raw_format, bool gamma,
+                                       const char* texture_type, uint32_t slices) {
     Cr2wBuilder b;
 
     // chunk 0: CBitmapTexture, with setup and a handle to the blob
@@ -286,9 +286,9 @@ std::vector<uint8_t> make_texture_cr2w(uint32_t width, uint32_t height, uint32_t
         b.end_struct();
         b.begin_struct("textureInfo", "rendRenderTextureBlobTextureInfo");
         {
-            const uint16_t type = b.name("TEXTYPE_2D");
+            const uint16_t type = b.name(texture_type);
             b.prop_in("type", "GpuWrapApieTextureType", &type, 2);
-            b.prop_in_u16("sliceCount", 1);
+            b.prop_in_u16("sliceCount", static_cast<uint16_t>(slices));
             // Stock cooks store mipCount as Uint8, but the property's type name
             // travels in the file, so a hostile archive can declare Uint32 and
             // any value that fits. Widen automatically so a test can express

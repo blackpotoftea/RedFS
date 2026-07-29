@@ -245,7 +245,7 @@ int main(int argc, char** argv) {
     // Containment rather than equality: the stored box legitimately includes
     // padding and covers morph/LOD range the resident chunks do not.
 
-    uint32_t meshes = 0, escaped = 0, empty_bounds = 0;
+    uint32_t meshes = 0, escaped = 0, empty_bounds = 0, disagreed = 0;
     for (uint64_t h : c.hashes) {
         if (meshes >= want) break;
 
@@ -255,6 +255,24 @@ int main(int argc, char** argv) {
         float lo[3], hi[3];
         redfs_mesh_bounds(m, lo, hi);
         const uint32_t n = redfs_mesh_chunk_count(m);
+
+        // Cross-check the two APIs that describe the same file against each
+        // other. redfs_mesh_desc_of reads the CR2W only; redfs_mesh_open decodes
+        // the geometry. They arrive at the counts by different routes, so a
+        // disagreement means one of them is wrong -- and for a long time one was,
+        // reporting the array count a file DECLARED rather than the number that
+        // actually walked.
+        redfs_mesh_desc desc{};
+        if (redfs_mesh_desc_of(d, h, &desc) == REDFS_OK) {
+            if (desc.submesh_count != n ||
+                desc.appearance_count != redfs_mesh_appearance_count(m)) {
+                ++disagreed;
+                std::printf("FAIL  0x%016" PRIX64 "  desc says %u chunks / %u appearances, "
+                            "mesh says %u / %u\n",
+                            h, desc.submesh_count, desc.appearance_count, n,
+                            redfs_mesh_appearance_count(m));
+            }
+        }
 
         float ulo[3] = {1e30f, 1e30f, 1e30f}, uhi[3] = {-1e30f, -1e30f, -1e30f};
         uint32_t with_bounds = 0;
@@ -316,7 +334,8 @@ int main(int argc, char** argv) {
     std::printf("\n%u meshes checked\n", meshes);
     std::printf("  %u chunk unions escaping the stored CMesh box\n", escaped);
     std::printf("  %u with no computable bounds (geometry absent)\n", empty_bounds);
+    std::printf("  %u where desc_of and mesh_open disagree about counts\n", disagreed);
 
     redfs_depot_close(d);
-    return (header_mismatch || size_mismatch || escaped) ? 1 : 0;
+    return (header_mismatch || size_mismatch || escaped || disagreed) ? 1 : 0;
 }
