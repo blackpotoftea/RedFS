@@ -1628,6 +1628,182 @@ TEST(api, async_read_and_shutdown) {
     redfs_drain();
 }
 
+TEST(api, out_of_range_part_is_rejected_not_wrapped) {
+    // `part` is a caller-supplied uint32 and reaches `start + 1 + part` with no
+    // validation. In 32-bit that wrapped: for a file whose segments begin at S,
+    // part = 0xFFFFFFFF - S selected segment S - 1, so the caller got ANOTHER
+    // FILE'S bytes back with REDFS_OK where redfs.h promises REDFS_E_RANGE.
+    //
+    // An earlier review round refuted this as unreachable, reasoning from the
+    // cap on a `part` the library derives from CR2W. That bound is real but says
+    // nothing about the four public entry points that take one from the caller.
+    // A host passing a signed -3 through an FFI lands here without trying.
+    // The wrap only reaches a VALID segment when the target index is at or below
+    // start - 2: anything above that either exceeds `end` and is caught anyway,
+    // or collides with REDFS_PART_MAIN / REDFS_PART_ALL, which are consumed
+    // before this branch. So the first file needs enough segments of its own to
+    // push the second file's start up. Getting this wrong makes the test pass
+    // against the broken code -- it did, once.
+    ArchiveBuilder ab;
+    const uint64_t first_key = redfs_hash("base\\wrap\\first.bin");
+    const uint64_t later_key = redfs_hash("base\\wrap\\later.bin");
+    ab.add(first_key, std::vector<uint8_t>(64, 0xA1),
+           {std::vector<uint8_t>(16, 0xA2), std::vector<uint8_t>(16, 0xA3)});  // segments 0,1,2
+    ab.add(later_key, std::vector<uint8_t>(64, 0xB2),
+           {std::vector<uint8_t>(32, 0xC3), std::vector<uint8_t>(32, 0xD4)});  // segments 3,4,5
+
+    TempDepot d("wrap.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_file_info info{};
+    CHECK_OK(redfs_stat(d.depot, later_key, &info));
+    CHECK_EQ(info.buffer_count, 2u);
+
+    // In range: fine.
+    uint64_t sz = 0;
+    CHECK_OK(redfs_part_size(d.depot, later_key, 0, &sz));
+    const uint64_t own_buffer_size = sz;
+
+    // Just past the end: the documented error.
+    CHECK_ERR(redfs_part_size(d.depot, later_key, 2, &sz), REDFS_E_RANGE);
+
+    // start = 3, so part = target - start - 1 wraps onto `target`. These select
+    // segments 0, 1 and 2 -- all belonging to the OTHER file -- and every one of
+    // them used to return REDFS_OK with that file's bytes.
+    for (uint32_t target = 0; target <= 1; ++target) {
+        const uint32_t part = target - 3u - 1u;  // wraps by construction
+        CHECK_ERR(redfs_part_size(d.depot, later_key, part, &sz), REDFS_E_RANGE);
+        redfs_blob b{};
+        CHECK_ERR(redfs_read(d.depot, later_key, part, &b), REDFS_E_RANGE);
+        // Nothing may have been handed back, least of all the other file's data.
+        CHECK(b.data == nullptr);
+        redfs_blob_free(&b);
+    }
+
+    // Sanity: the legitimate read still works and is unaffected by the above.
+    CHECK_OK(redfs_part_size(d.depot, later_key, 0, &sz));
+    CHECK_EQ(sz, own_buffer_size);
+}
+
+TEST(api, a_lying_segment_range_does_not_blow_up_stat_or_enumerate) {
+    // fill_info took an entry's segment range straight from the index and bounded
+    // the LOOP VARIABLE by segment_count rather than rejecting. So an entry
+    // claiming last = 0xFFFFFFFF made one redfs_stat walk every segment in the
+    // archive, and redfs_enumerate did that once per entry -- entry_count x
+    // segment_count iterations, with no allocation and no fault to notice.
+    // buffer_count came from the same unvalidated value and reported ~4.29e9,
+    // which is the bound redfs.h documents for addressing buffers.
+    //
+    // Nothing could test this until ArchiveBuilder could write a range that lies.
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\lying.bin");
+    ab.add(key, std::vector<uint8_t>(128, 0x7E), {std::vector<uint8_t>(64, 0x7F)});
+    ab.segment_range(0, 0, 0xFFFFFFFFu);
+
+    TempDepot d("lying.archive", ab.build());
+    if (!d.depot) return;
+
+    const auto t0 = std::chrono::steady_clock::now();
+
+    redfs_file_info info{};
+    CHECK_OK(redfs_stat(d.depot, key, &info));
+    // Clamped to what the archive actually holds, not what the entry claimed.
+    CHECK(info.buffer_count < 16u);
+
+    uint32_t seen = 0;
+    redfs_enumerate(
+        d.depot,
+        [](const redfs_file_info*, void* u) {
+            ++*static_cast<uint32_t*>(u);
+            return 1;
+        },
+        &seen);
+    CHECK_EQ(seen, 1u);
+
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    CHECK(ms < 1000);
+
+    // And the read path rejects the same entry outright rather than clamping --
+    // a file whose segment range is nonsense has no readable content.
+    redfs_blob b{};
+    CHECK_ERR(redfs_read(d.depot, key, REDFS_PART_MAIN, &b), REDFS_E_CORRUPT);
+    redfs_blob_free(&b);
+}
+
+TEST(mesh, declared_array_counts_are_not_trusted) {
+    // redfs_mesh_desc_of reported the count an array DECLARES; redfs_mesh_chunk_*
+    // reported what could be walked. Two exports, one file, different answers --
+    // and a caller looping to the first and indexing with the second walks off
+    // the end of nothing, spinning four billion times against a null return.
+    //
+    // The fixture could only ever state the truth, so the distinction did not
+    // exist as far as the suite was concerned.
+    const uint32_t chunks = 3, verts = 6;
+    fixture::MeshOverrides ov;
+    ov.declared_chunk_count = 0xFFFFFFFFu;
+    ov.declared_appearance_count = 0xFFFFFFFFu;
+    ov.lod_count = 2;
+    ov.declared_lod_count = 0xFFFFFFFFu;
+
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\liars.mesh");
+    ab.add(key, fixture::make_mesh_cr2w(chunks, verts, 1.0f, 0.0f, ov),
+           {fixture::make_mesh_geometry(chunks, verts)});
+
+    TempDepot d("liars.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_mesh_desc desc{};
+    CHECK_OK(redfs_mesh_desc_of(d.depot, key, &desc));
+    redfs_mesh* m = nullptr;
+    CHECK_OK(redfs_mesh_open(d.depot, key, &m));
+
+    // Neither export may repeat the file's claim.
+    CHECK(desc.submesh_count < 0xFFFFFFFFu);
+    CHECK(desc.appearance_count < 0xFFFFFFFFu);
+    CHECK(redfs_mesh_lod_count(m) < 0xFFFFFFFFu);
+
+    // And they must still agree with each other.
+    CHECK_EQ(desc.submesh_count, redfs_mesh_chunk_count(m));
+    CHECK_EQ(desc.appearance_count, redfs_mesh_appearance_count(m));
+    CHECK_EQ(redfs_mesh_chunk_count(m), chunks);
+
+    redfs_mesh_close(m);
+}
+
+TEST(mesh, an_impossible_position_stride_yields_no_bounds) {
+    // compute_bounds refuses a stride under 6 -- it cannot hold three int16s --
+    // and refuses a span that runs off the geometry buffer. Both guards were
+    // unreachable while the fixture always wrote the stock stride of 8.
+    //
+    // The failure this prevents is a confident box swept from misaligned bytes,
+    // which then gets cached and served forever.
+    for (uint32_t stride : {4u, 0x01000000u}) {
+        fixture::MeshOverrides ov;
+        ov.position_stride = stride;
+
+        ArchiveBuilder ab;
+        const uint64_t key = redfs_hash("base\\stride.mesh");
+        ab.add(key, fixture::make_mesh_cr2w(2, 6, 1.0f, 0.0f, ov),
+               {fixture::make_mesh_geometry(2, 6, 8)});  // real buffer stays stock
+
+        TempDepot d("stride.archive", ab.build());
+        if (!d.depot) return;
+
+        redfs_mesh* m = nullptr;
+        CHECK_OK(redfs_mesh_open(d.depot, key, &m));
+        for (uint32_t i = 0; i < redfs_mesh_chunk_count(m); ++i) {
+            const redfs_mesh_chunk* c = redfs_mesh_chunk_at(m, i);
+            CHECK(c != nullptr);
+            // No box rather than a wrong one, and it says so.
+            if (c) CHECK_EQ(c->bounds_valid, 0u);
+        }
+        redfs_mesh_close(m);
+    }
+}
+
 TEST(mesh, entry_points_agree_about_the_same_facts) {
     // Two exports describing one file must not disagree. redfs_mesh_desc_of
     // reported DECLARED array counts straight from the CR2W while

@@ -8,6 +8,26 @@ namespace fixture {
 
 // --- CR2W --------------------------------------------------------------------
 
+void Cr2wBuilder::prop_in_uint(const std::string& n, uint64_t v, uint32_t min_width,
+                               const std::string& type) {
+    // Narrowest that holds the value, then the caller's floor. Never the other
+    // way round: narrowing here would drop the high bytes of a value a test
+    // chose precisely because it is out of range, and the test would then assert
+    // against a perfectly ordinary number.
+    uint32_t width = v > 0xFFFFFFFFull ? 8 : v > 0xFFFFull ? 4 : v > 0xFFull ? 2 : 1;
+    if (min_width > width) width = min_width;
+    if (width > 8) width = 8;  // a uint64_t has no more bytes to give
+
+    std::string t = type;
+    if (t.empty()) {
+        // No name was asked for, so the width has to be one a Uint* names.
+        if (width == 3) width = 4;
+        if (width > 4) width = 8;
+        t = width == 1 ? "Uint8" : width == 2 ? "Uint16" : width == 4 ? "Uint32" : "Uint64";
+    }
+    prop_in(n, t, &v, width);  // little-endian: the low `width` bytes of v
+}
+
 std::vector<uint8_t> Cr2wBuilder::build(uint32_t version) {
     constexpr size_t kHeaderSize = 0xA0;  // magic + 36-byte header + 10 x 12-byte tables
 
@@ -93,11 +113,18 @@ std::vector<uint8_t> Cr2wBuilder::build(uint32_t version) {
     // chunks: {u16 class, u16 flags, u32 parent, u32 data_size, u32 data_offset,
     //          u32 template, u32 crc}
     for (size_t i = 0; i < chunks_count; ++i) {
+        uint32_t offset = body_offsets[i];
+        uint32_t size = static_cast<uint32_t>(bodies_[i].size());
+        const auto ov = chunk_extents_.find(static_cast<uint32_t>(i));
+        if (ov != chunk_extents_.end()) {
+            offset = ov->second.offset;
+            size = ov->second.size;
+        }
         out.u16(name(chunk_class_[i]));
         out.u16(0);
         out.u32(0);
-        out.u32(static_cast<uint32_t>(bodies_[i].size()));
-        out.u32(body_offsets[i]);
+        out.u32(size);
+        out.u32(offset);
         out.u32(0);
         out.u32(0);
     }
@@ -191,11 +218,20 @@ std::vector<uint8_t> ArchiveBuilder::build() const {
 
     // file entries (56 bytes each)
     for (size_t i = 0; i < files_.size(); ++i) {
+        // The range the entry DECLARES, which is only the range that was written
+        // unless a test said otherwise. The payload above is laid out either way:
+        // a malformed range is a lie told about real segments, which is what the
+        // readers have to survive -- not a file with nothing behind it.
+        const uint32_t first =
+            files_[i].range_declared ? files_[i].range_first : file_ranges[i].first;
+        const uint32_t last =
+            files_[i].range_declared ? files_[i].range_last : file_ranges[i].second;
+
         out.u64(files_[i].hash);
         out.i64(0);  // timestamp
         out.u32(0);  // num_inline_buffer_segments
-        out.u32(file_ranges[i].first);
-        out.u32(file_ranges[i].second);
+        out.u32(first);
+        out.u32(last);
         out.u32(0);  // deps start
         out.u32(0);  // deps end
         uint8_t digest[20];
@@ -250,7 +286,8 @@ bool ArchiveBuilder::write(const std::string& path, const std::vector<uint8_t>& 
 
 std::vector<uint8_t> make_texture_cr2w(uint32_t width, uint32_t height, uint32_t mips,
                                        const char* compression, const char* raw_format, bool gamma,
-                                       const char* texture_type, uint32_t slices) {
+                                       const char* texture_type, uint32_t slices,
+                                       const TextureOverrides& ov) {
     Cr2wBuilder b;
 
     // chunk 0: CBitmapTexture, with setup and a handle to the blob
@@ -269,7 +306,7 @@ std::vector<uint8_t> make_texture_cr2w(uint32_t width, uint32_t height, uint32_t
     b.end_struct();
     b.begin_struct("renderTextureResource", "rendRenderTextureResource");
     {
-        const int32_t handle = 2;  // chunk 1, +1
+        const int32_t handle = ov.blob_chunk + 1;  // 0 means null
         b.prop_in("renderResourceBlobPC", "handle:rendIRenderTextureBlob", &handle, 4);
     }
     b.end_struct();
@@ -281,37 +318,39 @@ std::vector<uint8_t> make_texture_cr2w(uint32_t width, uint32_t height, uint32_t
     {
         b.prop_in_u32("version", 2);
         b.begin_struct("sizeInfo", "rendRenderTextureBlobSizeInfo");
-        b.prop_in_u16("width", static_cast<uint16_t>(width));
-        b.prop_in_u16("height", static_cast<uint16_t>(height));
+        // Uint16 like a stock cook, until the caller passes a dimension that
+        // does not fit one -- which is the whole reason to pass such a
+        // dimension, and it used to arrive as its low 16 bits.
+        b.prop_in_uint("width", width, 2);
+        b.prop_in_uint("height", height, 2);
         b.end_struct();
         b.begin_struct("textureInfo", "rendRenderTextureBlobTextureInfo");
         {
             const uint16_t type = b.name(texture_type);
             b.prop_in("type", "GpuWrapApieTextureType", &type, 2);
-            b.prop_in_u16("sliceCount", static_cast<uint16_t>(slices));
+            b.prop_in_uint("sliceCount", slices, 2);
             // Stock cooks store mipCount as Uint8, but the property's type name
             // travels in the file, so a hostile archive can declare Uint32 and
-            // any value that fits. Widen automatically so a test can express
-            // that without every caller caring.
-            if (mips > 0xFF) {
-                b.prop_in_u32("mipCount", mips);
-            } else {
-                const uint8_t mc = static_cast<uint8_t>(mips);
-                b.prop_in("mipCount", "Uint8", &mc, 1);
-            }
+            // any value that fits.
+            b.prop_in_uint("mipCount", mips, ov.mip_count_width, ov.mip_count_type);
         }
         b.end_struct();
     }
     b.end_struct();
-    b.prop_deferred_buffer("textureData", 0);
+    b.prop_deferred_buffer("textureData", ov.buffer_index);
     b.end_chunk();
 
     return b.build();
 }
 
 std::vector<uint8_t> make_mesh_cr2w(uint32_t chunk_count, uint32_t verts_per_chunk,
-                                    float quant_scale, float quant_offset) {
+                                    float quant_scale, float quant_offset,
+                                    const MeshOverrides& ov) {
     Cr2wBuilder b;
+    // What the arrays declare, which is the truth unless a test overrides it.
+    const uint32_t declared_chunks =
+        ov.declared_chunk_count ? ov.declared_chunk_count : chunk_count;
+    const uint32_t stride = ov.position_stride;
 
     // chunk 0: CMesh
     b.begin_chunk("CMesh");
@@ -331,9 +370,11 @@ std::vector<uint8_t> make_mesh_cr2w(uint32_t chunk_count, uint32_t verts_per_chu
     b.end_struct();
     b.prop_handle("renderResourceBlob", "handle:IRenderResourceBlob", 1);
     {
-        // appearances: one handle, to chunk 2
-        const int32_t app_handle = 3;  // chunk 2, +1
-        b.prop_array("appearances", "handle:meshMeshAppearance", 1, &app_handle, 4);
+        // appearances: one handle, to chunk 2 unless a test aims it elsewhere
+        const int32_t app_handle = ov.appearance_chunk + 1;  // 0 means null
+        b.prop_array("appearances", "handle:meshMeshAppearance",
+                     ov.declared_appearance_count ? ov.declared_appearance_count : 1, &app_handle,
+                     4);
     }
     b.end_chunk();
 
@@ -352,14 +393,15 @@ std::vector<uint8_t> make_mesh_cr2w(uint32_t chunk_count, uint32_t verts_per_chu
         b.prop_in_f32("Y", quant_offset);
         b.prop_in_f32("Z", quant_offset);
         b.end_struct();
-        b.prop_in_u32("vertexBufferSize", chunk_count * verts_per_chunk * 8);
+        b.prop_in_u32("vertexBufferSize", chunk_count * verts_per_chunk * stride);
         b.prop_in_u32("indexBufferSize", 0);
-        b.prop_in_u32("indexBufferOffset", chunk_count * verts_per_chunk * 8);
+        b.prop_in_u32("indexBufferOffset", chunk_count * verts_per_chunk * stride);
 
         // renderChunkInfos: an array of rendChunk structs, variable width, so it
-        // is assembled by hand rather than through prop_array.
+        // is assembled by hand rather than through prop_array. The count is the
+        // header's claim; the loop below is what is actually there.
         Buf arr;
-        arr.u32(chunk_count);
+        arr.u32(declared_chunks);
         for (uint32_t c = 0; c < chunk_count; ++c) {
             Buf body;
             body.u8(0);
@@ -370,13 +412,24 @@ std::vector<uint8_t> make_mesh_cr2w(uint32_t chunk_count, uint32_t verts_per_chu
                 {  // vertexLayout
                     Buf vl;
                     vl.u8(0);
-                    {  // slotStrides: static:8,Uint8 -- count then 8 bytes
+                    {  // slotStrides: 8 slots, stock cooks type them Uint8
+                        //
+                        // A stride over 255 has no Uint8 to live in, and writing
+                        // its low byte would quietly turn "step the sweep off the
+                        // end of the buffer" into an ordinary stride. The element
+                        // type is part of the array's type name, so widen it.
+                        const bool wide = stride > 0xFF;
                         Buf sv;
-                        sv.u32(8);
-                        sv.u8(8);  // slot 0 stride
-                        for (int k = 1; k < 8; ++k) sv.u8(0);
+                        sv.u32(8);  // slot count, not a byte count
+                        for (int k = 0; k < 8; ++k) {
+                            const uint32_t s = k == 0 ? stride : 0;
+                            if (wide)
+                                sv.u32(s);
+                            else
+                                sv.u8(static_cast<uint8_t>(s));
+                        }
                         vl.u16(b.name("slotStrides"));
-                        vl.u16(b.name("static:8,Uint8"));
+                        vl.u16(b.name(wide ? "static:8,Uint32" : "static:8,Uint8"));
                         vl.u32(static_cast<uint32_t>(sv.size()) + 4);
                         vl.raw(sv.bytes.data(), sv.size());
                     }
@@ -389,7 +442,7 @@ std::vector<uint8_t> make_mesh_cr2w(uint32_t chunk_count, uint32_t verts_per_chu
                 {  // byteOffsets: static:5,Uint32
                     Buf bo;
                     bo.u32(5);
-                    bo.u32(c * verts_per_chunk * 8);  // this chunk's position stream
+                    bo.u32(c * verts_per_chunk * stride);  // this chunk's position stream
                     for (int k = 1; k < 5; ++k) bo.u32(0);
                     cv.u16(b.name("byteOffsets"));
                     cv.u16(b.name("static:5,Uint32"));
@@ -403,11 +456,15 @@ std::vector<uint8_t> make_mesh_cr2w(uint32_t chunk_count, uint32_t verts_per_chu
                 body.raw(cv.bytes.data(), cv.size());
             }
             {
-                const uint16_t nv = static_cast<uint16_t>(verts_per_chunk);
+                // Uint16 as a stock cook writes it, widened when the count does
+                // not fit: a vertex count is a loop bound and a sweep length, so
+                // the out-of-range values are the interesting ones and narrowing
+                // them here would hand the reader an ordinary count instead.
+                const bool wide = verts_per_chunk > 0xFFFF;
                 body.u16(b.name("numVertices"));
-                body.u16(b.name("Uint16"));
-                body.u32(2 + 4);
-                body.raw(&nv, 2);
+                body.u16(b.name(wide ? "Uint32" : "Uint16"));
+                body.u32((wide ? 4 : 2) + 4);
+                body.raw(&verts_per_chunk, wide ? 4 : 2);  // little-endian low bytes
             }
             {
                 const uint32_t ni = verts_per_chunk * 3;
@@ -427,6 +484,20 @@ std::vector<uint8_t> make_mesh_cr2w(uint32_t chunk_count, uint32_t verts_per_chu
             arr.raw(body.bytes.data(), body.size());
         }
         b.prop_in("renderChunkInfos", "array:rendChunk", arr.bytes.data(), arr.size());
+
+        // renderLODs: the LOD switch distances. Omitted by default, because
+        // mesh_build reads a missing array as a single LOD and that is the shape
+        // every existing caller of this builder expects. Present, it is the one
+        // array whose count reaches a caller directly as a LOD count -- so a
+        // header claiming more elements than it carries is the input that
+        // separates "reported what it walked" from "reported what it was told".
+        if (ov.lod_count) {
+            std::vector<float> lods;
+            for (uint32_t i = 0; i < ov.lod_count; ++i) lods.push_back(100.f * (i + 1));
+            b.prop_array("renderLODs", "Float",
+                         ov.declared_lod_count ? ov.declared_lod_count : ov.lod_count, lods.data(),
+                         lods.size() * 4);
+        }
     }
     b.end_struct();
     b.prop_data_buffer("renderBuffer", 0);
@@ -438,16 +509,21 @@ std::vector<uint8_t> make_mesh_cr2w(uint32_t chunk_count, uint32_t verts_per_chu
     {
         std::vector<std::string> mats;
         for (uint32_t c = 0; c < chunk_count; ++c) mats.push_back("mat_" + std::to_string(c));
-        b.prop_array_cname("chunkMaterials", mats);
+        b.prop_array_cname("chunkMaterials", mats,
+                           ov.declared_material_count ? ov.declared_material_count
+                                                      : static_cast<uint32_t>(mats.size()));
     }
     b.end_chunk();
 
     return b.build();
 }
 
-std::vector<uint8_t> make_mesh_geometry(uint32_t chunk_count, uint32_t verts_per_chunk) {
+std::vector<uint8_t> make_mesh_geometry(uint32_t chunk_count, uint32_t verts_per_chunk,
+                                        uint32_t stride) {
     // Stride 8: three int16 positions plus two padding bytes, matching the real
-    // layout observed on shipping meshes.
+    // layout observed on shipping meshes. A caller testing a stride the mesh
+    // header lies about gets exactly the stride it asked for -- including one too
+    // small to hold a position, which is the input, not a mistake to correct.
     Buf out;
     for (uint32_t c = 0; c < chunk_count; ++c) {
         for (uint32_t v = 0; v < verts_per_chunk; ++v) {
@@ -458,10 +534,12 @@ std::vector<uint8_t> make_mesh_geometry(uint32_t chunk_count, uint32_t verts_per
             const int16_t lo = static_cast<int16_t>(-span + (2 * span / chunk_count) * c);
             const int16_t hi = static_cast<int16_t>(lo + (2 * span / chunk_count) - 1);
             const int16_t z = (v == 0) ? lo : hi;
-            out.u16(static_cast<uint16_t>(static_cast<int16_t>(v == 0 ? -span : span)));  // x
-            out.u16(static_cast<uint16_t>(static_cast<int16_t>(0)));                      // y
-            out.u16(static_cast<uint16_t>(z));                                            // z
-            out.u16(0);                                                                   // pad
+            Buf pos;
+            pos.u16(static_cast<uint16_t>(static_cast<int16_t>(v == 0 ? -span : span)));  // x
+            pos.u16(static_cast<uint16_t>(static_cast<int16_t>(0)));                      // y
+            pos.u16(static_cast<uint16_t>(z));                                            // z
+            out.raw(pos.bytes.data(), stride < pos.size() ? stride : pos.size());
+            if (stride > pos.size()) out.zeros(stride - pos.size());  // padding to the stride
         }
     }
     return out.bytes;
