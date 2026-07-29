@@ -6,6 +6,7 @@
 
 #include "internal.hpp"
 
+#include <atomic>
 #include <mutex>
 
 #include <windows.h>
@@ -21,8 +22,11 @@ using DecompressFn = int64_t(__stdcall*)(const void* comp, int64_t comp_len, voi
                                          void* cb, void* cb_user, void* scratch, int64_t scratch_size,
                                          int32_t thread_phase);
 
-std::once_flag g_once;
-DecompressFn g_decompress = nullptr;
+// Atomic because available() and decompress() read it without going through
+// load(), so they do not inherit load()'s synchronisation. The pointer is
+// written once and never cleared, so relaxed ordering is sufficient.
+std::atomic<DecompressFn> g_decompress{nullptr};
+std::mutex g_load_mutex;
 
 constexpr int32_t kFuzzSafeYes = 1;
 constexpr int32_t kCheckCrcNo = 0;
@@ -44,25 +48,41 @@ void try_load(const std::string& game_dir) {
     if (!mod) mod = ::LoadLibraryW(L"oo2ext_7_win64.dll");  // last resort: search path
     if (!mod) return;
 
-    g_decompress = reinterpret_cast<DecompressFn>(
+    auto* fn = reinterpret_cast<DecompressFn>(
         reinterpret_cast<void*>(::GetProcAddress(mod, "OodleLZ_Decompress")));
-    if (!g_decompress) log("oodle: OodleLZ_Decompress not exported");
+    if (!fn) {
+        log("oodle: OodleLZ_Decompress not exported");
+        return;
+    }
+    g_decompress.store(fn, std::memory_order_relaxed);
 }
 
 }  // namespace
 
 bool load(const char* game_dir) {
-    std::string dir = game_dir ? game_dir : "";
-    std::call_once(g_once, [&] { try_load(dir); });
-    return g_decompress != nullptr;
+    // Gated on "not yet RESOLVED", not "not yet attempted".
+    //
+    // std::call_once would run try_load exactly once ever, which lets a failed
+    // first attempt poison every later one: redfs_depot_open_empty calls this
+    // with no game directory, so outside the game it finds nothing, and a
+    // subsequent redfs_depot_open with the real install path would never get to
+    // try. Every compressed read then fails for the life of the process.
+    // Retrying is cheap and idempotent, so gate on the result instead.
+    if (g_decompress.load(std::memory_order_relaxed)) return true;
+
+    std::lock_guard<std::mutex> lock(g_load_mutex);
+    if (g_decompress.load(std::memory_order_relaxed)) return true;  // won the race
+    try_load(game_dir ? game_dir : "");
+    return g_decompress.load(std::memory_order_relaxed) != nullptr;
 }
 
-bool available() { return g_decompress != nullptr; }
+bool available() { return g_decompress.load(std::memory_order_relaxed) != nullptr; }
 
 int64_t decompress(const void* comp, int64_t comp_len, void* raw, int64_t raw_len) {
-    if (!g_decompress) return -1;
-    return g_decompress(comp, comp_len, raw, raw_len, kFuzzSafeYes, kCheckCrcNo, kVerbosityNone,
-                        nullptr, 0, nullptr, nullptr, nullptr, 0, kUnthreaded);
+    const DecompressFn fn = g_decompress.load(std::memory_order_relaxed);
+    if (!fn) return -1;
+    return fn(comp, comp_len, raw, raw_len, kFuzzSafeYes, kCheckCrcNo, kVerbosityNone, nullptr, 0,
+              nullptr, nullptr, nullptr, 0, kUnthreaded);
 }
 
 }  // namespace redfs::oodle

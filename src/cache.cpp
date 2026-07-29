@@ -36,7 +36,9 @@ struct Cache {
     uint64_t fingerprint = 0;
     bool enabled = false;
     bool dirty = false;
-    std::unordered_map<uint64_t, std::unique_ptr<Mesh>> entries;
+    // shared_ptr, not unique_ptr: an open handle holds its own reference, so
+    // clearing the cache cannot free a mesh a caller is still reading.
+    std::unordered_map<uint64_t, std::shared_ptr<const Mesh>> entries;
 };
 
 Cache& cache() {
@@ -192,10 +194,13 @@ void load_from_disk(Cache& c) {
 
     uint32_t loaded = 0;
     for (uint32_t i = 0; i < count && r.ok; ++i) {
-        auto m = std::make_unique<Mesh>();
+        auto m = std::make_shared<Mesh>();
         if (!deserialize(r, m.get())) break;
+        // Same rule as mesh_build: the public view is derived before the object
+        // is published, so a cached mesh is immutable from here on.
+        m->finalize();
         const uint64_t h = m->hash;
-        c.entries[h] = std::move(m);
+        c.entries[h] = std::const_pointer_cast<const Mesh>(m);
         ++loaded;
     }
     log("mesh cache: loaded %u entries from %s", loaded, c.file.c_str());
@@ -283,39 +288,59 @@ uint32_t cache_entry_count() {
     return static_cast<uint32_t>(c.entries.size());
 }
 
-redfs_status mesh_acquire(const redfs_depot* depot, uint64_t hash, Mesh** out, bool* out_owned) {
+redfs_status mesh_acquire(const redfs_depot* depot, uint64_t hash,
+                          std::shared_ptr<const Mesh>* out) {
     Cache& c = cache();
 
     if (c.enabled) {
         std::lock_guard<std::mutex> lock(c.mutex);
         auto it = c.entries.find(hash);
         if (it != c.entries.end()) {
-            *out = it->second.get();
-            *out_owned = false;  // the cache owns it
+            *out = it->second;  // caller gets its own reference
             return REDFS_OK;
         }
     }
 
-    auto mesh = std::make_unique<Mesh>();
+    // Built privately and only published once complete, so nothing ever observes
+    // a half-decoded mesh and nothing mutates one after it is shared.
+    auto mesh = std::make_shared<Mesh>();
     const redfs_status st = mesh_build(depot, hash, mesh.get());
     if (st != REDFS_OK) return st;
 
     if (c.enabled) {
         std::lock_guard<std::mutex> lock(c.mutex);
-        // Another thread may have inserted it while we were building.
+        // Another thread may have inserted it while we were building; keep
+        // whichever won so all callers observe one object per hash.
         auto it = c.entries.find(hash);
         if (it == c.entries.end()) {
-            it = c.entries.emplace(hash, std::move(mesh)).first;
+            it = c.entries.emplace(hash, std::const_pointer_cast<const Mesh>(mesh)).first;
             c.dirty = true;
         }
-        *out = it->second.get();
-        *out_owned = false;
+        *out = it->second;
         return REDFS_OK;
     }
 
-    *out = mesh.release();
-    *out_owned = true;
+    *out = std::move(mesh);
     return REDFS_OK;
+}
+
+void cache_invalidate(const redfs_depot* depot) {
+    Cache& c = cache();
+    std::lock_guard<std::mutex> lock(c.mutex);
+    if (!c.enabled) return;
+
+    // Both halves are required. Re-fingerprinting alone would leave the stale
+    // in-memory entries live and merely relabel them on flush -- turning a
+    // reproducible staleness bug into an intermittent one. Dropping entries
+    // alone would let the next flush write fresh data under the old label.
+    const uint64_t before = c.fingerprint;
+    c.fingerprint = depot_fingerprint(depot);
+    if (c.fingerprint == before) return;  // archive set unchanged; keep the cache
+
+    if (!c.entries.empty())
+        log("mesh cache: archive set changed, dropping %zu entries", c.entries.size());
+    c.entries.clear();
+    c.dirty = false;  // nothing worth writing under the new fingerprint yet
 }
 
 }  // namespace redfs

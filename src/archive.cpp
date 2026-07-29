@@ -147,6 +147,15 @@ redfs_status Archive::open(const std::string& path) {
 }
 
 redfs_status Archive::read_segment(const Segment& seg, uint8_t* dst) const {
+    // Nothing to map, and mapping zero bytes would not mean "nothing":
+    // MapViewOfFile treats a length of 0 as "extend to the end of the mapping",
+    // so a zero-length segment at a 64 KB-aligned offset would reserve the whole
+    // archive -- gigabytes of address space -- to copy no bytes at all.
+    if (seg.zsize == 0) {
+        if (seg.size) std::memset(dst, 0, seg.size);
+        return REDFS_OK;
+    }
+
     const uint64_t gran = alloc_granularity();
     const uint64_t aligned = seg.offset & ~(gran - 1);
     const uint64_t delta = seg.offset - aligned;
@@ -262,6 +271,14 @@ redfs_status read_part(const redfs_depot* depot, uint64_t hash, uint32_t part, u
         if (abort && abort->load(std::memory_order_relaxed)) return REDFS_E_CANCELLED;
 
         const Segment seg = r.archive->segment(i);
+        // Bound each write independently of the sizing pass above.
+        //
+        // `total` was summed by re-reading these same descriptors, and they live
+        // in a file mapping the OS keeps coherent with the file -- which we open
+        // FILE_SHARE_WRITE. If anything changes a size between the two passes,
+        // the capacity computed from the first no longer covers the second. This
+        // check costs nothing and makes the coupling explicit.
+        if (seg.size > capacity - at) return REDFS_E_RANGE;
         st = r.archive->read_segment(seg, dst + at);
         if (st != REDFS_OK) return st;
         at += seg.size;

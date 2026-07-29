@@ -181,6 +181,26 @@ void compute_bounds(MeshChunk& c, const uint8_t* geometry, uint64_t geometry_siz
 
 }  // namespace
 
+// Builds the public view once, before the object is shared. Doing this lazily on
+// open would mutate an object the cache has already handed to other callers.
+void MeshData::finalize() {
+    public_chunks.clear();
+    public_chunks.reserve(chunks.size());
+    for (const auto& c : chunks) {
+        redfs_mesh_chunk p{};
+        p.index = c.index;
+        p.lod_mask = c.lod_mask;
+        p.lod = c.lod;
+        p.vertex_count = c.vertex_count;
+        p.index_count = c.index_count;
+        for (int i = 0; i < 3; ++i) {
+            p.bbox_min[i] = c.bbox_min[i];
+            p.bbox_max[i] = c.bbox_max[i];
+        }
+        public_chunks.push_back(p);
+    }
+}
+
 redfs_status mesh_build(const redfs_depot* depot, uint64_t hash, Mesh* out) {
     // 1. the resource itself
     std::vector<uint8_t> storage;
@@ -271,6 +291,7 @@ redfs_status mesh_build(const redfs_depot* depot, uint64_t hash, Mesh* out) {
         // No geometry available: the header facts are still valid, boxes are not.
         log("mesh 0x%016llX: geometry buffer unreadable, bounds omitted",
             static_cast<unsigned long long>(hash));
+        out->finalize();
         return REDFS_OK;
     }
 
@@ -279,6 +300,9 @@ redfs_status mesh_build(const redfs_depot* depot, uint64_t hash, Mesh* out) {
     if (st != REDFS_OK) return st;
 
     for (auto& c : out->chunks) compute_bounds(c, geometry.data(), geometry_size, scale, offset);
+
+    // Last step before the object can be shared: everything above mutates it.
+    out->finalize();
     return REDFS_OK;
 }
 

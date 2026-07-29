@@ -8,8 +8,10 @@
 #include "framework.hpp"
 #include "fixtures.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <windows.h>
@@ -823,6 +825,165 @@ TEST(cr2w, arrays_of_fixed_width_elements) {
     });
 }
 
+// --- regressions from the adversarial review of cr2w.cpp ---------------------
+
+TEST(cr2w, struct_array_size_field_cannot_hang) {
+    // struct_end advanced by `8 + (sz - 4)`, evaluated in 32-bit. sz == 0xFFFFFFFC
+    // gives 8 + 0xFFFFFFF8 == 0x100000000 -> 0, so the pointer never moved and the
+    // after-the-fact bounds check could not fire: an unbounded spin, reachable
+    // from redfs_mesh_open on a mod-supplied .mesh.
+    //
+    // If this regresses, the test does not fail -- it hangs. That is the point:
+    // the fuzzer's 0x7FFFFFFF and 0xFFFFFFFF advance by ~2 GB and 3, so neither
+    // could ever reach the one fatal value.
+    fixture::Buf arr;
+    arr.u32(1);   // one element
+    arr.u8(0);    // struct leading zero
+    arr.u16(1);   // name index, non-zero so the walk continues
+    arr.u16(1);   // type index
+    arr.u32(0xFFFFFFFCu);  // the size field that used to wrap the advance to zero
+    arr.u32(0);   // trailing bytes so the 8-byte header read is in bounds
+
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+    b.prop("items", "array:SomeStruct", arr.bytes.data(), arr.size());
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        redfs_value v{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "items", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_ARRAY);
+        // Must terminate and report corruption rather than spin.
+        const redfs_status st = redfs_cr2w_walk_array(
+            f, &v, [](uint32_t, const redfs_value*, void*) -> int { return 1; }, nullptr);
+        CHECK_ERR(st, REDFS_E_CORRUPT);
+    });
+}
+
+TEST(cr2w, null_deferred_buffer_is_not_part_main) {
+    // Index 0 means null. Subtracting first produced 0xFFFFFFFF == REDFS_PART_MAIN,
+    // so a null buffer silently resolved to segment 0 and handed back the CR2W
+    // document as payload -- a DDS whose pixels were the document.
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+    const uint16_t null_index = 0;
+    b.prop("textureData", "serializationDeferredDataBuffer", &null_index, 2);
+    const uint16_t real_index = 3;  // 1-based on the wire -> buffer 2
+    b.prop("otherData", "serializationDeferredDataBuffer", &real_index, 2);
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        redfs_value v{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "textureData", &v));
+        CHECK(v.kind != REDFS_KIND_BUFFER);          // no buffer attached
+        CHECK(v.as.buffer != REDFS_PART_MAIN);       // and above all, not the sentinel
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "otherData", &v));
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_BUFFER);
+        CHECK_EQ(v.as.buffer, 2u);                   // 3 on the wire is buffer 2
+    });
+}
+
+TEST(cr2w, enum_and_string_arrays_are_sized_correctly) {
+    // fixed_width knows neither enums (2-byte name index under a per-enum type
+    // name) nor CString (variable). Both used to fall into the TLV struct walker,
+    // which either failed a well-formed file or sheared elements at the wrong
+    // boundaries. Both shapes occur in unmodified game data.
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+
+    // array:<enum> -- three 2-byte name indices, one deliberately >= 256 so its
+    // low byte is zero and it looks exactly like a struct's leading zero.
+    const uint16_t e0 = b.name("TCM_None");
+    const uint16_t e1 = b.name("TCM_DXTAlpha");
+    const uint16_t e2 = b.name("TCM_QualityColor");
+    fixture::Buf enums;
+    enums.u16(e0);
+    enums.u16(e1);
+    enums.u16(e2);
+    b.prop_array("modes", "ETextureCompression", 3, enums.bytes.data(), enums.size());
+
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        redfs_value arr{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "modes", &arr));
+        CHECK_EQ((int)arr.kind, (int)REDFS_KIND_ARRAY);
+        CHECK_EQ(arr.as.u, 3ull);
+
+        ElemCollect c;
+        CHECK_OK(redfs_cr2w_walk_array(f, &arr, collect_elems, &c));
+        CHECK_EQ(c.names.size(), 3u);
+        if (c.names.size() == 3) {
+            CHECK_STR(c.names[0].c_str(), "TCM_None");
+            CHECK_STR(c.names[1].c_str(), "TCM_DXTAlpha");
+            CHECK_STR(c.names[2].c_str(), "TCM_QualityColor");
+        }
+    });
+}
+
+TEST(cr2w, fixed_size_array_spelling_is_handled) {
+    // cr2w_decode accepted a type starting with '[' as an array, but element_type
+    // had no '[' case and returned the whole name as the element type -- so every
+    // element was sized and decoded as if it were the array itself. [N]T is a real
+    // RED4 spelling used by CMaterialTemplate.Parameters among others.
+    const uint32_t values[3] = {11, 22, 33};
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+    fixture::Buf v;
+    v.u32(3);
+    v.raw(values, sizeof values);
+    b.prop("samples", "[3]Uint32", v.bytes.data(), v.size());
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        redfs_value arr{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "samples", &arr));
+        CHECK_EQ((int)arr.kind, (int)REDFS_KIND_ARRAY);
+        CHECK_EQ(arr.as.u, 3ull);
+
+        ElemCollect c;
+        CHECK_OK(redfs_cr2w_walk_array(f, &arr, collect_elems, &c));
+        CHECK_EQ(c.values.size(), 3u);
+        if (c.values.size() == 3) {
+            CHECK_EQ(c.values[0], 11ull);
+            CHECK_EQ(c.values[2], 33ull);
+        }
+    });
+}
+
+TEST(cr2w, repeated_string_reads_do_not_grow_the_handle) {
+    // Every CString decode used to allocate and retain a fresh std::string with no
+    // dedup, so a per-frame query grew the handle until it was closed. Decoding
+    // the same property must reuse the cached result -- and the pointer must stay
+    // stable, since callers hold it.
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+    fixture::Buf s;
+    s.u8(0x83);  // VLQ: negative-signed prefix, 3 chars, UTF-8
+    s.raw("abc", 3);
+    b.prop("label", "CString", s.bytes.data(), s.size());
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        redfs_value first{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "label", &first));
+        CHECK_EQ((int)first.kind, (int)REDFS_KIND_STRING);
+        const char* first_ptr = first.as.s;
+
+        for (int i = 0; i < 500; ++i) {
+            redfs_value again{};
+            CHECK_OK(redfs_cr2w_get(f, 0, "label", &again));
+            if (again.as.s != first_ptr) {
+                ::test::report(__FILE__, __LINE__, "cached string pointer is stable",
+                               "a repeated decode allocated a new string");
+                break;
+            }
+        }
+        CHECK_STR(first_ptr, "abc");
+    });
+}
+
 TEST(cr2w, rejects_malformed) {
     redfs_cr2w* f = nullptr;
 
@@ -1328,6 +1489,240 @@ TEST(api, shutdown_cancels_queued_work) {
     CHECK_EQ(after.completed, 1);
 
     redfs_shutdown();  // leave the suite quiesced for the next test
+}
+
+TEST(api, oodle_load_is_retried_not_poisoned) {
+    // Regression: load() used std::call_once, so the FIRST attempt decided the
+    // outcome forever. redfs_depot_open_empty calls it with no game directory,
+    // which outside the game resolves nothing -- and a later redfs_depot_open
+    // with the real install path could then never retry, leaving every
+    // compressed read failing with REDFS_E_OODLE for the process lifetime.
+    //
+    // The whole suite already runs open_empty first (TempDepot does), so by this
+    // point a poisoned gate would have latched. Assert it did not: either Oodle
+    // is genuinely absent on this machine, or it resolved -- what must not happen
+    // is resolving being made impossible by an early argument-less call.
+    redfs_depot* d = nullptr;
+    CHECK_OK(redfs_depot_open_empty(&d));
+    CHECK(d != nullptr);
+    if (d) redfs_depot_close(d);
+
+    // Idempotent and side-effect free: querying must not change the answer.
+    const int first = redfs_oodle_available();
+    const int second = redfs_oodle_available();
+    CHECK_EQ(first, second);
+}
+
+// --- regressions from the adversarial review of api.cpp / archive.cpp --------
+
+TEST(api, mesh_handle_survives_cache_close) {
+    // A cached mesh used to be owned solely by the cache: redfs_shutdown ->
+    // cache_close -> entries.clear() destroyed it while callers still held the
+    // pointer, and redfs_mesh_close was a silent no-op on it. Every accessor was
+    // then a use-after-free. The handle now holds its own reference.
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\cachelife.mesh");
+    ab.add(key, fixture::make_mesh_cr2w(3, 6, 4.0f, 0.0f),
+           {fixture::make_mesh_geometry(3, 6)});
+    TempDepot d("cachelife.archive", ab.build());
+    if (!d.depot) return;
+
+    const std::string cache_file = temp_path("lifetime.cache");
+    std::remove(cache_file.c_str());
+    CHECK_OK(redfs_cache_open(d.depot, cache_file.c_str()));
+
+    redfs_mesh* m = nullptr;
+    CHECK_OK(redfs_mesh_open(d.depot, key, &m));
+    if (!m) return;
+    const uint32_t chunks_before = redfs_mesh_chunk_count(m);
+    const redfs_mesh_chunk* c = redfs_mesh_chunk_at(m, 0);
+    CHECK(c != nullptr);
+    const float z_before = c ? c->bbox_min[2] : 0.f;
+
+    // Pull the cache out from under the live handle.
+    redfs_cache_close();
+
+    // Everything must still read correctly -- under ASan this is where a
+    // use-after-free would fire.
+    CHECK_EQ(redfs_mesh_chunk_count(m), chunks_before);
+    const redfs_mesh_chunk* after = redfs_mesh_chunk_at(m, 0);
+    CHECK(after != nullptr);
+    if (after) CHECK_NEAR(after->bbox_min[2], z_before, 1e-6);
+    CHECK_STR(redfs_mesh_appearance_name(m, 0), "default");
+
+    redfs_mesh_close(m);
+    std::remove(cache_file.c_str());
+}
+
+TEST(api, concurrent_mesh_open_is_safe) {
+    // The suite had NO threading tests, which is why a data race on the cached
+    // mesh's public_chunks vector survived every other check. redfs.h lists
+    // redfs_mesh_* as concurrency-safe and INTEGRATION.md describes two threads
+    // racing on the same mesh as supported, so this is the documented path.
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\race.mesh");
+    ab.add(key, fixture::make_mesh_cr2w(6, 8, 3.0f, 0.0f),
+           {fixture::make_mesh_geometry(6, 8)});
+    TempDepot d("race.archive", ab.build());
+    if (!d.depot) return;
+
+    const std::string cache_file = temp_path("race.cache");
+    std::remove(cache_file.c_str());
+    CHECK_OK(redfs_cache_open(d.depot, cache_file.c_str()));
+
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; ++t) {
+        threads.emplace_back([&] {
+            for (int i = 0; i < 200; ++i) {
+                redfs_mesh* m = nullptr;
+                if (redfs_mesh_open(d.depot, key, &m) != REDFS_OK || !m) {
+                    ++failures;
+                    continue;
+                }
+                if (redfs_mesh_chunk_count(m) != 6) ++failures;
+                const redfs_mesh_chunk* c = redfs_mesh_chunk_at(m, 5);
+                if (!c || c->index != 5) ++failures;
+                redfs_mesh_close(m);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    CHECK_EQ(failures.load(), 0);
+
+    redfs_cache_close();
+    std::remove(cache_file.c_str());
+}
+
+TEST(api, mount_invalidates_the_mesh_cache) {
+    // The fingerprint was computed only in cache_open, so mounting afterwards
+    // kept serving pre-mount geometry -- and flushed new entries under the stale
+    // fingerprint, poisoning the file for later runs. redfs.h promises "a game
+    // patch or a new mod cannot serve stale geometry".
+    const uint64_t key = redfs_hash("base\\swap.mesh");
+
+    ArchiveBuilder base;
+    base.add(key, fixture::make_mesh_cr2w(2, 6, 1.0f, 0.0f),
+             {fixture::make_mesh_geometry(2, 6)});
+    // The override has a different chunk count, so a stale answer is unmistakable.
+    ArchiveBuilder patch;
+    patch.add(key, fixture::make_mesh_cr2w(5, 6, 1.0f, 0.0f),
+              {fixture::make_mesh_geometry(5, 6)});
+
+    const std::string p1 = temp_path("swap_base.archive");
+    const std::string p2 = temp_path("swap_patch.archive");
+    ArchiveBuilder::write(p1, base.build());
+    ArchiveBuilder::write(p2, patch.build());
+
+    redfs_depot* d = nullptr;
+    redfs_depot_open_empty(&d);
+    if (d) {
+        CHECK_OK(redfs_depot_mount(d, p1.c_str()));
+
+        const std::string cache_file = temp_path("swap.cache");
+        std::remove(cache_file.c_str());
+        CHECK_OK(redfs_cache_open(d, cache_file.c_str()));
+
+        redfs_mesh* m = nullptr;
+        CHECK_OK(redfs_mesh_open(d, key, &m));
+        CHECK_EQ(redfs_mesh_chunk_count(m), 2u);
+        redfs_mesh_close(m);
+
+        // Mount an override AFTER the cache was opened.
+        CHECK_OK(redfs_depot_mount(d, p2.c_str()));
+
+        m = nullptr;
+        CHECK_OK(redfs_mesh_open(d, key, &m));
+        CHECK_EQ(redfs_mesh_chunk_count(m), 5u);  // must reflect the override
+        redfs_mesh_close(m);
+
+        redfs_cache_close();
+        redfs_depot_close(d);
+        std::remove(cache_file.c_str());
+    }
+    std::remove(p1.c_str());
+    std::remove(p2.c_str());
+}
+
+namespace {
+struct ReQueue {
+    redfs_depot* depot;
+    uint64_t key;
+    std::atomic<int> cancelled{0};
+    std::atomic<int> completed{0};
+    std::atomic<int> refused{0};
+};
+
+void requeue_cb(redfs_status st, redfs_blob b, void* user) {
+    auto* ctx = static_cast<ReQueue*>(user);
+    if (st == REDFS_E_CANCELLED)
+        ++ctx->cancelled;
+    else if (st == REDFS_OK)
+        ++ctx->completed;
+    redfs_blob_free(&b);
+
+    // The dangerous pattern: chain the next read from inside a callback. During
+    // shutdown this used to spawn a thread AFTER the join, so shutdown returned
+    // with a live worker. It must be refused via the RETURN VALUE -- and not by
+    // invoking this same callback again, which recurses until the stack dies.
+    // That is exactly what this test caught on the first attempt at the fix.
+    if (redfs_read_async(ctx->depot, ctx->key, REDFS_PART_ALL, requeue_cb, ctx) != REDFS_OK)
+        ++ctx->refused;
+}
+}  // namespace
+
+TEST(api, callback_requeue_during_shutdown_is_refused_not_dropped) {
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\chain.bin");
+    ab.add(key, std::vector<uint8_t>(32 * 1024, 0x77));
+    TempDepot d("chain.archive", ab.build());
+    if (!d.depot) return;
+
+    ReQueue ctx{d.depot, key};
+    for (int i = 0; i < 64; ++i)
+        redfs_read_async(d.depot, key, REDFS_PART_ALL, requeue_cb, &ctx);
+
+    // Must return with the worker joined, even though callbacks re-post.
+    redfs_shutdown();
+
+    // Every job resolved one way or another; nothing was silently dropped.
+    const int total = ctx.completed + ctx.cancelled;
+    CHECK(total >= 64);
+    // And a re-post during shutdown was refused rather than swallowed.
+    CHECK(ctx.refused > 0);
+
+    // The worker must be gone: a fresh post now starts a new one cleanly.
+    redfs_drain();
+}
+
+TEST(api, drain_and_shutdown_from_a_callback_do_not_deadlock) {
+    // busy_ is cleared only after the callback returns, so both drain() and
+    // shutdown() would wait on a flag only the calling thread can clear -- and
+    // shutdown would additionally join itself. Both must refuse instead.
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\reentrant.bin");
+    ab.add(key, std::vector<uint8_t>(1024, 0x22));
+    TempDepot d("reentrant.archive", ab.build());
+    if (!d.depot) return;
+
+    std::atomic<int> calls{0};
+    struct Ctx {
+        std::atomic<int>* calls;
+    } ctx{&calls};
+
+    redfs_read_async(d.depot, key, REDFS_PART_ALL,
+                     [](redfs_status, redfs_blob b, void* user) {
+                         redfs_blob_free(&b);
+                         // If these deadlock, the test hangs rather than fails.
+                         redfs_drain();
+                         redfs_shutdown();
+                         ++*static_cast<Ctx*>(user)->calls;
+                     },
+                     &ctx);
+
+    redfs_drain();
+    CHECK_EQ(calls.load(), 1);
+    redfs_shutdown();
 }
 
 TEST(api, status_strings_exist) {

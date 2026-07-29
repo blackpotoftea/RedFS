@@ -8,8 +8,14 @@
  * Stable C ABI. Safe to consume from any compiler / language with C FFI.
  *
  * Threading: a redfs_depot is immutable once opened. redfs_read* / redfs_stat /
- * redfs_texture_* are safe to call concurrently from any number of threads.
- * redfs_depot_mount / redfs_depot_close are NOT (open first, then share).
+ * redfs_texture_* / redfs_mesh_* are safe to call concurrently from any number
+ * of threads. redfs_depot_mount / redfs_depot_close / redfs_shutdown /
+ * redfs_cache_* are NOT (open first, then share).
+ *
+ * An individual redfs_cr2w handle is SINGLE-THREADED: decoding a CString caches
+ * it on the handle, so two threads calling redfs_cr2w_get on the same handle
+ * race. Sharing the depot is fine; give each thread its own CR2W handle. The
+ * typed helpers above are unaffected -- each builds a private handle per call.
  *
  * All reads are synchronous and can take milliseconds (Oodle decode). Call them
  * from a worker thread, or use redfs_read_async.
@@ -245,8 +251,21 @@ REDFS_API void redfs_blob_free(redfs_blob* blob);
 
 /*
  * Queue a read on RedFS's worker thread. `cb` runs on that worker, never on the
- * caller's thread -- marshal back to the game thread yourself. On REDFS_OK the
- * callback owns `blob` and must redfs_blob_free it.
+ * caller's thread -- marshal back to the game thread yourself. When the callback
+ * receives REDFS_OK it owns `blob` and must redfs_blob_free it.
+ *
+ * The return value decides whether the callback fires at all:
+ *   REDFS_OK             -- queued; the callback WILL fire exactly once, with
+ *                           either a result or REDFS_E_CANCELLED
+ *   REDFS_E_CANCELLED    -- refused because redfs_shutdown is in progress; the
+ *                           callback will NOT fire, handle it here
+ *   REDFS_E_INVALID_ARG  -- likewise not queued, callback will not fire
+ *
+ * Chaining the next read from inside a callback is fine and is the normal
+ * pattern; during shutdown that chained call simply returns REDFS_E_CANCELLED.
+ *
+ * Do NOT call redfs_drain or redfs_shutdown from a callback -- both would wait
+ * on the very job you are completing. They detect it and return without acting.
  */
 typedef void (*redfs_read_fn)(redfs_status status, redfs_blob blob, void* user);
 REDFS_API redfs_status redfs_read_async(const redfs_depot* depot, uint64_t hash, uint32_t part,
@@ -564,6 +583,17 @@ REDFS_API redfs_status redfs_cache_warm(const redfs_depot* depot, const uint64_t
 
 typedef void (*redfs_log_fn)(const char* message, void* user);
 REDFS_API void redfs_set_log(redfs_log_fn fn, void* user);
+
+/*
+ * Whether Oodle resolved. Compressed segments -- which is nearly everything --
+ * fail with REDFS_E_OODLE when this is 0, so it is worth checking once after
+ * opening a depot and warning loudly rather than letting every read fail.
+ *
+ * Inside the game this is effectively always true: the DLL is already resident.
+ * It is standalone tools, and installs missing bin/x64/oo2ext_7_win64.dll, that
+ * see 0.
+ */
+REDFS_API int redfs_oodle_available(void);
 
 /* Human-readable reason for the last failure on this thread. */
 REDFS_API const char* redfs_last_error(void);

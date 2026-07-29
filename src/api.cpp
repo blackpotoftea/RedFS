@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <thread>
 
 #include <windows.h>
@@ -20,19 +22,32 @@ namespace redfs {
 // --- diagnostics -------------------------------------------------------------
 
 namespace {
-redfs_log_fn g_log_fn = nullptr;
-void* g_log_user = nullptr;
+// The callback and its context are one atomic unit. Two separate globals could
+// be read half-updated -- and the null check and the call would be separate
+// loads of a plain global, so redfs_set_log racing with a worker-thread log()
+// could produce an indirect call through null, or a callback paired with
+// another logger's context.
+struct LogSink {
+    redfs_log_fn fn;
+    void* user;
+};
+std::atomic<LogSink> g_log{LogSink{nullptr, nullptr}};
 thread_local char t_last_error[512] = {};
+
+void emit(const char* message) {
+    const LogSink sink = g_log.load(std::memory_order_relaxed);
+    if (sink.fn) sink.fn(message, sink.user);
+}
 }  // namespace
 
 void log(const char* fmt, ...) {
-    if (!g_log_fn) return;
+    if (!g_log.load(std::memory_order_relaxed).fn) return;  // cheap early out
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    g_log_fn(buf, g_log_user);
+    emit(buf);
 }
 
 redfs_status fail(redfs_status status, const char* fmt, ...) {
@@ -40,7 +55,7 @@ redfs_status fail(redfs_status status, const char* fmt, ...) {
     va_start(ap, fmt);
     std::vsnprintf(t_last_error, sizeof(t_last_error), fmt, ap);
     va_end(ap);
-    if (g_log_fn) g_log_fn(t_last_error, g_log_user);
+    emit(t_last_error);
     return status;
 }
 
@@ -50,9 +65,10 @@ redfs_status blob_alloc(uint64_t size, redfs_blob* out) {
     out->data = nullptr;
     out->size = 0;
     out->reserved = nullptr;
-    if (size == 0) return REDFS_OK;
-    // +1 so a zero-length read still yields a non-null pointer and text payloads
-    // can be treated as NUL-terminated.
+    // +1 so even a zero-length read yields a non-null, NUL-terminated pointer.
+    // No early return for size == 0: it would hand back data == nullptr, which
+    // is exactly the case a caller treating the blob as a C string would trip
+    // over -- and the one this padding exists to make safe.
     void* p = std::malloc(static_cast<size_t>(size) + 1);
     if (!p) return fail(REDFS_E_OOM, "out of memory allocating %llu bytes",
                         static_cast<unsigned long long>(size));
@@ -208,19 +224,30 @@ public:
         return *w;
     }
 
-    void post(const Job& job) {
+    // Returns false when the job was refused because a shutdown is in progress;
+    // the caller then reports it as cancelled itself. Never drops silently --
+    // redfs.h promises every callback fires exactly once.
+    bool post(const Job& job) {
         {
             std::lock_guard<std::mutex> lk(m_);
-            if (stop_) return;  // shutting down; drop rather than queue forever
+            if (state_ == State::kQuiescing) return false;
             queue_.push_back(job);
             ensure_thread();
         }
         cv_.notify_one();
+        return true;
     }
 
     void drain() {
         std::unique_lock<std::mutex> lk(m_);
         done_.wait(lk, [&] { return queue_.empty() && !busy_; });
+    }
+
+    // True while this thread is executing a completion callback, so re-entrant
+    // drain/shutdown can be refused instead of deadlocking on a flag only this
+    // thread can clear.
+    bool on_worker_thread() const {
+        return std::this_thread::get_id() == worker_id_.load(std::memory_order_relaxed);
     }
 
     // Stops the thread and joins it. Safe to call more than once. Must NOT be
@@ -236,6 +263,13 @@ public:
     // the exact crash this call exists to prevent. So the bound comes from doing
     // less work, never from giving up on the join.
     void stop() {
+        // Re-entrancy from a completion callback would wait on !busy_ -- a flag
+        // only this very thread can clear -- and then join itself. Refuse.
+        if (on_worker_thread()) {
+            log("redfs_shutdown called from a completion callback; ignored");
+            return;
+        }
+
         std::thread victim;
         std::deque<Job> cancelled;
         // Set before taking the lock: the worker is very likely mid-read and
@@ -243,9 +277,13 @@ public:
         abort_.store(true, std::memory_order_relaxed);
         {
             std::unique_lock<std::mutex> lk(m_);
-            stop_ = true;
+            state_ = State::kQuiescing;
             cancelled.swap(queue_);  // drop pending work
             cv_.notify_all();
+            // Emptying the queue can satisfy a waiting drain()'s predicate, and
+            // done_ is otherwise only signalled on job completion -- so without
+            // this a drainer sleeps forever on a condition that is already true.
+            done_.notify_all();
             // Only the in-flight job is waited on, and it is now aborting at the
             // next segment boundary. Bounded by one segment decode, not by the
             // queue and not by the size of whatever was being read.
@@ -255,20 +293,26 @@ public:
         cv_.notify_all();
         if (victim.joinable()) victim.join();
 
+        // Cancellations fire while still QUIESCING, on purpose.
+        //
+        // Re-opening first and then reporting would let a callback that re-posts
+        // slip a job through and spawn a fresh thread *after* the join -- so
+        // shutdown would return with a live worker, the one thing it exists to
+        // prevent. Reporting first and re-opening after means such a re-post is
+        // refused and reported as REDFS_E_CANCELLED instead: no lost callback,
+        // and no thread outliving the call.
+        for (const Job& job : cancelled)
+            if (job.cb) job.cb(REDFS_E_CANCELLED, redfs_blob{}, job.user);
+
         // Quiesced, not disabled. A later post() starts a fresh thread. This
         // matters when RedFS.dll is shared between plugins: the first one to
         // unload must not permanently break async for the others.
         {
             std::lock_guard<std::mutex> lk(m_);
-            stop_ = false;
+            state_ = State::kRunning;
         }
         abort_.store(false, std::memory_order_relaxed);
-
-        // Report cancellations after the join, so callbacks never run
-        // concurrently with the worker. A caller waiting on one of these would
-        // otherwise wait forever.
-        for (const Job& job : cancelled)
-            if (job.cb) job.cb(REDFS_E_CANCELLED, redfs_blob{}, job.user);
+        done_.notify_all();
     }
 
 private:
@@ -277,12 +321,16 @@ private:
     }
 
     void run() {
+        worker_id_.store(std::this_thread::get_id(), std::memory_order_relaxed);
         for (;;) {
             Job job{};
             {
                 std::unique_lock<std::mutex> lk(m_);
-                cv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
-                if (stop_ && queue_.empty()) return;
+                cv_.wait(lk, [&] { return state_ == State::kQuiescing || !queue_.empty(); });
+                if (state_ == State::kQuiescing && queue_.empty()) {
+                    worker_id_.store(std::thread::id{}, std::memory_order_relaxed);
+                    return;
+                }
                 job = queue_.front();
                 queue_.pop_front();
                 busy_ = true;
@@ -310,14 +358,22 @@ private:
         }
     }
 
+    // Two states, not a bool: "quiescing" has to be observable by post() for the
+    // whole of stop(), including while the cancellation callbacks run. A plain
+    // stop_ flag cleared before those callbacks lets one of them queue work that
+    // spawns a thread after the join.
+    enum class State { kRunning, kQuiescing };
+
     std::mutex m_;
     std::condition_variable cv_, done_;
     std::deque<Job> queue_;
     std::thread thread_;
     bool busy_ = false;
-    bool stop_ = false;
+    State state_ = State::kRunning;
     // Read without the lock by an in-flight read, hence atomic.
     std::atomic<bool> abort_{false};
+    // Identifies the worker so re-entrant drain/shutdown can be refused.
+    std::atomic<std::thread::id> worker_id_{};
 };
 
 }  // namespace
@@ -350,6 +406,34 @@ void fill_info(const Located& loc, redfs_file_info* out) {
 
 using namespace redfs;
 
+// Exception barrier for the C ABI.
+//
+// Callers are C, Lua or another language's FFI; letting a C++ exception unwind
+// into their frames is undefined behaviour, and terminate at best. The status
+// enum already says allocation failure is RETURNED (REDFS_E_OOM), so the
+// contract is clear -- it just was not enforced anywhere except blob_alloc.
+//
+// This is not hypothetical: several buffers are sized directly from a uint32
+// segment size out of the archive, so a corrupt or crafted file can ask for
+// gigabytes and throw std::bad_alloc straight out of a typed helper.
+#define REDFS_GUARD(expr)                                                      \
+    try {                                                                      \
+        return (expr);                                                         \
+    } catch (const std::bad_alloc&) {                                           \
+        return fail(REDFS_E_OOM, "allocation failed");                         \
+    } catch (const std::exception& e) {                                        \
+        return fail(REDFS_E_IO, "internal error: %s", e.what());               \
+    } catch (...) {                                                            \
+        return fail(REDFS_E_IO, "internal error");                             \
+    }
+
+// Same, for entry points that return void and so cannot report.
+#define REDFS_GUARD_VOID(expr)                                                 \
+    try {                                                                      \
+        expr;                                                                  \
+    } catch (...) {                                                            \
+    }
+
 extern "C" {
 
 uint32_t redfs_abi_version(void) { return REDFS_ABI_VERSION; }
@@ -371,11 +455,13 @@ const char* redfs_status_string(redfs_status status) {
 }
 
 void redfs_set_log(redfs_log_fn fn, void* user) {
-    g_log_fn = fn;
-    g_log_user = user;
+    // Single atomic store: the pair can never be observed half-updated.
+    g_log.store(LogSink{fn, user}, std::memory_order_relaxed);
 }
 
 const char* redfs_last_error(void) { return t_last_error; }
+
+int redfs_oodle_available(void) { return oodle::available() ? 1 : 0; }
 
 // --- depot -------------------------------------------------------------------
 
@@ -443,6 +529,10 @@ redfs_status redfs_depot_mount(redfs_depot* depot, const char* archive_path) {
     }
     depot->archives.push_back(a);
     reindex(depot);
+    // The archive set just changed, so any cached geometry may now be overridden.
+    // Without this the cache serves pre-mount bounds and, worse, flushes new
+    // entries under the stale fingerprint -- poisoning the file for later runs.
+    cache_invalidate(depot);
     return REDFS_OK;
 }
 
@@ -468,6 +558,7 @@ redfs_status redfs_depot_mount_dir(redfs_depot* depot, const char* dir, uint32_t
     if (added == 0) return fail(REDFS_E_IO, "none of the archives in %s could be opened", dir);
 
     reindex(depot);
+    cache_invalidate(depot);  // same reasoning as redfs_depot_mount
     if (out_mounted) *out_mounted = added;
     return REDFS_OK;
 }
@@ -603,11 +694,25 @@ void redfs_blob_free(redfs_blob* blob) {
 redfs_status redfs_read_async(const redfs_depot* depot, uint64_t hash, uint32_t part,
                               redfs_read_fn cb, void* user) {
     if (!depot || !cb) return REDFS_E_INVALID_ARG;
-    Worker::get().post(Job{depot, hash, part, cb, user});
+    // Refused while shutting down. Reported through the RETURN VALUE, never by
+    // invoking the callback here: the callback is exactly the place that tends
+    // to queue the next read, so calling it synchronously on refusal recurses
+    // until the stack dies. The contract is therefore the conventional one --
+    // REDFS_OK means the callback will fire exactly once, any error means it
+    // will not fire at all and the caller handles it inline.
+    if (!Worker::get().post(Job{depot, hash, part, cb, user})) return REDFS_E_CANCELLED;
     return REDFS_OK;
 }
 
-void redfs_drain(void) { Worker::get().drain(); }
+void redfs_drain(void) {
+    // From a completion callback this would wait on a flag only the calling
+    // thread can clear. Refuse rather than deadlock.
+    if (Worker::get().on_worker_thread()) {
+        log("redfs_drain called from a completion callback; ignored");
+        return;
+    }
+    Worker::get().drain();
+}
 
 void redfs_shutdown(void) {
     // Order matters: stop the worker before touching the cache, so no in-flight
@@ -706,13 +811,20 @@ redfs_status redfs_cr2w_walk_in(const redfs_cr2w* cr2w, const redfs_value* paren
 redfs_status redfs_texture_desc_of(const redfs_depot* depot, uint64_t hash,
                                    redfs_texture_desc* out_desc) {
     if (!depot || !out_desc) return REDFS_E_INVALID_ARG;
-    return texture_desc_of(depot, hash, out_desc);
+    REDFS_GUARD(texture_desc_of(depot, hash, out_desc));
 }
 
 redfs_status redfs_texture_read_dds(const redfs_depot* depot, uint64_t hash, redfs_blob* out_blob) {
     if (!depot || !out_blob) return REDFS_E_INVALID_ARG;
     *out_blob = redfs_blob{};
-    const redfs_status st = texture_read_dds(depot, hash, out_blob);
+    redfs_status st;
+    try {
+        st = texture_read_dds(depot, hash, out_blob);
+    } catch (const std::bad_alloc&) {
+        st = fail(REDFS_E_OOM, "allocation failed");
+    } catch (...) {
+        st = fail(REDFS_E_IO, "internal error");
+    }
     if (st != REDFS_OK) redfs_blob_free(out_blob);
     return st;
 }
@@ -721,7 +833,14 @@ redfs_status redfs_texture_read_raw(const redfs_depot* depot, uint64_t hash,
                                     redfs_texture_desc* out_desc, redfs_blob* out_blob) {
     if (!depot || !out_blob) return REDFS_E_INVALID_ARG;
     *out_blob = redfs_blob{};
-    const redfs_status st = texture_read_raw(depot, hash, out_desc, out_blob);
+    redfs_status st;
+    try {
+        st = texture_read_raw(depot, hash, out_desc, out_blob);
+    } catch (const std::bad_alloc&) {
+        st = fail(REDFS_E_OOM, "allocation failed");
+    } catch (...) {
+        st = fail(REDFS_E_IO, "internal error");
+    }
     if (st != REDFS_OK) redfs_blob_free(out_blob);
     return st;
 }
@@ -729,13 +848,13 @@ redfs_status redfs_texture_read_raw(const redfs_depot* depot, uint64_t hash,
 redfs_status redfs_audio_probe(const redfs_depot* depot, uint64_t hash,
                                redfs_audio_format* out_format) {
     if (!depot || !out_format) return REDFS_E_INVALID_ARG;
-    return audio_probe(depot, hash, out_format);
+    REDFS_GUARD(audio_probe(depot, hash, out_format));
 }
 
 redfs_status redfs_audio_info_of(const redfs_depot* depot, uint64_t hash,
                                  redfs_audio_info* out_info) {
     if (!depot || !out_info) return REDFS_E_INVALID_ARG;
-    return audio_info_of(depot, hash, out_info);
+    REDFS_GUARD(audio_info_of(depot, hash, out_info));
 }
 
 redfs_status redfs_audio_info_parse(const void* data, uint64_t size, redfs_audio_info* out_info) {
@@ -764,7 +883,7 @@ const char* redfs_audio_codec_name(redfs_audio_codec codec) {
 redfs_status redfs_mesh_desc_of(const redfs_depot* depot, uint64_t hash,
                                 redfs_mesh_desc* out_desc) {
     if (!depot || !out_desc) return REDFS_E_INVALID_ARG;
-    return mesh_desc_of(depot, hash, out_desc);
+    REDFS_GUARD(mesh_desc_of(depot, hash, out_desc));
 }
 
 // --- mesh chunks -------------------------------------------------------------
@@ -773,76 +892,77 @@ redfs_status redfs_mesh_open(const redfs_depot* depot, uint64_t hash, redfs_mesh
     if (!depot || !out_mesh) return REDFS_E_INVALID_ARG;
     *out_mesh = nullptr;
 
-    Mesh* mesh = nullptr;
-    bool owned = false;
-    const redfs_status st = mesh_acquire(depot, hash, &mesh, &owned);
+    std::shared_ptr<const Mesh> data;
+    redfs_status st;
+    // mesh_acquire sizes buffers from archive-supplied lengths, so a corrupt or
+    // crafted file can throw bad_alloc here. That must not unwind into a C host.
+    try {
+        st = mesh_acquire(depot, hash, &data);
+    } catch (const std::bad_alloc&) {
+        return fail(REDFS_E_OOM, "allocation failed decoding mesh");
+    } catch (...) {
+        return fail(REDFS_E_IO, "internal error decoding mesh");
+    }
     if (st != REDFS_OK) return st;
 
-    mesh->public_chunks.clear();
-    mesh->public_chunks.reserve(mesh->chunks.size());
-    for (const auto& c : mesh->chunks) {
-        redfs_mesh_chunk p{};
-        p.index = c.index;
-        p.lod_mask = c.lod_mask;
-        p.lod = c.lod;
-        p.vertex_count = c.vertex_count;
-        p.index_count = c.index_count;
-        for (int i = 0; i < 3; ++i) {
-            p.bbox_min[i] = c.bbox_min[i];
-            p.bbox_max[i] = c.bbox_max[i];
-        }
-        mesh->public_chunks.push_back(p);
-    }
-
-    mesh->caller_owned = owned;
-    *out_mesh = mesh;
+    // The handle owns a reference; the mesh itself is never touched here. It was
+    // finalised before publication precisely so this function has nothing to
+    // mutate -- writing through a pointer the cache shares would race with every
+    // other holder, and would reallocate a vector that redfs_mesh_chunk_at hands
+    // out interior pointers into.
+    *out_mesh = new redfs_mesh{std::move(data)};
     return REDFS_OK;
 }
 
 void redfs_mesh_close(redfs_mesh* mesh) {
-    // Cached meshes outlive the handle; only a cache miss with the cache off
-    // produces something this call owns.
-    if (mesh && mesh->caller_owned) delete mesh;
+    // Always drops exactly this handle's reference. The data survives if the
+    // cache -- or another open handle -- still refers to it, so closing is safe
+    // no matter what the cache is doing.
+    delete mesh;
 }
 
 uint32_t redfs_mesh_chunk_count(const redfs_mesh* mesh) {
-    return mesh ? static_cast<uint32_t>(mesh->chunks.size()) : 0;
+    return mesh && mesh->data ? static_cast<uint32_t>(mesh->data->chunks.size()) : 0;
 }
 
 const redfs_mesh_chunk* redfs_mesh_chunk_at(const redfs_mesh* mesh, uint32_t index) {
-    if (!mesh || index >= mesh->public_chunks.size()) return nullptr;
-    return &mesh->public_chunks[index];
+    if (!mesh || !mesh->data || index >= mesh->data->public_chunks.size()) return nullptr;
+    // Safe to hand out: public_chunks is immutable for as long as this handle
+    // holds its reference.
+    return &mesh->data->public_chunks[index];
 }
 
-uint32_t redfs_mesh_lod_count(const redfs_mesh* mesh) { return mesh ? mesh->lod_count : 0; }
+uint32_t redfs_mesh_lod_count(const redfs_mesh* mesh) {
+    return mesh && mesh->data ? mesh->data->lod_count : 0;
+}
 
 void redfs_mesh_bounds(const redfs_mesh* mesh, float out_min[3], float out_max[3]) {
-    if (!mesh) return;
+    if (!mesh || !mesh->data) return;
     for (int i = 0; i < 3; ++i) {
-        if (out_min) out_min[i] = mesh->bbox_min[i];
-        if (out_max) out_max[i] = mesh->bbox_max[i];
+        if (out_min) out_min[i] = mesh->data->bbox_min[i];
+        if (out_max) out_max[i] = mesh->data->bbox_max[i];
     }
 }
 
 uint32_t redfs_mesh_appearance_count(const redfs_mesh* mesh) {
-    return mesh ? static_cast<uint32_t>(mesh->appearances.size()) : 0;
+    return mesh && mesh->data ? static_cast<uint32_t>(mesh->data->appearances.size()) : 0;
 }
 
 const char* redfs_mesh_appearance_name(const redfs_mesh* mesh, uint32_t appearance) {
-    if (!mesh || appearance >= mesh->appearances.size()) return "";
-    return mesh->appearances[appearance].name.c_str();
+    if (!mesh || !mesh->data || appearance >= mesh->data->appearances.size()) return "";
+    return mesh->data->appearances[appearance].name.c_str();
 }
 
 int32_t redfs_mesh_find_appearance(const redfs_mesh* mesh, const char* name) {
-    if (!mesh || !name) return -1;
-    for (uint32_t i = 0; i < mesh->appearances.size(); ++i)
-        if (mesh->appearances[i].name == name) return static_cast<int32_t>(i);
+    if (!mesh || !mesh->data || !name) return -1;
+    for (uint32_t i = 0; i < mesh->data->appearances.size(); ++i)
+        if (mesh->data->appearances[i].name == name) return static_cast<int32_t>(i);
     return -1;
 }
 
 const char* redfs_mesh_chunk_material(const redfs_mesh* mesh, uint32_t appearance, uint32_t chunk) {
-    if (!mesh || appearance >= mesh->appearances.size()) return "";
-    const auto& mats = mesh->appearances[appearance].chunk_materials;
+    if (!mesh || !mesh->data || appearance >= mesh->data->appearances.size()) return "";
+    const auto& mats = mesh->data->appearances[appearance].chunk_materials;
     if (chunk >= mats.size()) return "";
     return mats[chunk].c_str();
 }

@@ -15,10 +15,13 @@
 
 #include "fixtures.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "redfs.h"
@@ -47,9 +50,28 @@ enum Mutation {
     kZeroRegion,
     kMaxOutU32,     // a size or offset field becomes enormous
     kNegativeU32,   // ...or 0xFFFFFFFF, which underflows a subtraction
+    kWrapU32,       // ...or a value that makes `x + K` wrap to exactly 0
     kTruncate,
     kDuplicateByte,
     kMutationCount
+};
+
+// Values that make a 32-bit `field + K` wrap to zero, for the small constants
+// that appear in header arithmetic. A wrap to exactly zero is far worse than a
+// wrap to a large number: the pointer does not advance at all, so a walk loop
+// spins forever instead of failing a bounds check.
+//
+// This set exists because the original mutations could not reach it. struct_end
+// advanced by `8 + (sz - 4)`, which is zero only for sz == 0xFFFFFFFC; the
+// generator's 0x7FFFFFFF and 0xFFFFFFFF advance by ~2 GB and 3 respectively, so
+// 20k iterations passed over a hang that a single well-chosen value finds.
+const uint32_t kWrapValues[] = {
+    0xFFFFFFFCu,  // x + 4  == 0   (and `8 + (x - 4)`)
+    0xFFFFFFF8u,  // x + 8  == 0
+    0xFFFFFFF4u,  // x + 12 == 0
+    0xFFFFFFF0u,  // x + 16 == 0
+    0xFFFFFFFEu,  // x + 2  == 0
+    0xFFFFFFFFu,  // x + 1  == 0
 };
 
 void mutate(std::vector<uint8_t>& data, Rng& rng) {
@@ -80,6 +102,14 @@ void mutate(std::vector<uint8_t>& data, Rng& rng) {
             if (data.size() < 4) break;
             const uint32_t at = rng.below((uint32_t)data.size() - 3);
             const uint32_t v = 0xFFFFFFFFu;
+            std::memcpy(data.data() + at, &v, 4);
+            break;
+        }
+        case kWrapU32: {
+            if (data.size() < 4) break;
+            const uint32_t at = rng.below((uint32_t)data.size() - 3);
+            const uint32_t v =
+                kWrapValues[rng.below(sizeof(kWrapValues) / sizeof(*kWrapValues))];
             std::memcpy(data.data() + at, &v, 4);
             break;
         }
@@ -227,11 +257,41 @@ int main(int argc, char** argv) {
         archive_corpus.push_back(ab.build());
     }
 
+    // Watchdog. A crash announces itself; a hang does not -- it just wedges the
+    // run and looks like slow progress, which is exactly how an infinite loop in
+    // struct_end survived 20k iterations. This thread notices when an iteration
+    // stops making progress and aborts with the offending input identified, so a
+    // hang fails the run like any other defect.
+    std::atomic<uint32_t> current_iteration{0};
+    std::atomic<bool> finished{false};
+    std::thread watchdog([&] {
+        uint32_t last_seen = 0;
+        int stalled_checks = 0;
+        while (!finished.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            const uint32_t now = current_iteration.load(std::memory_order_relaxed);
+            if (now == last_seen && !finished.load(std::memory_order_relaxed)) {
+                if (++stalled_checks >= 20) {  // ~10 s on one input
+                    std::fprintf(stderr,
+                                 "\nHANG: iteration %u made no progress for 10 s.\n"
+                                 "Reproduce with: redfs_fuzz %u %llu\n",
+                                 now, now + 1, (unsigned long long)seed);
+                    std::fflush(stderr);
+                    std::abort();
+                }
+            } else {
+                stalled_checks = 0;
+                last_seen = now;
+            }
+        }
+    });
+
     Rng rng(seed);
     const std::string arc_path = temp_path("mutated.archive");
 
     uint32_t cr2w_runs = 0, archive_runs = 0;
     for (uint32_t i = 0; i < iterations; ++i) {
+        current_iteration.store(i, std::memory_order_relaxed);
         if ((i % 4) == 3) {
             std::vector<uint8_t> data = archive_corpus[rng.below((uint32_t)archive_corpus.size())];
             const uint32_t rounds = rng.below(3) + 1;
@@ -250,7 +310,10 @@ int main(int argc, char** argv) {
             std::printf("  %u%%\n", 100 * i / iterations);
     }
 
-    std::printf("\nsurvived %u CR2W and %u archive mutations without crashing\n", cr2w_runs,
-                archive_runs);
+    finished.store(true, std::memory_order_relaxed);
+    watchdog.join();
+
+    std::printf("\nsurvived %u CR2W and %u archive mutations without crashing or hanging\n",
+                cr2w_runs, archive_runs);
     return 0;
 }

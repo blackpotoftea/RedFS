@@ -283,16 +283,28 @@ redfs_cache_warm(depot, hashes, count, &computed);
 Do **not** try to warm the whole depot — ~10⁵ meshes would cost minutes and
 gigabytes. Warm what you actually touch.
 
+Mounting an archive after `redfs_cache_open` **drops the cache** and
+re-fingerprints against the new archive set, because a mounted mod can override
+geometry that is already cached. That is correct but costs you the warm cache, so
+mount everything you intend to before opening it.
+
 ## 7. Keep it off the render thread
 
 Reads are milliseconds. Either call from your own worker, or:
 
 ```c
-redfs_read_async(depot, key, REDFS_PART_ALL, on_loaded, user);
-/* on_loaded runs on RedFS's worker thread -- marshal back yourself */
+/* The return value decides whether the callback fires at all:
+   REDFS_OK        -> it WILL fire exactly once
+   anything else   -> it will NOT fire; handle the error right here      */
+if (redfs_read_async(depot, key, REDFS_PART_ALL, on_loaded, user) != REDFS_OK)
+    handle_now();
 
+/* on_loaded runs on RedFS's worker thread -- marshal back yourself */
 void on_loaded(redfs_status st, redfs_blob blob, void* user) {
     if (st == REDFS_OK) { queue_for_main_thread(blob); }  /* you now own it */
+    /* Chaining the next read from here is fine; during shutdown it simply
+       returns REDFS_E_CANCELLED. Do NOT call redfs_drain or redfs_shutdown
+       from a callback -- both would wait on the job you are completing. */
 }
 ```
 
@@ -379,12 +391,18 @@ For verbose internal logging, set `REDFS_VERBOSE=1`.
 ## Pitfalls
 
 - **`redfs_cr2w` borrows its bytes.** Free the blob only after `cr2w_close`.
-- **`redfs_mesh_close` on a cached mesh is a no-op by design** — the cache owns
-  it. Do not hold the pointer past `redfs_cache_close`.
+- **Always `redfs_mesh_close` every handle**, cached or not. The handle owns a
+  reference to the decoded mesh, so it stays valid even across
+  `redfs_cache_close` or `redfs_shutdown` — but it is only released when you
+  close it.
 - **Bounding boxes are game space, Z up**, not the Y-up flip glTF exporters use.
   Compare against component transforms directly.
 - **Chunks repeat per LOD.** Filter on `lod` or you will count geometry twice.
-- **`mount` and `close` are not thread-safe.** Everything else is.
+- **`mount`, `close`, `shutdown` and the cache calls are not thread-safe.** Reads,
+  stats and the texture/mesh helpers are — share the depot freely.
+- **A `redfs_cr2w` handle is single-threaded.** Decoding a `CString` caches it on
+  the handle, so two threads calling `redfs_cr2w_get` on the *same* handle race.
+  Give each thread its own handle; the depot underneath is still shared.
 - **Oodle is resolved lazily.** Missing `oo2ext_7_win64.dll` is not a mount
   failure; it surfaces as `REDFS_E_OODLE` on the first compressed read.
 - **Reading from a path you guessed** usually fails. Confirm with

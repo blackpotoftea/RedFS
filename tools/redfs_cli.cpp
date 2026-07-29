@@ -125,6 +125,10 @@ redfs_depot* mount(const char* game_dir) {
     std::printf("mounted %u archives, %" PRIu64 " files, %.1f MB index, in %.0f ms\n",
                 redfs_depot_archive_count(d), redfs_depot_file_count(d),
                 redfs_depot_index_bytes(d) / 1048576.0, ms_since(t0));
+    // Nearly every segment is Kraken-compressed, so without Oodle almost nothing
+    // reads. Say so once here rather than let every read fail with E_OODLE.
+    if (!redfs_oodle_available())
+        std::fprintf(stderr, "WARNING: Oodle unresolved -- compressed reads will fail\n");
     return d;
 }
 

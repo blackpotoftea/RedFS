@@ -6,6 +6,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "redfs.h"
@@ -190,7 +191,14 @@ struct redfs_cr2w {
     std::vector<redfs::Cr2wBuffer> buffers;
     // CString values are decoded on demand; the handle owns them so that
     // redfs_value::as.s stays valid for as long as the caller holds the CR2W.
+    // Keyed by source pointer so decoding the same property twice reuses the
+    // result instead of growing the handle on every query.
+    //
+    // Mutated by cr2w_decode, which means a CR2W handle is SINGLE-THREADED --
+    // see the threading note in redfs.h. Depot reads remain safe to share; it is
+    // only an individual redfs_cr2w* that must not be touched from two threads.
     std::vector<std::unique_ptr<std::string>> owned_strings;
+    std::unordered_map<const uint8_t*, std::string*> string_cache;
 
     // Both accessors must bounds-check the *offset*, not just the index. A
     // corrupt name table holds arbitrary offsets, and every returned pointer is
@@ -253,33 +261,63 @@ struct MeshAppearance {
     std::vector<std::string> chunk_materials;  // parallel to chunks
 };
 
-}  // namespace redfs
-
-struct redfs_mesh {
+// A fully decoded mesh. IMMUTABLE once built.
+//
+// That immutability is the whole design. The cache hands the same object to
+// every caller, so anything that mutates it after publication is a data race --
+// and redfs_mesh_chunk_at returns an interior pointer callers may hold, so a
+// vector that grows after publication is a use-after-free waiting to happen.
+// public_chunks is therefore populated at CONSTRUCTION (mesh_build, and
+// cache deserialize), never on open.
+//
+// Ownership is shared: the cache holds a reference and so does every open
+// handle, so closing the cache cannot pull the object out from under a caller
+// who is still using it.
+struct MeshData {
     uint64_t hash = 0;
     uint32_t lod_count = 1;
     float bbox_min[3] = {0, 0, 0};
     float bbox_max[3] = {0, 0, 0};
-    std::vector<redfs::MeshChunk> chunks;
-    std::vector<redfs::MeshAppearance> appearances;
+    std::vector<MeshChunk> chunks;
+    std::vector<MeshAppearance> appearances;
 
-    // Filled on open so redfs_mesh_chunk_at can hand back a stable pointer.
+    // Mirrors `chunks` in the public struct layout, so redfs_mesh_chunk_at can
+    // return a pointer straight into it.
     std::vector<redfs_mesh_chunk> public_chunks;
-    // True only when the cache is off and the caller must free this.
-    bool caller_owned = false;
+
+    // Derives public_chunks from chunks. Call once, before publication.
+    void finalize();
+};
+
+}  // namespace redfs
+
+// The handle a caller holds. Deliberately not the mesh itself: it exists to own
+// a reference, so redfs_mesh_close always means "drop my reference" regardless
+// of whether the cache is on, and an outstanding handle keeps the data alive
+// past redfs_cache_close.
+struct redfs_mesh {
+    std::shared_ptr<const redfs::MeshData> data;
 };
 
 namespace redfs {
 
-using Mesh = redfs_mesh;
+using Mesh = MeshData;
 
 // Reads and fully decodes a mesh, geometry sweep included.
 redfs_status mesh_build(const redfs_depot* depot, uint64_t hash, Mesh* out);
 
 // --- mesh cache --------------------------------------------------------------
 
-// Returns a cached mesh if one exists, otherwise builds and records it.
-redfs_status mesh_acquire(const redfs_depot* depot, uint64_t hash, Mesh** out, bool* out_owned);
+// Returns a cached mesh if one exists, otherwise builds and records it. The
+// result is shared: the caller's reference keeps it alive independently of the
+// cache, so cache_close cannot invalidate a live handle.
+redfs_status mesh_acquire(const redfs_depot* depot, uint64_t hash,
+                          std::shared_ptr<const Mesh>* out);
+
+// Drops every cached entry and re-fingerprints against the depot as it is NOW.
+// Called when the archive set changes; without it a mount after cache_open
+// serves pre-mount geometry and flushes new entries under the stale label.
+void cache_invalidate(const redfs_depot* depot);
 redfs_status cache_open(const redfs_depot* depot, const char* file);
 redfs_status cache_flush();
 void cache_close();
