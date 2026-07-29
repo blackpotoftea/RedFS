@@ -1,10 +1,9 @@
 // Format helpers built on top of the depot + CR2W reader.
 //
-// These exist because "give me the bytes" is not what a mod actually wants. A
-// cooked .xbm is a CR2W document describing a texture plus a separate buffer of
-// GPU-ready pixels; nothing can consume that directly. Stitching a DDS header
-// onto the payload turns it into something DirectXTex, DirectXTK or a bare
-// CreateTexture2D call will accept.
+// "Give me the bytes" is not what a mod actually wants: a cooked .xbm is a CR2W
+// document describing a texture plus a separate buffer of GPU-ready pixels, and
+// nothing consumes that directly. Stitching a DDS header onto the payload turns
+// it into something DirectXTex, DirectXTK or a bare CreateTexture2D accepts.
 
 #include "internal.hpp"
 
@@ -12,7 +11,7 @@
 #include <cmath>
 #include <vector>
 
-#include <string.h>  // _stricmp
+#include <string.h>  // strcmp, memcpy, memset
 
 namespace redfs {
 namespace {
@@ -105,15 +104,11 @@ uint64_t mip_chain_bytes(uint32_t fmt, uint32_t w, uint32_t h, uint32_t depth, u
                          uint32_t slices) {
     if (w == 0 || h == 0 || mips == 0) return 0;
     uint64_t total = 0;
-    // The mip count comes from the file and nothing upstream bounds it, so the
-    // trip count is the whole hazard: a crafted 0xFFFFFFFB spins for seconds per
-    // call, five calls per describe_texture, on whatever thread asked -- and this
-    // is a synchronous entry point, so that thread is usually the game's.
-    //
-    // 32 costs nothing legitimate. Level m has extent max(1, w >> m), so for a
-    // 32-bit extent level 31 is the last that can differ from its predecessor;
-    // a complete chain for a 2^31-wide texture is exactly 32 levels, and real
-    // content tops out at 15 (16384x16384). It also keeps `w >> m` defined.
+    // `mips` comes from the file, so bound the trip count here too. 32 is where
+    // the arithmetic stops meaning anything: level m has extent max(1, w >> m),
+    // so for a 32-bit extent level 31 is the last that can differ from its
+    // predecessor, and m >= 32 makes `w >> m` UB. Real content tops out at 15
+    // (16384x16384).
     for (uint32_t m = 0; m < mips && m < 32; ++m) {
         const uint32_t mw = (std::max)(1u, w >> m);
         const uint32_t mh = (std::max)(1u, h >> m);
@@ -199,13 +194,12 @@ void write_dds_header(uint8_t* dst, const redfs_texture_desc& d) {
     w.u32(d.dxgi_format);
     w.u32(d.is_3d ? D3D10_TEXTURE3D : D3D10_TEXTURE2D);
     w.u32(d.is_cubemap ? D3D11_MISC_TEXTURECUBE : 0u);
-    // On disk, arraySize counts CUBES, not faces: every DDS loader multiplies it
+    // On disk arraySize counts CUBES, not faces: every DDS loader multiplies it
     // by 6 when MISC_TEXTURECUBE is set (DirectXTK DDSTextureLoader.cpp --
     // `if (miscFlag & D3D11_RESOURCE_MISC_TEXTURECUBE) { arraySize *= 6; }`).
-    // RED4's sliceCount counts faces, which is what mip_chain_bytes above wants,
-    // so this is the one place the two conventions have to be bridged -- writing
-    // the face count here declared 36 faces for a 6-face payload and every
-    // cubemap we emitted failed to load with ERROR_HANDLE_EOF.
+    // RED4's sliceCount counts faces, which is what mip_chain_bytes wants, so
+    // this is the one place the two conventions are bridged. Writing the face
+    // count declares 36 faces for a 6-face payload: ERROR_HANDLE_EOF on load.
     w.u32(d.is_cubemap ? (std::max)(1u, d.slice_count / 6u) : (std::max)(1u, d.slice_count));
     w.u32(DDS_ALPHA_MODE_STRAIGHT);
 }
@@ -253,10 +247,9 @@ float float_or(const redfs_cr2w& f, uint32_t chunk, const char* path, float fall
 
 redfs_status describe_texture(const redfs_depot* depot, uint64_t hash, const redfs_cr2w& f,
                               redfs_texture_desc* out) {
-    // A .mesh embeds its own CBitmapTexture chunks, so "this file contains a
-    // texture blob" is not the same as "this file is a texture". Insist on the
-    // root chunk actually being a texture resource, otherwise we would happily
-    // describe a mesh's first embedded texture and read `setup` off the mesh.
+    // A .mesh embeds its own CBitmapTexture chunks, so "contains a texture blob"
+    // is not "is a texture". Without the root-chunk check we would describe a
+    // mesh's first embedded texture and read `setup` off the mesh.
     if (f.chunks.empty()) return fail(REDFS_E_CORRUPT, "CR2W has no chunks");
     const char* root = f.name(f.chunks[0].class_name);
     const bool is_texture = std::strcmp(root, "CBitmapTexture") == 0 ||
@@ -300,18 +293,17 @@ redfs_status describe_texture(const redfs_depot* depot, uint64_t hash, const red
     if (cr2w_find(&f, blob, "textureData", &tex) == REDFS_OK && tex.kind == REDFS_KIND_BUFFER)
         out->buffer_index = tex.as.buffer;
     else
-        // Falling through to buffer 0 is usually right -- textures have one
-        // attached buffer -- but when it is not, the caller gets pixels from an
-        // unrelated buffer with nothing to distinguish that from success. Say so,
-        // so a wrong image is traceable from a log rather than a guess.
+        // Usually right -- textures have one attached buffer -- but when it is
+        // not, the caller gets an unrelated buffer's pixels with nothing to
+        // distinguish that from success.
         log("texture 0x%016llX: no textureData buffer property; assuming attached buffer 0",
             static_cast<unsigned long long>(hash));
 
     if (out->width == 0 || out->height == 0)
         return fail(REDFS_E_CORRUPT, "texture header has zero extent");
     // A complete chain never exceeds 32 levels for any 32-bit extent (see
-    // mip_chain_bytes). Rejecting here rather than silently clamping means a
-    // caller is never handed a descriptor built from a nonsense mip count.
+    // mip_chain_bytes). Reject rather than clamp, so no caller is handed a
+    // descriptor built from a nonsense mip count.
     if (out->mip_count > 32)
         return fail(REDFS_E_CORRUPT, "texture header claims %u mips", out->mip_count);
     if (out->dxgi_format == DXGI_UNKNOWN)
@@ -323,11 +315,11 @@ redfs_status describe_texture(const redfs_depot* depot, uint64_t hash, const red
     if (st != REDFS_OK) return st;
     out->data_size = data_size;
 
-    // Reconcile the header against the payload. On a minority of textures CDPR
-    // writes the mip-biased extent into sizeInfo while the buffer still holds
-    // the unbiased surface, and a DDS whose header disagrees with its payload
-    // decodes to garbage. The payload is the actual GPU resource, so when a
-    // power-of-two rescale makes the two agree exactly, take that reading.
+    // On a minority of textures CDPR writes the mip-biased extent into sizeInfo
+    // while the buffer still holds the unbiased surface, and a DDS whose header
+    // disagrees with its payload decodes to garbage. The payload is the actual
+    // GPU resource, so when a power-of-two rescale makes the two agree exactly,
+    // take that reading.
     const uint64_t declared = mip_chain_bytes(out->dxgi_format, out->width, out->height,
                                               out->depth, out->mip_count, out->slice_count);
     if (declared != data_size) {
@@ -335,8 +327,8 @@ redfs_status describe_texture(const redfs_depot* depot, uint64_t hash, const red
         for (uint32_t shift = 1; shift <= 4; ++shift) {
             // 64-bit, because `out->width << shift` is a 32-bit shift that wraps:
             // 0x40000000 << 2 is 0, mip_chain_bytes then returns 0 through its own
-            // zero-extent guard, and a zero-size payload would make that "match" --
-            // committing width = 0 straight past the check eight lines above.
+            // zero-extent guard, and a zero-size payload would make that "match",
+            // committing width = 0 straight past the zero-extent check above.
             const uint64_t w = static_cast<uint64_t>(out->width) << shift;
             const uint64_t h = static_cast<uint64_t>(out->height) << shift;
             if (w > 0xFFFFFFFFull || h > 0xFFFFFFFFull) break;
@@ -355,10 +347,9 @@ redfs_status describe_texture(const redfs_depot* depot, uint64_t hash, const red
             reconciled = true;
             break;
         }
-        // No rescale fit. The header is known to disagree with the payload, and
-        // callers get it anyway -- rejecting would break a documented class of
-        // stock content the four-shift search does not cover. Say so, rather
-        // than discarding the one number that proves something is off.
+        // No rescale fit. Callers get the header anyway -- rejecting would break
+        // stock content the four-shift search does not cover -- so log the two
+        // numbers that prove something is off.
         if (!reconciled)
             log("texture 0x%016llX: header describes %llu bytes but the payload is %llu; "
                 "returning the header as-is",
@@ -418,11 +409,10 @@ redfs_status audio_probe(const redfs_depot* depot, uint64_t hash, redfs_audio_fo
     if (st != REDFS_OK) return st;
 
     // read_part is all-or-nothing -- it returns REDFS_E_RANGE when the buffer is
-    // smaller than the segment -- so there is no such thing as reading "just the
-    // header" here. A previous 1 MiB cap therefore did not limit the work; it
-    // skipped the read entirely for anything larger, left `head` zeroed, and
-    // reported UNKNOWN. That silently covered every music .wem and every
-    // .opuspak, which is to say every file REDFS_AUDIO_OPUSPAK exists for.
+    // smaller than the segment -- so reading "just the header" does not exist
+    // here. A size cap does not bound the work, it skips the read entirely for
+    // anything larger, leaves `head` zeroed and reports UNKNOWN: that is every
+    // music .wem and every .opuspak, i.e. every file this probe exists for.
     if (total) {
         std::vector<uint8_t> buf(static_cast<size_t>(total));
         uint64_t got = 0;
@@ -446,11 +436,10 @@ redfs_status audio_probe(const redfs_depot* depot, uint64_t hash, redfs_audio_fo
 // whose wFormatTag may be a Wwise-private value, a 'data' chunk, and codec state
 // in non-standard chunks such as 'vorb' and 'seek'.
 //
-// RedFS parses the header and reports where the payload is. It deliberately does
-// not decode: Vorbis and Opus would mean bundling codecs, and Wwise Vorbis needs
-// its stripped codebooks rebuilt anyway (that is what ww2ogg and vgmstream do).
-// Knowing the codec, the layout and the payload offset is what a caller actually
-// needs to hand it to a decoder it already has.
+// RedFS reports where the payload is and deliberately does not decode: that
+// would mean bundling Vorbis and Opus, and Wwise Vorbis needs its stripped
+// codebooks rebuilt on top (what ww2ogg and vgmstream do). Codec, layout and
+// payload offset are what a caller needs to reach a decoder it already has.
 
 namespace {
 
@@ -470,7 +459,7 @@ redfs_audio_codec codec_from_tag(uint32_t tag) {
         case 0x3041: return REDFS_CODEC_OPUS;
         case 0xFFFF: return REDFS_CODEC_VORBIS;
         // WAVE_FORMAT_EXTENSIBLE: the real codec lives in the GUID, which Wwise
-        // does not populate usefully. Report unknown rather than guess.
+        // does not populate usefully. Unknown rather than a guess.
         case 0xFFFE: return REDFS_CODEC_UNKNOWN;
         default: return REDFS_CODEC_UNKNOWN;
     }
@@ -532,10 +521,9 @@ redfs_status audio_info_parse(const void* data, uint64_t size, redfs_audio_info*
     if (st != REDFS_OK) return st;
     if (!saw_fmt) return fail(REDFS_E_CORRUPT, "wem has no fmt chunk");
 
-    // Duration is only honest where the layout makes it so. For PCM the sample
-    // count follows from the block size; for compressed codecs the byte rate is
-    // an average and would give a misleading answer, so leave it at zero rather
-    // than report something a caller might trust.
+    // Only PCM gets a duration: the sample count follows from the block size.
+    // For compressed codecs the byte rate is an average, so a computed duration
+    // would be wrong in a way a caller would trust. Leave it at zero.
     if (out->codec == REDFS_CODEC_PCM && out->channels && out->bits_per_sample) {
         const uint64_t frame = static_cast<uint64_t>(out->channels) * (out->bits_per_sample / 8);
         if (frame) {
@@ -577,10 +565,9 @@ namespace {
 // reconciles it against the payload, so a truncated or crafted array can claim
 // four billion elements it does not contain. Walking reports what actually
 // decodes -- which is also what redfs_mesh_chunk_count reports, and two public
-// entry points must not disagree about the same number.
-//
-// Cheap: cr2w_walk_array stops as soon as an element fails to advance, so a
-// bogus count costs a handful of iterations, not its face value.
+// entry points must not disagree about the same number. Cheap: cr2w_walk_array
+// stops as soon as an element fails to advance, so a bogus count costs a handful
+// of iterations, not its face value.
 uint32_t walked_count(const redfs_cr2w* f, const redfs_value* v) {
     uint32_t n = 0;
     cr2w_walk_array(
@@ -626,9 +613,9 @@ redfs_status mesh_desc_of(const redfs_depot* depot, uint64_t hash, redfs_mesh_de
     if (cr2w_find(&f, 0, "materialEntries", &v) == REDFS_OK && v.kind == REDFS_KIND_ARRAY)
         out->material_count = walked_count(&f, &v);
 
-    // Stored in the file, so it can be NaN or infinity. Same reasoning as
-    // mesh_build: a non-finite box makes every comparison a caller writes
-    // against it false, which reads as "nothing matched" rather than as an error.
+    // Stored in the file, so it can be NaN or infinity -- which makes every
+    // comparison a caller writes against the box false, reading as "nothing
+    // matched" rather than as an error. Same clamp as mesh_build.
     auto finite_or_zero = [](float v) { return std::isfinite(v) ? v : 0.f; };
     out->bbox_min[0] = finite_or_zero(float_or(f, 0, "boundingBox.Min.X", 0.f));
     out->bbox_min[1] = finite_or_zero(float_or(f, 0, "boundingBox.Min.Y", 0.f));

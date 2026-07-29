@@ -6,7 +6,7 @@
 //
 //   redfs::Depot depot = redfs::Depot::open().value();
 //   auto dds = depot.texture_dds("base\\icon\\common\\ico_scanner.xbm");
-//   device.CreateTextureFromMemory(dds->data(), dds->size());
+//   DirectX::CreateDDSTextureFromMemory(device, dds->data(), dds->size(), ...);
 #pragma once
 
 #include <array>
@@ -44,10 +44,8 @@ inline const char* to_string(Status s) { return redfs_status_string(s); }
 inline bool abi_ok() { return redfs_abi_version() == REDFS_ABI_VERSION; }
 inline std::string last_error() { return redfs_last_error(); }
 
-/// A depot path, hashed the way the engine hashes it.
 inline uint64_t hash(std::string_view path) { return redfs_hash_n(path.data(), path.size()); }
 
-/// Decimal form of a key, for hosts that cannot hold a uint64 exactly.
 inline std::string hash_string(std::string_view path) {
     return std::to_string(hash(path));
 }
@@ -55,8 +53,9 @@ inline uint64_t hash_parse(const std::string& decimal) {
     return redfs_hash_parse(decimal.c_str());
 }
 
-/// Reverse lookup; empty when the hash is not in the dictionary.
-/// See Depot::load_paths.
+/// Empty rather than null when the hash is unknown. The view does not borrow
+/// anything you own: redfs.h interns these strings for the life of the process,
+/// so it stays valid however the dictionary grows afterwards.
 inline std::string_view path_of(uint64_t key) {
     const char* p = redfs_path_from_hash(key);
     return p ? std::string_view{p} : std::string_view{};
@@ -126,7 +125,7 @@ public:
     std::string_view chunk_type(uint32_t i) const { return redfs_cr2w_chunk_type(h_, i); }
     int32_t find_chunk(const char* type) const { return redfs_cr2w_find_chunk(h_, type); }
 
-    /// Depot paths of every resource this file references.
+    /// The views borrow this Cr2w, not the vector.
     std::vector<std::string_view> imports() const {
         std::vector<std::string_view> out;
         const uint32_t n = redfs_cr2w_import_count(h_);
@@ -135,7 +134,6 @@ public:
         return out;
     }
 
-    /// Address nested properties with a dotted path: "header.sizeInfo.width".
     std::optional<Value> get(uint32_t chunk, const char* prop_path) const {
         Value v{};
         if (redfs_cr2w_get(h_, chunk, prop_path, &v) != REDFS_OK) return std::nullopt;
@@ -157,13 +155,12 @@ public:
         return std::string_view{v->as.s};
     }
 
-    /// Visit every property of a chunk (or of a nested struct). `fn` returns
-    /// false to stop early.
+    /// `fn` returns false to stop early.
     template <typename Fn>
     void walk(uint32_t chunk, const char* prop_path, Fn&& fn) const {
-        // remove_reference_t: with a forwarding reference and an lvalue callable,
-        // Fn deduces to L&, and `L&*` is not a type -- MSVC C2528. So passing a
-        // named lambda failed to compile while an inline one worked.
+        // remove_reference_t: with a forwarding reference and an lvalue callable
+        // Fn deduces to L&, and `L&*` is not a type -- MSVC C2528. Without it,
+        // an inline lambda compiles and a named one does not.
         auto trampoline = [](const char* name, const Value* v, void* user) -> int {
             return (*static_cast<std::remove_reference_t<Fn>*>(user))(std::string_view{name}, *v)
                        ? 1
@@ -179,9 +176,6 @@ private:
 };
 
 /// A decoded mesh: chunk table, LODs, appearances and per-chunk bounds.
-///
-/// A chunk index is a bit in a component's chunkMask, so `chunks()` is directly
-/// queryable against a live entity. Chunks repeat per LOD -- filter on `lod`.
 class Mesh {
 public:
     using Chunk = redfs_mesh_chunk;
@@ -261,12 +255,11 @@ public:
         if (h_) redfs_depot_close(h_);
     }
 
-    /// game_dir == nullptr auto-detects from the running process, which is what
-    /// you want from inside the game.
     static std::optional<Depot> open(const char* game_dir = nullptr,
                                      uint32_t flags = REDFS_SCAN_ALL) {
-        // A struct-layout mismatch produces wrong geometry rather than a crash,
-        // so refusing here is the only point at which it is still diagnosable.
+        // Refusing here is the only point at which an ABI mismatch is still
+        // diagnosable -- see abi_ok. It is also the only failure in this header
+        // that never reaches the DLL, so last_error() will not explain it.
         if (!abi_ok()) return std::nullopt;
         redfs_depot* h = nullptr;
         if (redfs_depot_open(game_dir, flags, &h) != REDFS_OK) return std::nullopt;
@@ -293,7 +286,6 @@ public:
     }
     std::optional<FileInfo> stat(std::string_view path) const { return stat(hash(path)); }
 
-    /// Whole file: the resource plus every attached buffer.
     std::optional<Blob> read(uint64_t key, uint32_t part = REDFS_PART_ALL) const {
         redfs_blob b{};
         if (redfs_read(h_, key, part, &b) != REDFS_OK) return std::nullopt;
@@ -303,7 +295,6 @@ public:
         return read(hash(path), part);
     }
 
-    /// Just the CR2W document, without the bulk payload.
     std::optional<Blob> read_main(std::string_view path) const {
         return read(hash(path), REDFS_PART_MAIN);
     }
@@ -311,7 +302,8 @@ public:
         return read(hash(path), index);
     }
 
-    /// Parse a resource's CR2W. The returned pair keeps the bytes alive.
+    /// Returns the Blob as well as the Cr2w because the Cr2w only borrows those
+    /// bytes -- drop the Blob and the document is reading freed memory.
     std::optional<std::pair<Blob, Cr2w>> open_resource(uint64_t key) const {
         auto blob = read(key, REDFS_PART_MAIN);
         if (!blob) return std::nullopt;
@@ -334,7 +326,6 @@ public:
         return texture_desc(hash(path));
     }
 
-    /// A complete in-memory DDS, ready for CreateDDSTextureFromMemory.
     std::optional<Blob> texture_dds(uint64_t key) const {
         redfs_blob b{};
         if (redfs_texture_read_dds(h_, key, &b) != REDFS_OK) return std::nullopt;
@@ -342,8 +333,6 @@ public:
     }
     std::optional<Blob> texture_dds(std::string_view path) const { return texture_dds(hash(path)); }
 
-    /// Raw pixels plus the descriptor, for callers filling their own
-    /// D3D11_SUBRESOURCE_DATA.
     std::optional<std::pair<TextureDesc, Blob>> texture_raw(uint64_t key) const {
         TextureDesc d{};
         redfs_blob b{};
@@ -364,15 +353,12 @@ public:
 
     // --- meshes --------------------------------------------------------------
 
-    /// Cheap: header facts only, no geometry read.
     std::optional<MeshDesc> mesh_desc(std::string_view path) const {
         MeshDesc m{};
         if (redfs_mesh_desc_of(h_, hash(path), &m) != REDFS_OK) return std::nullopt;
         return m;
     }
 
-    /// Full decode including per-chunk bounding boxes. Costs a geometry
-    /// decompress unless the mesh is already cached -- see enable_cache.
     std::optional<Mesh> mesh(uint64_t key) const {
         redfs_mesh* m = nullptr;
         if (redfs_mesh_open(h_, key, &m) != REDFS_OK) return std::nullopt;
@@ -382,9 +368,8 @@ public:
 
     // --- hash -> path --------------------------------------------------------
 
-    /// Load a path dictionary (WolvenKit's usedhashes.kark, or plain text).
-    /// Returns how many entries resolve in this depot. Also switches on
-    /// learning paths from CR2W import tables as files are read.
+    /// The uint32_t is redfs.h's out_kept: how many of the file's paths resolve
+    /// in this depot, not how many it contained.
     std::optional<uint32_t> load_paths(const char* list_file) const {
         uint32_t kept = 0;
         if (redfs_path_load(h_, list_file, &kept) != REDFS_OK) return std::nullopt;
@@ -393,14 +378,13 @@ public:
 
     // --- mesh cache ----------------------------------------------------------
 
-    /// Remember decoded meshes in `file`, across process restarts. Discards
-    /// itself automatically if the mounted archive set changes.
+    /// Opening is per-depot but the rest is static, mirroring redfs.h: there is
+    /// one cache per process, owned by whichever depot opened it.
     Status enable_cache(const char* file) const { return redfs_cache_open(h_, file); }
     static Status flush_cache() { return redfs_cache_flush(); }
     static void close_cache() { redfs_cache_close(); }
     static uint32_t cached_mesh_count() { return redfs_cache_entry_count(); }
 
-    /// Precompute a known set up front, skipping anything already cached.
     std::optional<uint32_t> warm_cache(std::span<const uint64_t> hashes) const {
         uint32_t computed = 0;
         if (redfs_cache_warm(h_, hashes.data(), static_cast<uint32_t>(hashes.size()), &computed) !=
@@ -411,7 +395,7 @@ public:
 
     // --- enumeration ---------------------------------------------------------
 
-    /// Visit every file in the depot. `fn` returns false to stop early.
+    /// `fn` returns false to stop early.
     template <typename Fn>
     void for_each(Fn&& fn) const {
         // See Cr2w::walk for why remove_reference_t is required here.
@@ -423,11 +407,13 @@ public:
 
     // --- async ---------------------------------------------------------------
 
-    /// Read on RedFS's worker thread. `fn` runs on that worker, not here.
+    /// `fn` runs on RedFS's worker thread, not here. It is moved onto the heap
+    /// and destroyed by the callback, so it may be a temporary -- but whatever
+    /// it captures by reference has to still be alive when the worker runs it.
     ///
-    /// The depot must outlive the read. Destroying this Depot cancels anything
-    /// still queued against it, so the callback still fires -- with
-    /// REDFS_E_CANCELLED rather than data.
+    /// This Depot need not outlive the read: destroying it cancels anything
+    /// still queued against it and the callback fires with REDFS_E_CANCELLED
+    /// rather than data.
     template <typename Fn>
     Status read_async(uint64_t key, uint32_t part, Fn fn) const {
         auto* boxed = new Fn(std::move(fn));
@@ -446,7 +432,6 @@ public:
         return st;
     }
 
-    /// Block until every queued async read has finished.
     static void drain() { redfs_drain(); }
 
 private:

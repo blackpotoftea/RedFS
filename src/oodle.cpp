@@ -1,8 +1,11 @@
 // Oodle Kraken decoding.
 //
-// The decoder is *not* shipped with RedFS. Every Cyberpunk 2077 install has
-// bin/x64/oo2ext_7_win64.dll, and inside the game process it is already loaded,
-// so we resolve it at runtime. Nothing about Oodle gets redistributed.
+// Oodle is proprietary: RedFS neither ships nor links it, binding it by name at
+// runtime instead, so the only copy ever used is the one already in the user's
+// own install. Nothing about Oodle gets redistributed.
+//
+// So a missing decoder has to be a recoverable runtime error rather than a link
+// error -- outside the game there is no guarantee the DLL is there at all.
 
 #include "internal.hpp"
 
@@ -14,8 +17,9 @@
 namespace redfs::oodle {
 namespace {
 
-// The subset of the signature we use; the trailing parameters are all defaulted
-// in Oodle's own headers and passed as zero here.
+// Oodle's header defaults everything after raw_len. GetProcAddress does not
+// carry defaults, so the tail is spelled out and passed with the values Oodle
+// itself would have supplied.
 using DecompressFn = int64_t(__stdcall*)(const void* comp, int64_t comp_len, void* raw,
                                          int64_t raw_len, int32_t fuzz_safe, int32_t check_crc,
                                          int32_t verbosity, void* dec_buf_base, int64_t dec_buf_size,
@@ -28,14 +32,17 @@ using DecompressFn = int64_t(__stdcall*)(const void* comp, int64_t comp_len, voi
 std::atomic<DecompressFn> g_decompress{nullptr};
 std::mutex g_load_mutex;
 
+// Oodle's defaults, matching WolvenKit's P/Invoke. fuzz_safe is the load-bearing
+// one: segment bytes come from whatever mod is installed, and it is what obliges
+// the decoder to stay inside raw_len instead of trusting the compressed stream.
 constexpr int32_t kFuzzSafeYes = 1;
 constexpr int32_t kCheckCrcNo = 0;
 constexpr int32_t kVerbosityNone = 0;
 constexpr int32_t kUnthreaded = 3;
 
 void try_load(const std::string& game_dir) {
-    // Inside the game the DLL is already resident -- reuse it, do not load a
-    // second copy.
+    // Inside the game the DLL is already resident -- reuse it rather than
+    // pinning a second reference the host never asked for.
     HMODULE mod = ::GetModuleHandleW(L"oo2ext_7_win64.dll");
 
     if (!mod && !game_dir.empty()) {
@@ -71,7 +78,7 @@ bool load(const char* game_dir) {
     if (g_decompress.load(std::memory_order_relaxed)) return true;
 
     std::lock_guard<std::mutex> lock(g_load_mutex);
-    if (g_decompress.load(std::memory_order_relaxed)) return true;  // won the race
+    if (g_decompress.load(std::memory_order_relaxed)) return true;
     try_load(game_dir ? game_dir : "");
     return g_decompress.load(std::memory_order_relaxed) != nullptr;
 }

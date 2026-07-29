@@ -14,7 +14,7 @@
 //         entry_count   x 56 bytes  { u64 hash; i64 time; u32 inline_bufs;
 //                                     u32 seg_start; u32 seg_end;
 //                                     u32 dep_start; u32 dep_end; u8 sha1[20] }
-//         segment_count x 16 bytes  { u64 offset; u32 zsize; u32 size }
+//         segment_count x 16 bytes  { u64 offset; u32 zsize; u32 size }   -- offset is absolute
 //         dependency_count x u64
 //
 // A segment is raw when zsize == size, otherwise it is
@@ -101,7 +101,6 @@ redfs_status Archive::open(const std::string& path) {
     if (!mh) return fail(REDFS_E_IO, "CreateFileMapping failed for %s", path.c_str());
     map_ = mh;
 
-    // header
     uint8_t header[40];
     {
         void* v = ::MapViewOfFile(mh, FILE_MAP_READ, 0, 0, sizeof(header));
@@ -130,13 +129,11 @@ redfs_status Archive::open(const std::string& path) {
     if (!view_) return fail(REDFS_E_IO, "cannot map index of %s (error %lu)", path.c_str(), ::GetLastError());
 
     const uint8_t* idx = static_cast<const uint8_t*>(view_) + delta;
-    // The whole 28-byte index header is inside the mapping: index_size is checked
-    // against kIndexHeaderSize above, and the view spans delta + index_size.
+    // The 28-byte index header is inside the mapping: index_size >= kIndexHeaderSize
+    // was checked above, and the view spans delta + index_size.
     //
-    // Read into locals and commit to members only after validation, so the class
-    // never carries counts that describe a table it does not have. It makes the
-    // real invariant -- the counts mean something iff entries_ is set -- hold by
-    // construction rather than by every caller destroying a failed Archive.
+    // Read into locals and commit to members only after the size check, so a failed
+    // open never leaves the Archive holding counts for a table it does not have.
     const uint64_t crc = rd64(idx + 8);
     const uint32_t entries = rd32(idx + 16);
     const uint32_t segments = rd32(idx + 20);
@@ -160,9 +157,8 @@ redfs_status Archive::open(const std::string& path) {
 }
 
 redfs_status Archive::read_segment(const Segment& seg, uint8_t* dst) const {
-    // Nothing to map, and mapping zero bytes would not mean "nothing":
     // MapViewOfFile treats a length of 0 as "extend to the end of the mapping",
-    // so a zero-length segment at a 64 KB-aligned offset would reserve the whole
+    // so a zero-length segment at an aligned offset would reserve the rest of the
     // archive -- gigabytes of address space -- to copy no bytes at all.
     if (seg.zsize == 0) {
         if (seg.size) std::memset(dst, 0, seg.size);
@@ -187,7 +183,8 @@ redfs_status Archive::read_segment(const Segment& seg, uint8_t* dst) const {
         std::memcpy(dst, src, seg.size);
     } else if (seg.zsize >= 8 && rd32(src) == kKarkMagic) {
         uint32_t raw = rd32(src + 4);
-        // The KARK header is authoritative when it disagrees with the index.
+        // dst holds only seg.size bytes, so the index bounds the decode: a KARK
+        // raw_size larger than the segment's would otherwise overrun the caller.
         if (raw > seg.size) raw = seg.size;
         if (!oodle::available()) {
             st = fail(REDFS_E_OODLE, "oo2ext_7_win64.dll is not available");
@@ -222,9 +219,8 @@ bool redfs_depot::locate(uint64_t hash, redfs::Located* out) const {
     auto it = std::lower_bound(refs.begin(), refs.end(), hash,
                                [](const Ref& r, uint64_t h) { return r.hash < h; });
     if (it == refs.end() || it->hash != hash) return false;
-    // refs is built from `archives`, so this index is always valid -- but the
-    // invariant lives in reindex(), a long way from here, and a stale ref would
-    // be a use-after-free rather than a miss.
+    // refs is built from `archives` in reindex(), far from here; a stale index
+    // would be a use-after-free rather than a miss, so re-check it.
     if (it->archive >= archives.size()) return false;
     if (out) {
         out->archive = archives[it->archive];
@@ -256,17 +252,12 @@ redfs_status resolve_part(const redfs_depot* depot, uint64_t hash, uint32_t part
     } else {
         // buffer i == segment start + 1 + i
         //
-        // 64-bit, because `part` is a caller-supplied parameter of redfs_read,
-        // redfs_read_into, redfs_part_size and redfs_read_async, and none of them
-        // validates it. In 32-bit this wrapped: start=5 with part=0xFFFFFFFA gave
-        // seg=0, the check below passed, and the caller got a DIFFERENT file's
-        // main segment back with REDFS_OK where redfs.h promises REDFS_E_RANGE.
-        // A host passing a signed -3 or lower through an FFI lands there without
-        // trying (-1 and -2 are the two documented sentinels, handled above).
-        //
-        // An earlier review dismissed this as unreachable because a `part` the
-        // library derives from CR2W is capped at 0x7FFFFFFE. That bound is real
-        // but covers only the internal callers; it never applied to the C ABI.
+        // Widened to 64-bit because `part` reaches redfs_read, redfs_read_into,
+        // redfs_part_size and redfs_read_async unvalidated: in 32-bit, start=5
+        // with part=0xFFFFFFFA wrapped to seg=0, passed the check below, and
+        // returned a DIFFERENT file's main segment with REDFS_OK where redfs.h
+        // promises REDFS_E_RANGE. A host passing a signed -3 or lower through the
+        // FFI lands there (-1 and -2 are the documented sentinels, handled above).
         const uint64_t seg = static_cast<uint64_t>(start) + 1u + part;
         if (seg >= end) return REDFS_E_RANGE;
         out->first = static_cast<uint32_t>(seg);
@@ -289,20 +280,15 @@ redfs_status read_part(const redfs_depot* depot, uint64_t hash, uint32_t part, u
 
     uint64_t at = 0;
     for (uint32_t i = r.first; i < r.last; ++i) {
-        // Checked per segment rather than per byte: a Kraken block cannot be
-        // interrupted once started, so this is the finest granularity available.
-        // It is what keeps shutdown from having to wait out a whole multi-buffer
-        // read of a large resource.
+        // Per segment, not per byte: a Kraken block cannot be interrupted once
+        // started, so this is the finest granularity available.
         if (abort && abort->load(std::memory_order_relaxed)) return REDFS_E_CANCELLED;
 
         const Segment seg = r.archive->segment(i);
-        // Bound each write independently of the sizing pass above.
-        //
-        // `total` was summed by re-reading these same descriptors, and they live
-        // in a file mapping the OS keeps coherent with the file -- which we open
-        // FILE_SHARE_WRITE. If anything changes a size between the two passes,
-        // the capacity computed from the first no longer covers the second. This
-        // check costs nothing and makes the coupling explicit.
+        // Bound each write independently of the sizing pass: these descriptors
+        // live in a mapping of a file opened FILE_SHARE_WRITE, so a size that
+        // changes between the two passes leaves the capacity checked against
+        // `total` too small for what this pass copies.
         if (seg.size > capacity - at) return REDFS_E_RANGE;
         st = r.archive->read_segment(seg, dst + at);
         if (st != REDFS_OK) return st;

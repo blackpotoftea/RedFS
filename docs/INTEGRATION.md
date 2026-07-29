@@ -404,10 +404,14 @@ Measured on a 57-archive, 85 GB install:
 | `redfs_read` of a 40 KB file | 0.16 ms |
 | `redfs_mesh_open`, cold | 1–2 ms |
 | `redfs_mesh_open`, cached | ~0 ms |
-| `redfs_path_load` (full dictionary) | ~135 MB, opt-in |
+| `redfs_path_load` (full dictionary) | ~135 MB transient, ~40 MB resident, opt-in |
 
-The path dictionary is the only large optional cost. Load it only if you call
-`redfs_path_from_hash`.
+The path dictionary is the only large optional cost, and its two figures are
+different things. `usedhashes.kark` is 3.4 MB on disk and decompresses to
+**~135 MB**, which is held only for the duration of the call. What stays is the
+**~40 MB** of paths that actually resolve in the mounted depot — 544,496 of
+544,670 on a stock install — as interned strings plus a 16-bytes-per-entry
+index. Load it only if you call `redfs_path_from_hash`.
 
 ---
 

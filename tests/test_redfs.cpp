@@ -1920,6 +1920,57 @@ TEST(api, cache_round_trip_preserves_the_public_view) {
     std::remove(cache_file.c_str());
 }
 
+namespace {
+struct CloseFromCb {
+    redfs_depot* depot;
+    std::atomic<int> calls{0};
+    std::atomic<bool> closed{false};
+};
+}  // namespace
+
+TEST(api, closing_a_depot_from_its_own_callback_still_purges_the_queue) {
+    // cancel_for bailed out entirely when called on the worker thread, reasoning
+    // about the IN-FLIGHT job -- which is indeed this one -- and thereby skipping
+    // the queue purge, which is the whole point of the call. Every other job
+    // queued against the depot stayed in the queue holding a raw pointer to it,
+    // and redfs_depot_close then deleted it.
+    //
+    // Only the wait needs skipping on the worker thread. The purge does not.
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\cbclose.bin");
+    ab.add(key, std::vector<uint8_t>(48 * 1024, 0x2D));
+    const std::string p = temp_path("cbclose.archive");
+    ArchiveBuilder::write(p, ab.build());
+
+    redfs_depot* d = nullptr;
+    redfs_depot_open_empty(&d);
+    if (d) {
+        CHECK_OK(redfs_depot_mount(d, p.c_str()));
+
+        CloseFromCb ctx;
+        ctx.depot = d;
+        for (int i = 0; i < 32; ++i) {
+            redfs_read_async(d, key, REDFS_PART_ALL,
+                             [](redfs_status, redfs_blob b, void* u) {
+                                 auto* c = static_cast<CloseFromCb*>(u);
+                                 c->calls.fetch_add(1);
+                                 redfs_blob_free(&b);
+                                 // The first callback closes the depot the
+                                 // remaining queued jobs still point at.
+                                 if (!c->closed.exchange(true)) redfs_depot_close(c->depot);
+                             },
+                             &ctx);
+        }
+
+        // Every callback must still resolve exactly once, and nothing may touch
+        // the depot after it is gone.
+        for (int spin = 0; spin < 400 && ctx.calls.load() < 32; ++spin)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CHECK_EQ(ctx.calls.load(), 32);
+    }
+    std::remove(p.c_str());
+}
+
 TEST(api, cpp_facade_accepts_named_callables) {
     // redfs.hpp's for_each and Cr2w::walk took Fn&& and then did
     // static_cast<Fn*>. For an lvalue callable Fn deduces to L&, and `L&*` is not

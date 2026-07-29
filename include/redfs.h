@@ -8,11 +8,11 @@
  * Stable C ABI. Safe to consume from any compiler / language with C FFI.
  *
  * Threading: a redfs_depot is immutable once opened. redfs_read* / redfs_stat /
- * redfs_texture_* / redfs_mesh_* are safe to call concurrently from any number
- * of threads. redfs_depot_mount / redfs_depot_mount_dir / redfs_depot_close /
- * redfs_shutdown / redfs_cache_* / redfs_path_* are NOT (open first, then
- * share) -- mounting rebuilds the depot index in place, and a concurrent read
- * walks it while it is being reallocated.
+ * redfs_enumerate / redfs_texture_* / redfs_mesh_* are safe to call
+ * concurrently from any number of threads. redfs_depot_mount /
+ * redfs_depot_mount_dir / redfs_depot_close / redfs_shutdown / redfs_cache_* /
+ * redfs_path_* are NOT (open first, then share) -- mounting rebuilds the depot
+ * index in place, and a concurrent read walks it while it is being reallocated.
  *
  * An individual redfs_cr2w handle is SINGLE-THREADED: decoding a CString caches
  * it on the handle, so two threads calling redfs_cr2w_get on the same handle
@@ -60,7 +60,7 @@ typedef enum redfs_status {
     REDFS_E_OOM          = -6,
     REDFS_E_UNSUPPORTED  = -7,  /* known format, not implemented by this build */
     REDFS_E_RANGE        = -8,  /* index / destination buffer out of range */
-    REDFS_E_CANCELLED    = -9   /* queued async read dropped by redfs_shutdown */
+    REDFS_E_CANCELLED    = -9   /* async read dropped by shutdown or depot close */
 } redfs_status;
 
 REDFS_API uint32_t    redfs_abi_version(void);
@@ -78,9 +78,11 @@ typedef struct redfs_depot redfs_depot;
  *
  *   content -> ep1 -> REDmod (mods/) -> legacy (archive/pc/mod/)
  *
- * so a legacy mod overrides a REDmod one, which overrides base game. Within each
- * folder, archives mount in ordinal filename order, which is why modders prefix
- * with zz_ to win.
+ * so a legacy mod overrides a REDmod one, which overrides base game. Under
+ * archive/pc the archives mount in ordinal filename order, so the alphabetically
+ * LAST one wins -- which is why modders prefix with zz_. REDmod is the
+ * exception: mod folders are taken in name order, but the archives within one
+ * folder mount in reverse, so there the alphabetically FIRST one wins.
  */
 typedef enum redfs_scan_flags {
     REDFS_SCAN_CONTENT = 1u << 0,  /* archive/pc/content   (base game)          */
@@ -98,16 +100,15 @@ typedef enum redfs_scan_flags {
  *           called from inside the game, e.g. a RED4ext plugin).
  * flags     which archive folders to mount; REDFS_SCAN_ALL is the usual choice.
  *
- * Mounting is index-only: file *contents* are never read here. Later mounts win
- * on hash collisions, matching the game's own load order (mods override base).
+ * Index-only: file *contents* are never read here.
  */
 REDFS_API redfs_status redfs_depot_open(const char* game_dir, uint32_t flags, redfs_depot** out_depot);
 
 /*
  * An empty depot, to be filled with redfs_depot_mount / redfs_depot_mount_dir.
- * For callers assembling a set of archives by hand rather than scanning an
- * install -- a mod-manager staging tree, a test, or a single archive you were
- * handed. Never fails for want of a game directory.
+ * For callers assembling a set of archives by hand -- a mod-manager staging
+ * tree, a test, a single archive you were handed -- rather than scanning an
+ * install. Never fails for want of a game directory.
  */
 REDFS_API redfs_status redfs_depot_open_empty(redfs_depot** out_depot);
 
@@ -116,10 +117,10 @@ REDFS_API redfs_status redfs_depot_mount(redfs_depot* depot, const char* archive
 
 /*
  * Mount every .archive in a folder, in name order, on top of what is already
- * mounted. For mod trees that live outside the game folder -- an MO2 or Vortex
- * staging directory, say. Not needed when running inside a game that MO2
- * launched: its VFS already makes those archives appear under archive/pc/mod,
- * so REDFS_SCAN_MODS finds them.
+ * mounted -- for mod trees outside the game folder, such as an MO2 or Vortex
+ * staging directory. Not needed when running inside a game MO2 launched: its
+ * VFS already makes those archives appear under archive/pc/mod, where
+ * REDFS_SCAN_MODS finds them.
  *
  * Returns REDFS_E_NOT_FOUND if the folder holds no archives; out_mounted, when
  * given, receives how many were added.
@@ -185,14 +186,10 @@ REDFS_API uint64_t redfs_hash_parse(const char* decimal);
  *      path per line.
  *   3. redfs_path_add.
  *
- * Source 2 retains only paths that resolve in the mounted depot -- on a stock
- * install that keeps roughly a quarter of WolvenKit's shipped list.
- *
- * Sources 1 and 3 are NOT filtered, and structurally cannot be: import learning
- * happens inside CR2W parsing, which has no depot (redfs_cr2w_open does not take
- * one), and redfs_path_add takes only a string. So a hit tells you what a file
- * is CALLED, not that it is readable -- check redfs_exists, or just handle
- * REDFS_E_NOT_FOUND from the read.
+ * Only source 2 is filtered against the mounted depot -- on a stock install that
+ * keeps roughly a quarter of WolvenKit's shipped list. Sources 1 and 3 are not,
+ * so a hit tells you what a file is CALLED, not that it is readable: check
+ * redfs_exists, or just handle REDFS_E_NOT_FOUND from the read.
  *
  * Import learning is off until the dictionary is switched on by either
  * redfs_path_load or redfs_path_enable.
@@ -204,9 +201,8 @@ REDFS_API void         redfs_path_add(const char* depot_path);
 REDFS_API uint32_t     redfs_path_count(void);
 
 /* NULL when the hash is not in the dictionary. The returned string stays valid
- * for the lifetime of the process -- interned strings live in an arena that is
- * never moved or freed, so later additions from any source cannot invalidate a
- * pointer you already hold. */
+ * for the lifetime of the process: later additions from any source cannot
+ * invalidate a pointer you already hold. */
 REDFS_API const char* redfs_path_from_hash(uint64_t hash);
 
 /* ------------------------------------------------------------------------- */
@@ -283,6 +279,9 @@ REDFS_API void redfs_blob_free(redfs_blob* blob);
  *
  * Do NOT call redfs_drain or redfs_shutdown from a callback -- both would wait
  * on the very job you are completing. They detect it and return without acting.
+ * Do not close a depot from a callback either: redfs_depot_close cannot cancel
+ * from the worker thread, so anything still queued against that depot outlives
+ * the free.
  */
 typedef void (*redfs_read_fn)(redfs_status status, redfs_blob blob, void* user);
 REDFS_API redfs_status redfs_read_async(const redfs_depot* depot, uint64_t hash, uint32_t part,
@@ -295,28 +294,25 @@ REDFS_API void redfs_drain(void);
  * close the mesh cache.
  *
  * Call this before your DLL can be unloaded -- from a RED4ext plugin's
- * Main(EMainReason::Unload), or your CET onShutdown. If RedFS is statically
- * linked and the host calls FreeLibrary while the worker is alive, that thread's
- * code is unmapped while it runs, which crashes the game.
+ * Main(EMainReason::Unload), or your CET onShutdown. Unloading with the worker
+ * alive unmaps the code that thread is running, which crashes the game.
  *
  * NEVER call it from DllMain: joining a thread there runs under the loader lock
  * and deadlocks. DllMain is exactly what this call exists to avoid.
  *
- * FAST BY CANCELLING, NOT BY ABANDONING. Queued-but-unstarted reads are dropped,
- * and the one already running gives up at its next segment boundary. So the wait
- * does not scale with how much work was queued or how large the target was --
- * it is bounded by a single segment decode. There is deliberately no timeout:
- * abandoning the thread would reintroduce the exact unmapped-code crash this
- * prevents, so the bound comes from doing less work, never from giving up.
+ * The wait is bounded by a single segment decode, not by how much was queued or
+ * how large the target was: unstarted reads are dropped and the running one
+ * gives up at its next segment boundary. There is deliberately no timeout --
+ * abandoning the thread would reintroduce the unmapped-code crash this prevents.
  *
  * Dropped reads get their callback with REDFS_E_CANCELLED, so nothing is left
  * waiting on a callback that never arrives. Call redfs_drain() first if you
  * actually want queued work to finish.
  *
- * Idempotent, and it quiesces rather than disables -- a later redfs_read_async
- * starts a fresh worker. That matters when RedFS.dll is shared between plugins:
- * one unloading must not permanently break async for the others. Synchronous
- * reads are unaffected throughout.
+ * Idempotent, and it quiesces rather than disables: a later redfs_read_async
+ * starts a fresh worker, so one plugin unloading does not permanently break
+ * async for others sharing RedFS.dll. Synchronous reads are unaffected
+ * throughout.
  */
 REDFS_API void redfs_shutdown(void);
 
@@ -332,7 +328,9 @@ REDFS_API void redfs_shutdown(void);
  */
 typedef struct redfs_cr2w redfs_cr2w;
 
-/* Borrows `data`; it must outlive the handle. */
+/* Borrows `data`; it must outlive the handle. Every redfs_value the calls below
+ * hand back points into `data` or into the handle, so those pointers die with
+ * the handle too -- copy anything you keep past redfs_cr2w_close. */
 REDFS_API redfs_status redfs_cr2w_open(const void* data, uint64_t size, redfs_cr2w** out_cr2w);
 REDFS_API void         redfs_cr2w_close(redfs_cr2w* cr2w);
 
@@ -390,6 +388,9 @@ REDFS_API redfs_status redfs_cr2w_walk(const redfs_cr2w* cr2w, uint32_t chunk,
  * Walk the elements of a REDFS_KIND_ARRAY value. Elements arrive decoded the
  * same way properties do, so an array of structs yields REDFS_KIND_STRUCT
  * values you can address further with redfs_cr2w_get_in.
+ *
+ * Prefer this to looping on as.u: that count is only what the file declares,
+ * and the walk stops early when an element does not decode.
  */
 typedef int (*redfs_elem_fn)(uint32_t index, const redfs_value* value, void* user);
 REDFS_API redfs_status redfs_cr2w_walk_array(const redfs_cr2w* cr2w, const redfs_value* array,
@@ -425,7 +426,7 @@ REDFS_API redfs_status redfs_texture_desc_of(const redfs_depot* depot, uint64_t 
 /*
  * Read an .xbm and hand back a complete in-memory DDS (DDS_HEADER + DXT10 +
  * pixels), ready for DirectX::CreateDDSTextureFromMemory or
- * DirectX::LoadFromDDSMemory. No temp files, no D3D device needed here.
+ * DirectX::LoadFromDDSMemory. No temp files, no D3D device needed.
  */
 REDFS_API redfs_status redfs_texture_read_dds(const redfs_depot* depot, uint64_t hash,
                                               redfs_blob* out_blob);
@@ -450,9 +451,8 @@ typedef enum redfs_audio_format {
 /* Identifies the container from the first bytes of the file.
  *
  * NOT cheap: it decodes the whole main segment to look at 16 bytes, because
- * Kraken cannot decode a prefix -- a partial read is not something the format
- * offers. Costs a decompress proportional to that segment, which for music is
- * tens of MB. Call it off the game thread. */
+ * Kraken cannot decode a prefix. For music that is tens of MB. Call it off the
+ * game thread. */
 REDFS_API redfs_status redfs_audio_probe(const redfs_depot* depot, uint64_t hash,
                                          redfs_audio_format* out_format);
 
@@ -483,10 +483,10 @@ typedef struct redfs_audio_info {
  * Parse a .wem (Wwise RIFF) header: codec, channel layout, sample rate, and
  * where the payload actually starts.
  *
- * RedFS does NOT decode audio -- that would mean bundling Vorbis and Opus. It
- * tells you what you have and where it is, so you can hand the payload to
- * whatever decoder you already use. For PCM and ADPCM that is enough to play
- * directly; Wwise Vorbis needs its codebooks rebuilt (ww2ogg/vgmstream) first.
+ * RedFS does NOT decode audio. It tells you what you have and where it is, so
+ * you can hand the payload to whatever decoder you already use. For PCM and
+ * ADPCM that is enough to play directly; Wwise Vorbis needs its codebooks
+ * rebuilt (ww2ogg/vgmstream) first.
  *
  * Reads only the main segment.
  */
@@ -498,7 +498,8 @@ REDFS_API redfs_status redfs_audio_info_parse(const void* data, uint64_t size,
                                               redfs_audio_info* out_info);
 
 /* Enumerate the RIFF chunks of a .wem. Wwise carries codec state in non-standard
- * chunks ('vorb', 'seek'), and a decoder front-end usually needs to find them. */
+ * chunks ('vorb', 'seek'), and a decoder front-end usually needs to find them.
+ * `fourcc` is exactly 4 bytes and is NOT NUL-terminated. */
 typedef int (*redfs_riff_chunk_fn)(const char fourcc[4], uint64_t offset, uint64_t size,
                                    void* user);
 REDFS_API redfs_status redfs_audio_walk_chunks(const void* data, uint64_t size,
@@ -537,10 +538,10 @@ REDFS_API redfs_status redfs_mesh_desc_of(const redfs_depot* depot, uint64_t has
  * Chunks repeat per LOD: two entries can be the same geometry at different
  * detail. Filter on `lod` to get one copy.
  *
- * The bounding box is NOT stored in the mesh -- nothing in the format carries
- * it. RedFS computes it by dequantizing that chunk's vertex positions, which
- * means redfs_mesh_open has to decompress the geometry buffer. See the cache
- * below: pay that once per mesh, ever.
+ * The bounding box is NOT stored in the format, so RedFS computes it by
+ * dequantizing that chunk's vertex positions -- which means redfs_mesh_open has
+ * to decompress the geometry buffer. See the cache below: pay that once per
+ * mesh, ever.
  *
  * Boxes are in mesh-local GAME space (Z up), matching entity/component
  * transforms -- not the Y-up convention glTF exporters use.
@@ -574,10 +575,9 @@ REDFS_API uint32_t                redfs_mesh_chunk_count(const redfs_mesh* mesh)
 REDFS_API const redfs_mesh_chunk* redfs_mesh_chunk_at(const redfs_mesh* mesh, uint32_t index);
 REDFS_API uint32_t                redfs_mesh_lod_count(const redfs_mesh* mesh);
 /* Whole-mesh box. Unlike the per-chunk boxes above, this one IS stored in the
- * file (CMesh.boundingBox) and is returned as found -- RedFS does not compute or
- * verify it beyond replacing a non-finite value with 0. It covers the whole
- * mesh, so it cannot answer "which chunks are the chest"; use the chunk boxes
- * for that. */
+ * file (CMesh.boundingBox) and is returned as found -- RedFS does not verify it
+ * beyond replacing a non-finite value with 0. It cannot answer "which chunks are
+ * the chest"; use the chunk boxes for that. */
 REDFS_API void redfs_mesh_bounds(const redfs_mesh* mesh, float out_min[3], float out_max[3]);
 
 /* Appearances are the named material sets a component selects by CName. */
@@ -597,15 +597,11 @@ REDFS_API const char* redfs_mesh_chunk_material(const redfs_mesh* mesh, uint32_t
  * first call for a mesh computes, every later call -- including after a restart
  * -- is a lookup.
  *
- * The cache records a fingerprint of the mounted archive set -- each archive's
- * path, entry count, index size, index CRC and declared file size -- and
- * silently discards itself if any of those move. So a game patch, a new mod, or
- * an existing archive REPLACED IN PLACE (a re-cook that keeps the same file and
- * segment counts) cannot serve stale geometry: the index CRC covers the file and
- * segment tables, so it moves with the contents and not just the shape.
- *
- * Mounting after redfs_cache_open re-checks the fingerprint and drops the cache
- * if it changed, so mount order does not have to be perfect.
+ * The cache fingerprints the mounted archive set and silently discards itself
+ * when that moves, so a game patch, a new mod, or an archive REPLACED IN PLACE
+ * (a re-cook that keeps the same file and segment counts) cannot serve stale
+ * geometry. Mounting after redfs_cache_open re-checks, so mount order does not
+ * have to be perfect.
  *
  * There is ONE cache per process, and it belongs to the depot you pass here.
  * Entries are keyed by hash alone, and the same hash means different bytes in a
@@ -639,8 +635,8 @@ REDFS_API redfs_status redfs_cache_warm(const redfs_depot* depot, const uint64_t
  *     failure inside redfs_read_async reports from there.
  *   - It may be invoked CONCURRENTLY. Synchronize your own logger; RedFS does
  *     not serialize calls into it.
- *   - `message` is valid only for the duration of the call. It points at a
- *     stack buffer. Copy it if you keep it.
+ *   - `message` is valid only for the duration of the call. Copy it if you keep
+ *     it.
  *
  * It is never invoked with a RedFS lock held, so calling back into RedFS from
  * the sink is safe.
@@ -650,12 +646,11 @@ REDFS_API void redfs_set_log(redfs_log_fn fn, void* user);
 
 /*
  * Whether Oodle resolved. Compressed segments -- which is nearly everything --
- * fail with REDFS_E_OODLE when this is 0, so it is worth checking once after
- * opening a depot and warning loudly rather than letting every read fail.
+ * fail with REDFS_E_OODLE when this is 0, so check it once after opening a depot
+ * and warn loudly rather than letting every read fail.
  *
- * Inside the game this is effectively always true: the DLL is already resident.
- * It is standalone tools, and installs missing bin/x64/oo2ext_7_win64.dll, that
- * see 0.
+ * Inside the game it is effectively always true: the DLL is already resident.
+ * Standalone tools, and installs missing bin/x64/oo2ext_7_win64.dll, see 0.
  */
 REDFS_API int redfs_oodle_available(void);
 

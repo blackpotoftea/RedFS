@@ -4,8 +4,8 @@
 // needs the game's RTTI (thousands of classes), but the container itself is
 // self-describing: every property carries its own name and RED type name as
 // indices into the file's own string table. So a reader that knows *no* classes
-// can still walk the whole object graph and pull out named fields -- which is
-// all a mod needs to find a texture's dimensions or a mesh's geometry buffer.
+// can still walk the object graph and pull out named fields -- enough to find a
+// texture's dimensions or a mesh's geometry buffer.
 //
 // Layout:
 //   0x00 u32 'CR2W'
@@ -17,10 +17,11 @@
 //
 // Chunk data is a flat TLV stream:
 //   u8 0
-//   repeat { u16 name_idx; u16 type_idx; u32 size_including_these_4; bytes }
+//   repeat { u16 name_idx; u16 type_idx; u32 size; payload }
 //   until name_idx == 0
-// Nested structs use the exact same encoding, which is what makes dotted paths
-// like "header.sizeInfo.width" work.
+// `size` counts its own 4 bytes, so payload is size - 4. Nested structs use the
+// exact same encoding, which is what makes dotted paths like
+// "header.sizeInfo.width" work.
 
 #include "internal.hpp"
 
@@ -56,10 +57,8 @@ int32_t read_vlq(const uint8_t*& p, const uint8_t* end) {
     return negative ? -value : value;
 }
 
-// One step of the TLV walk.
-// Default to empty strings rather than null: `name` and `type` are always passed
-// to strcmp-family functions, so an unfilled Prop should compare as "no match"
-// rather than crash.
+// One step of the TLV walk. `name` and `type` default to "" rather than null
+// because every consumer hands them straight to a strcmp-family call.
 struct Prop {
     const char* name = "";
     const char* type = "";
@@ -138,14 +137,12 @@ const uint8_t* struct_end(const uint8_t* body, const uint8_t* limit) {
         if (sz < 4) return nullptr;
         const uint32_t payload = sz - 4;
 
-        // Bound-check the advance BEFORE making it, in 64-bit.
-        //
-        // Writing this as `p += 8 + (sz - 4)` and checking `p > limit` afterwards
-        // is what PropWalker::next deliberately avoids: `8 + (sz - 4)` is
-        // evaluated entirely in 32-bit (the literal 8 promotes to unsigned), so
-        // sz == 0xFFFFFFFC gives 8 + 0xFFFFFFF8 == 0x100000000 -> 0. The pointer
-        // then never moves, the after-the-fact check cannot fire because p is
-        // unchanged, and the loop spins forever on a file a mod could ship.
+        // Bound-check the advance BEFORE making it, and in 64-bit. Written as
+        // `p += 8 + (sz - 4)` with the check afterwards, the sum is evaluated
+        // entirely in 32-bit (the literal 8 promotes to unsigned): sz ==
+        // 0xFFFFFFFC wraps it to 0, the pointer never moves, the check cannot
+        // fire, and the loop spins forever on a file a mod could ship. The
+        // `p + 8 > limit` test above is what makes `limit - (p + 8)` valid.
         if (static_cast<uint64_t>(limit - (p + 8)) < payload) return nullptr;
         p += 8 + static_cast<size_t>(payload);
     }
@@ -156,7 +153,7 @@ const uint8_t* struct_end(const uint8_t* body, const uint8_t* limit) {
 // All three spellings must be handled here because cr2w_decode accepts all three
 // as REDFS_KIND_ARRAY. Missing one means the whole array type name is returned as
 // its own element type, and every element is then sized and decoded as if it were
-// that array -- which is what "[N]X" used to do.
+// that array.
 const char* element_type(const char* array_type) {
     if (starts_with(array_type, "array:")) return array_type + 6;
     if (starts_with(array_type, "static:")) {
@@ -165,7 +162,7 @@ const char* element_type(const char* array_type) {
         return comma ? comma + 1 : array_type + 7;
     }
     if (array_type[0] == '[') {
-        // "[3]Float" -- a RED4 fixed-size array; skip past the bracketed count.
+        // "[3]Float" -- skip the bracketed count.
         const char* close = std::strchr(array_type, ']');
         if (close) return close + 1;
     }
@@ -188,16 +185,14 @@ const uint8_t* cstring_end(const uint8_t* p, const uint8_t* limit) {
 //
 // The type name alone is not always enough. fixed_width knows the primitives and
 // the pointer-ish types; CString is self-describing; a struct is a TLV body. What
-// is left is a fixed-width type whose name we cannot recognise -- in practice an
-// enum, which serialises as a 2-byte name-table index exactly like CName but
-// under a per-enum type name we have no table for.
+// is left is a name we do not recognise -- in practice an enum, serialised as a
+// 2-byte name-table index like CName but under a per-enum type name.
 //
-// For that last case the payload itself settles it: an enum array divides evenly
-// into equal elements, and a struct array essentially never does, because struct
-// elements vary in size. So a clean division into a small power-of-two stride is
-// strong evidence of a uniform type, and it is checked BEFORE falling back to the
-// TLV walk. Guessing "struct" first would misfire on any enum whose low byte is
-// zero (name index >= 256), which looks exactly like a struct's leading zero.
+// For that last case the payload settles it: an enum array divides evenly into
+// equal elements, a struct array essentially never does. That test runs BEFORE
+// the TLV fallback, because guessing "struct" first misfires on any enum whose
+// low byte is zero (name index >= 256) -- indistinguishable from a struct's
+// leading zero.
 struct ElementLayout {
     enum Kind { kFixed, kCString, kStruct } kind;
     uint64_t stride;  // meaningful when kind == kFixed
@@ -309,18 +304,19 @@ void cr2w_decode(const redfs_cr2w* f, const char* type, const uint8_t* data, uin
         out->kind = REDFS_KIND_NAME;
         out->as.s = f->name(rd16(data));
     } else if (eq("CString")) {
-        // Decoded strings are owned by the handle so redfs_value::as.s stays
-        // valid as long as the caller holds it. Cached by source pointer: the
-        // same property decoded twice must not allocate twice, or a per-frame
-        // query grows the handle without bound until it is closed.
+        // Decoded strings are owned by the handle (redfs_cr2w::owned_strings) and
+        // cached by source pointer, so a property queried every frame allocates
+        // once instead of growing the handle until it is closed.
         auto* mut = const_cast<redfs_cr2w*>(f);
         auto cached = mut->string_cache.find(data);
         if (cached != mut->string_cache.end()) {
             out->kind = REDFS_KIND_STRING;
             out->as.s = cached->second->c_str();
         } else {
-            // Build the value first and only take ownership once it is decoded,
-            // so a payload that fails validation does not leave an entry behind.
+            // string_cache holds a non-owning pointer into owned_strings; the
+            // unique_ptr indirection is what keeps it valid when that vector
+            // regrows. A payload that fails its bounds check decodes to "" and
+            // is cached like any other result.
             std::string decoded;
             const uint8_t* p = data;
             const int32_t prefix = read_vlq(p, data + size);
@@ -352,8 +348,7 @@ void cr2w_decode(const redfs_cr2w* f, const char* type, const uint8_t* data, uin
         // Index 0 means null, the same convention handles and rRef use. It must
         // be rejected BEFORE the subtraction: 0 - 1 is 0xFFFFFFFF, which is
         // REDFS_PART_MAIN, so a null buffer would quietly resolve to segment 0
-        // and hand back the CR2W document as if it were payload -- a DDS whose
-        // pixels are the document, or mesh bounds swept from it and cached.
+        // and hand back the CR2W document as if it were payload.
         const uint32_t index = rd16(data);
         if (index > 0) {
             out->kind = REDFS_KIND_BUFFER;
@@ -387,7 +382,7 @@ void cr2w_decode(const redfs_cr2w* f, const char* type, const uint8_t* data, uin
             out->as.u = rd32(data);
         }
     } else if (size == 2) {
-        // Nothing else is exactly two bytes: this is an enum, stored as a name index.
+        // No other unrecognised type is two bytes: an enum, stored as a name index.
         out->kind = REDFS_KIND_NAME;
         out->as.s = f->name(rd16(data));
     } else if (looks_like_struct(data, size)) {
@@ -515,13 +510,12 @@ redfs_status cr2w_parse(const void* data, uint64_t size, redfs_cr2w* out) {
     // Every string in a well-formed file is NUL-terminated, so the table's last
     // byte is a NUL. Requiring that turns "the offset is in range" into "the
     // string is safe to walk", which is what every strcmp downstream relies on.
+    // The count == 0 test comes first because `last` underflows on an empty table.
     //
-    // Indexed in 64-bit to match the range check above. Left in 32-bit, the two
-    // disagree once offset + count crosses 2^32: the guard passes on the true
-    // sum while the index wraps to a small value, so the invariant this line
-    // exists to establish is never actually checked. Unreachable through the
-    // depot today (a main segment is uint32-sized), but the mismatch is a trap
-    // for whoever later relaxes the input path.
+    // `last` is 64-bit to match the range check above: in 32-bit the two disagree
+    // once offset + count crosses 2^32, the index wrapping small while the guard
+    // passes on the true sum. Not reachable through the depot today (a main
+    // segment is uint32-sized), but a trap for whoever later relaxes the input.
     const uint64_t last = static_cast<uint64_t>(strings.offset) + strings.count - 1;
     if (strings.count == 0 || b[last] != '\0')
         return fail(REDFS_E_CORRUPT, "CR2W string table is not NUL-terminated");
@@ -535,6 +529,8 @@ redfs_status cr2w_parse(const void* data, uint64_t size, redfs_cr2w* out) {
         return static_cast<uint64_t>(t.offset) + static_cast<uint64_t>(t.count) * stride <= size;
     };
 
+    // 1, 2, 4, 5 are the tables this reader reads: names, imports, chunks,
+    // buffers. Properties (3) and embedded files (6) are never touched.
     if (!in_bounds(tables[1], 8) || !in_bounds(tables[2], 8) || !in_bounds(tables[4], 24) ||
         !in_bounds(tables[5], 24))
         return fail(REDFS_E_CORRUPT, "CR2W table runs past the end of the file");

@@ -3,10 +3,11 @@
 // Chunk bounds cost a geometry decompress to produce and never change, because
 // the archives they came from never change. So compute once, keep forever.
 //
-// The file is append-friendly and loaded whole at open. Every record carries a
-// fingerprint of the archive set that produced it -- patch the game or add a mod
-// and the fingerprint moves, the cache is dropped, and everything is recomputed
-// rather than silently serving geometry for a mesh that has since been replaced.
+// The file is loaded whole at open and rewritten whole at flush. Its header
+// carries a fingerprint of the archive set that produced it -- patch the game or
+// add a mod and the fingerprint moves, the cache is dropped, and everything is
+// recomputed rather than silently serving geometry for a mesh that has since
+// been replaced.
 //
 // Format (little-endian):
 //   'RFMC' u32 | version u32 | fingerprint u64 | entry_count u32 | reserved u32
@@ -37,14 +38,12 @@ struct Cache {
     std::mutex mutex;
     std::string file;
     uint64_t fingerprint = 0;
-    // Read without the lock on mesh_acquire's fast path. redfs.h declares the
+    // Read outside the lock on mesh_acquire's fast path. redfs.h declares the
     // cache calls not concurrency-safe, so a host following the contract cannot
-    // race -- but a plain bool read outside the lock is still formally UB, and
-    // the same pattern was already made atomic in paths.cpp.
+    // race -- but a plain bool read outside the lock is still formally UB.
     std::atomic<bool> enabled{false};
     // The depot cache_open was called with. Compared for identity only and NEVER
-    // dereferenced -- it may dangle after redfs_depot_close, and a stored depot
-    // pointer that gets used is the trap this codebase already declined once.
+    // dereferenced -- it may dangle after redfs_depot_close.
     const redfs_depot* owner = nullptr;
     bool dirty = false;
     // shared_ptr, not unique_ptr: an open handle holds its own reference, so
@@ -146,12 +145,10 @@ struct Reader {
 // Smallest on-disk footprint of each repeated element, straight from serialize()
 // above. These turn every declared count into a bound the file itself has to pay
 // for, which is what keeps a 68-byte cache file from asking for 56 MB of chunks.
-//
-// They also close a subtler hole: the writer applies no caps at all, so any
-// fixed reader limit can be exceeded by a record serialize() happily produced,
-// and deserialize() rejecting it truncates the rest of the file. A bound derived
-// from bytes remaining is satisfied by construction on the write side, so the
-// two halves cannot disagree.
+// Deriving the bound from bytes remaining rather than picking a fixed cap also
+// keeps the two halves in agreement: the writer applies no caps, so any fixed
+// reader limit could reject a record serialize() legitimately produced -- and
+// rejecting one truncates the rest of the file.
 constexpr uint32_t kChunkBytes = 6 * 4 + 6 * 4;  // 5 x u32 + bounds_valid + 6 x f32
 constexpr uint32_t kAppearanceBytes = 4 + 4;     // empty name + material count
 constexpr uint32_t kMaterialBytes = 4;           // empty string
@@ -169,10 +166,10 @@ bool deserialize(Reader& r, Mesh* m) {
     if (chunk_count > left / kChunkBytes || appearance_count > left / kAppearanceBytes)
         return false;
 
-    // mesh_build guarantees >= 1 (mesh.cpp, via max(1u, ...) and lowest_lod); a
-    // cache file is external input and carries no such guarantee. Clamp rather
-    // than reject: rejecting would discard every later record in the file over a
-    // value that repairs trivially, and redfs.h documents these as 1-based.
+    // mesh_build guarantees >= 1 (max(1u, ...) and lowest_lod); a cache file is
+    // external input and carries no such guarantee. Clamp rather than reject:
+    // rejecting discards every later record in the file over a value that
+    // repairs trivially, and redfs.h documents lod as 1-based.
     if (m->lod_count == 0) m->lod_count = 1;
 
     m->chunks.resize(chunk_count);
@@ -196,19 +193,17 @@ bool deserialize(Reader& r, Mesh* m) {
         for (auto& mat : a.chunk_materials) mat = r.str();
         // Truncate AFTER reading, never before: the count is part of the stream,
         // so skipping entries here would desynchronise every later record.
-        // mesh_build caps materials at the chunk count, and internal.hpp
-        // documents the two as parallel -- the load path has to honour that too,
-        // or a cached mesh reports materials for chunks it does not have.
+        // internal.hpp documents chunk_materials as parallel to chunks and
+        // mesh_build caps it at the chunk count; the load path has to as well.
         if (a.chunk_materials.size() > m->chunks.size())
             a.chunk_materials.resize(m->chunks.size());
     }
     return r.ok;
 }
 
-// What a load attempt did, so the caller can report it after unlocking. Nothing
-// in here touches the log sink: that is host code, it runs on this thread, and
-// it is free to call back into the cache -- which would re-enter a mutex this
-// thread already holds.
+// What a load attempt did, so the caller can report it after unlocking. The log
+// sink is host code, it runs on this thread, and it is free to call back into
+// the cache -- which would re-enter a mutex this thread already holds.
 struct LoadReport {
     enum class Result { kNoFile, kBadHeader, kWrongFingerprint, kLoaded };
     Result result = Result::kNoFile;
@@ -249,14 +244,11 @@ LoadReport load_from_disk(Cache& c) {
     rep.result = LoadReport::Result::kLoaded;
     for (uint32_t i = 0; i < rep.declared && r.ok; ++i) {
         auto m = std::make_shared<Mesh>();
-        // A partial record leaves the reader positioned mid-field with no way to
-        // resynchronise, so stopping is the only option -- but the caller is told
-        // how many of the declared entries actually made it, because silently
-        // reporting the survivors as the whole file hides real corruption.
+        // A partial record leaves the reader mid-field with no way to
+        // resynchronise, so stopping is the only option; loaded vs declared is
+        // what tells the caller the file was truncated.
         if (!deserialize(r, m.get())) break;
-        // Same rule as mesh_build: the public view is derived before the object
-        // is published, so a cached mesh is immutable from here on.
-        m->finalize();
+        m->finalize();  // public view derived before the object is published
         const uint64_t h = m->hash;
         c.entries[h] = std::const_pointer_cast<const Mesh>(m);
         ++rep.loaded;
@@ -271,17 +263,15 @@ uint64_t depot_fingerprint(const redfs_depot* depot) {
     //
     // The CRC is the load-bearing one. Path, entry count and index size are all
     // blind to an archive whose files were replaced IN PLACE -- re-cook a mesh
-    // with edited vertices and repack, and as long as the file count, segment
-    // count and dependency count are unchanged, the index is exactly as long as
-    // before and every one of those three inputs is byte-identical. The cache
-    // would then validate and keep serving the old geometry, forever, which is
-    // the precise failure this fingerprint exists to prevent.
+    // with edited vertices and repack, and as long as the file, segment and
+    // dependency counts are unchanged, the index is exactly as long as before and
+    // all three of those inputs are byte-identical. The cache would then validate
+    // and keep serving the old geometry forever.
     //
     // The packer's index CRC covers the entry table and the segment table, so it
-    // moves when a file's content hash or a segment's offset/size moves. It costs
-    // one read of a header field already in the mapping -- no extra I/O, and O(1)
-    // per archive rather than the O(entries) a sweep of the per-entry SHA-1s
-    // would cost on every mount.
+    // moves when a file's content hash or a segment's offset/size moves. It is
+    // also free: a header field already read at mount, so O(1) per archive rather
+    // than the O(entries) a sweep of the per-entry SHA-1s would cost.
     uint64_t h = 0xCBF29CE484222325ull;
     auto mix = [&h](const void* data, size_t len) {
         const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -360,8 +350,8 @@ redfs_status cache_flush() {
         put_u32(out, 0);  // reserved
         for (const auto& [hash, mesh] : c.entries) serialize(out, *mesh);
 
-        // Write to a sibling then replace it in, so a crash mid-write cannot
-        // corrupt a cache that was previously good.
+        // Write to a sibling and rename over the original, so a crash mid-write
+        // cannot corrupt a cache that was previously good.
         const std::string tmp = c.file + ".tmp";
         FILE* f = std::fopen(tmp.c_str(), "wb");
         if (!f) {
@@ -369,10 +359,10 @@ redfs_status cache_flush() {
             failed = true;
         } else {
             // fwrite reports bytes accepted into the FILE buffer, not bytes that
-            // reached the disk. On a network share, a synced folder or a
-            // removable drive, a write failure surfaces at flush or close and
-            // nowhere else -- so checking fwrite alone would call a truncated
-            // file a success and then promote it over a good cache.
+            // reached the disk: on a network share, a synced folder or a
+            // removable drive the failure surfaces only at flush or close, so
+            // fwrite alone would call a truncated file a success and then
+            // promote it over a good cache.
             bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
             if (ok) ok = std::fflush(f) == 0 && ::_commit(::_fileno(f)) == 0;
             if (std::fclose(f) != 0) ok = false;  // close either way, then judge
@@ -382,10 +372,10 @@ redfs_status cache_flush() {
                 std::snprintf(message, sizeof(message), "cannot write %s", tmp.c_str());
                 failed = true;
             } else if (!::MoveFileExA(tmp.c_str(), c.file.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-                // One atomic step. Deleting the destination first opens a window
-                // where neither file exists, and a rename that then fails -- a
-                // scanner or backup tool holding the path is enough -- destroys
-                // the good cache instead of preserving it.
+                // Replace in one step. Deleting the destination first opens a
+                // window where neither file exists, and a rename that then fails
+                // -- a scanner holding the path is enough -- destroys the good
+                // cache instead of preserving it.
                 std::remove(tmp.c_str());
                 std::snprintf(message, sizeof(message), "cannot replace %s (error %lu)",
                               c.file.c_str(), ::GetLastError());
@@ -429,24 +419,24 @@ redfs_status mesh_acquire(const redfs_depot* depot, uint64_t hash,
                           std::shared_ptr<const Mesh>* out) {
     Cache& c = cache();
 
-    // Entries are keyed by hash alone, and a hash means different bytes in
-    // different depots. There is one cache for the process, so it can only ever
-    // belong to one depot: anything asked for on behalf of another must bypass
-    // it entirely, or depot B is served depot A's geometry and B's results are
-    // flushed under A's fingerprint.
+    // Entries are keyed by hash alone, a hash means different bytes in different
+    // depots, and there is one cache per process. Anything asked for on behalf of
+    // a depot the cache does not belong to must bypass it entirely, or depot B is
+    // served depot A's geometry and B's results are flushed under A's
+    // fingerprint.
     const bool usable = c.enabled.load(std::memory_order_relaxed) && c.owner == depot;
 
     if (usable) {
         std::lock_guard<std::mutex> lock(c.mutex);
         auto it = c.entries.find(hash);
         if (it != c.entries.end()) {
-            *out = it->second;  // caller gets its own reference
+            *out = it->second;
             return REDFS_OK;
         }
     }
 
-    // Built privately and only published once complete, so nothing ever observes
-    // a half-decoded mesh and nothing mutates one after it is shared.
+    // Built privately and published only once complete: nothing ever observes a
+    // half-decoded mesh, and nothing mutates one after it is shared.
     auto mesh = std::make_shared<Mesh>();
     const redfs_status st = mesh_build(depot, hash, mesh.get());
     if (st != REDFS_OK) return st;
@@ -478,10 +468,9 @@ void cache_invalidate(const redfs_depot* depot) {
         // the archive set the cache was built from.
         if (c.owner != depot) return;
 
-        // Both halves are required. Re-fingerprinting alone would leave the stale
-        // in-memory entries live and merely relabel them on flush -- turning a
-        // reproducible staleness bug into an intermittent one. Dropping entries
-        // alone would let the next flush write fresh data under the old label.
+        // Both halves are required: re-fingerprinting alone leaves the stale
+        // in-memory entries live and merely relabels them on flush, and dropping
+        // entries alone lets the next flush write fresh data under the old label.
         const uint64_t before = c.fingerprint;
         c.fingerprint = depot_fingerprint(depot);
         if (c.fingerprint == before) return;  // archive set unchanged; keep the cache

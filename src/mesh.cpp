@@ -1,20 +1,20 @@
 // Mesh chunk decoding: per-submesh LOD, material and bounding box.
 //
-// The bounding box is the reason this file exists, and the format does not store
-// one. rendChunk carries vertex/index counts, a lodMask and stream offsets, but
-// no bounds -- only CMesh has a box, and it covers the whole mesh. So the box
-// per chunk has to be computed from the geometry:
+// The per-chunk box is the reason this file exists, and the format does not
+// store one: rendChunk carries vertex/index counts, a lodMask and stream
+// offsets, but only CMesh has a box and it covers the whole mesh. So each box
+// has to be computed from the geometry:
 //
 //   positions live at renderBuffer[ chunkVertices.byteOffsets[0]
-//                                   + i * vertexLayout.slotStrides[0] ]
+//                        + i * chunkVertices.vertexLayout.slotStrides[0] ]
 //   as three int16s, dequantized by
 //       p = i16 / 32767 * header.quantizationScale + header.quantizationOffset
 //
 // That costs one Kraken decompress of the geometry buffer per mesh, which is why
 // cache.cpp exists.
 //
-// Boxes come out in mesh-local game space (Z up). No axis swap: these are meant
-// to be compared against component transforms, not fed to a glTF writer.
+// Boxes come out in mesh-local game space (Z up), for comparison against
+// component transforms -- no axis swap for a glTF writer.
 
 #include "internal.hpp"
 
@@ -25,7 +25,6 @@
 namespace redfs {
 namespace {
 
-// Reads element `want` of a fixed-width array property as an unsigned value.
 struct ElemPick {
     uint32_t want;
     uint64_t value;
@@ -78,8 +77,8 @@ uint32_t lowest_lod(uint32_t mask) {
     return lod;
 }
 
-// Collects the per-chunk facts we can read straight out of the CR2W. The
-// geometry pass fills in the boxes afterwards.
+// Per-chunk facts readable straight out of the CR2W; the geometry pass below
+// fills in the boxes afterwards.
 struct ChunkGather {
     const redfs_cr2w* f;
     std::vector<MeshChunk>* chunks;
@@ -110,22 +109,19 @@ int gather_chunk(uint32_t index, const redfs_value* v, void* user) {
 
 // Appearance gathering: each element is a handle to a meshMeshAppearance chunk.
 //
-// Two independent bounds are needed here, and neither is redundant.
+// Two bounds, neither redundant. Nothing stops N appearance handles from all
+// resolving to the SAME chunk, each one re-walking that chunk's chunkMaterials
+// in full; handles cost 4 bytes of array payload and CNames 2, so a ~512 KB
+// crafted .mesh buys 65536 x 131072 string constructions -- retained, not
+// transient, because every appearance is moved into the mesh.
 //
-// Nothing stops N appearance handles from all resolving to the SAME chunk, and
-// each one re-walks that chunk's chunkMaterials in full. Handles cost 4 bytes of
-// array payload and CNames cost 2, so a ~512 KB crafted .mesh buys 65536 x
-// 131072 string constructions -- billions of allocations that are retained, not
-// transient, because every appearance is moved into the mesh. Worse, a variant
-// tuned to stop just short of bad_alloc gets serialized into the on-disk cache
-// and replayed on every subsequent load.
-//
-// `chunk_materials` is documented as parallel to the chunk list, and
-// redfs_mesh_chunk_material refuses any index past chunks.size() anyway, so
-// truncating there is free. But that alone is not enough: chunks.size() comes
-// from the same attacker-controlled file (renderChunkInfos elements cost 3
-// bytes), so the product stays quadratic. The aggregate budget is what actually
-// bounds the work.
+// Clamping each appearance to chunks.size() is free (chunk_materials is
+// parallel to the chunk list, and redfs_mesh_chunk_material bounds-checks the
+// materials it holds), but not sufficient: chunks.size() comes from the same
+// attacker-controlled file (renderChunkInfos elements cost 3 bytes), so the
+// product stays quadratic. The aggregate budget is the real bound -- without
+// it, a file tuned to stop just short of bad_alloc is serialized into the
+// on-disk cache and replayed on every subsequent load.
 constexpr size_t kMaterialBudget = 1u << 20;  // total strings across all appearances
 
 struct AppearanceGather {
@@ -138,7 +134,7 @@ struct AppearanceGather {
 
 struct MaterialGather {
     std::vector<std::string>* names;
-    size_t limit;  // stop accepting past this many
+    size_t limit;
 };
 
 int gather_material(uint32_t, const redfs_value* v, void* user) {
@@ -181,18 +177,18 @@ int gather_appearance(uint32_t, const redfs_value* v, void* user) {
     return 1;
 }
 
-// Sweeps one chunk's position stream and reduces it to a box.
 void compute_bounds(MeshChunk& c, const uint8_t* geometry, uint64_t geometry_size,
                     const float scale[3], const float offset[3]) {
     c.bbox_min[0] = c.bbox_min[1] = c.bbox_min[2] = 0.f;
     c.bbox_max[0] = c.bbox_max[1] = c.bbox_max[2] = 0.f;
     if (c.vertex_count == 0 || c.position_stride < 6) return;
 
-    // A NaN or infinite quantization term makes every dequantized value NaN, and
-    // both std::min and std::max return their first argument when the comparison
-    // is false -- so the sentinels survive untouched and the chunk would publish
-    // an inverted FLT_MAX..-FLT_MAX box marked valid, then cache it. Infinity is
-    // enough on its own: 0/32767 * inf is NaN.
+    // A non-finite quantization term makes every dequantized value NaN, and both
+    // std::min and std::max return their FIRST argument when the comparison is
+    // false -- so the sentinels below survive untouched and the chunk publishes
+    // an inverted FLT_MAX..-FLT_MAX box marked valid. Note the post-sweep check
+    // cannot catch that case: FLT_MAX is finite. Infinity is enough on its own,
+    // since 0/32767 * inf is NaN.
     for (int axis = 0; axis < 3; ++axis)
         if (!std::isfinite(scale[axis]) || !std::isfinite(offset[axis])) return;
 
@@ -215,12 +211,11 @@ void compute_bounds(MeshChunk& c, const uint8_t* geometry, uint64_t geometry_siz
             hi[axis] = (std::max)(hi[axis], value);
         }
     }
-    // The input guard above is not sufficient, because finite inputs can still
-    // produce a non-finite result: scale = offset = FLT_MAX are both finite, and
-    // a vertex at q = 32767 dequantizes to FLT_MAX + FLT_MAX, which overflows to
-    // +inf. min(FLT_MAX, +inf) then returns FLT_MAX and leaves `lo` sitting on
-    // its sentinel -- reproducing the exact inverted box the input guard was
-    // added to prevent, and caching it. Validate what was actually computed.
+    // The input guard above is not sufficient: finite inputs can still produce a
+    // non-finite result. scale = offset = FLT_MAX are both finite, but a vertex
+    // at q = 32767 dequantizes to FLT_MAX + FLT_MAX, which overflows to +inf;
+    // min(FLT_MAX, +inf) then returns FLT_MAX and leaves `lo` on its sentinel.
+    // Validate what was actually computed.
     for (int axis = 0; axis < 3; ++axis)
         if (!std::isfinite(lo[axis]) || !std::isfinite(hi[axis])) return;
 
@@ -233,8 +228,8 @@ void compute_bounds(MeshChunk& c, const uint8_t* geometry, uint64_t geometry_siz
 
 }  // namespace
 
-// Builds the public view once, before the object is shared. Doing this lazily on
-// open would mutate an object the cache has already handed to other callers.
+// Once, before the object is shared: doing it lazily on open would mutate an
+// object the cache has already handed to other callers.
 void MeshData::finalize() {
     public_chunks.clear();
     public_chunks.reserve(chunks.size());
@@ -293,13 +288,12 @@ redfs_status mesh_build(const redfs_depot* depot, uint64_t hash, Mesh* out) {
 
     // 3. whole-mesh bounds, straight from CMesh
     //
-    // Unlike the per-chunk boxes, this one is stored rather than computed, so it
-    // is archive content and can be anything -- including NaN or infinity, which
-    // makes every comparison a caller writes against it false and silently turns
-    // a chunk filter into a no-op. Clamp non-finite to 0 here rather than inside
-    // chunk_float: compute_bounds below feeds the quantization terms through the
-    // same helper and RELIES on seeing a non-finite value so it can skip the
-    // sweep.
+    // Unlike the per-chunk boxes this one is stored rather than computed, so it
+    // is archive content and can be NaN or infinity -- which makes every
+    // comparison a caller writes against it false, silently turning a chunk
+    // filter into a no-op. Clamp here rather than inside chunk_float: the
+    // quantization terms below come through that same helper, and compute_bounds
+    // RELIES on seeing a non-finite value there so it can skip the sweep.
     auto finite_or_zero = [](float v) { return std::isfinite(v) ? v : 0.f; };
     out->bbox_min[0] = finite_or_zero(chunk_float(&f, 0, "boundingBox.Min.X", 0.f));
     out->bbox_min[1] = finite_or_zero(chunk_float(&f, 0, "boundingBox.Min.Y", 0.f));
@@ -329,7 +323,7 @@ redfs_status mesh_build(const redfs_depot* depot, uint64_t hash, Mesh* out) {
     out->lod_count = 1;
     if (cr2w_find(&f, blob_chunk, "header.renderLODs", &lods) == REDFS_OK &&
         lods.kind == REDFS_KIND_ARRAY) {
-        // Walked, not declared. The leading u32 is whatever the file claims, and
+        // Walked, not declared: the leading u32 is whatever the file claims, and
         // a truncated array can claim 4 billion -- which redfs_mesh_lod_count
         // would then hand back verbatim as a loop bound.
         uint32_t n = 0;
@@ -359,9 +353,9 @@ redfs_status mesh_build(const redfs_depot* depot, uint64_t hash, Mesh* out) {
         render_buffer.kind == REDFS_KIND_BUFFER)
         buffer_index = render_buffer.as.buffer;
     else
-        // Attached buffer 0 is the usual answer, but when it is the wrong one the
-        // sweep below produces a confident box from unrelated bytes -- and caches
-        // it. Leave a trace so that outcome is diagnosable.
+        // Attached buffer 0 is the usual answer, but when it is the wrong one
+        // the sweep below produces a confident box from unrelated bytes -- and
+        // caches it. Leave a trace so that outcome is diagnosable.
         log("mesh 0x%016llX: no renderBuffer property; assuming attached buffer 0",
             static_cast<unsigned long long>(hash));
 
@@ -381,7 +375,6 @@ redfs_status mesh_build(const redfs_depot* depot, uint64_t hash, Mesh* out) {
 
     for (auto& c : out->chunks) compute_bounds(c, geometry.data(), geometry_size, scale, offset);
 
-    // Last step before the object can be shared: everything above mutates it.
     out->finalize();
     return REDFS_OK;
 }

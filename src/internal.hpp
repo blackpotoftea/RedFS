@@ -13,7 +13,7 @@
 
 namespace redfs {
 
-// --- unaligned little-endian reads ------------------------------------------
+// --- unaligned little-endian reads -------------------------------------------
 // Index and CR2W tables are read straight out of a file mapping at arbitrary
 // offsets, so nothing may assume natural alignment.
 
@@ -37,8 +37,9 @@ redfs_status fail(redfs_status status, const char* fmt, ...);
 // --- oodle -------------------------------------------------------------------
 
 namespace oodle {
-// Resolves oo2ext_7_win64.dll: already loaded in the game process, else from
-// <game_dir>/bin/x64. Idempotent, thread-safe.
+// Resolves oo2ext_7_win64.dll: already loaded in the game process, else
+// <game_dir>/bin/x64, else the DLL search path. Thread-safe, and retries after a
+// failed attempt -- an early call with no game_dir must not poison later ones.
 bool load(const char* game_dir);
 bool available();
 // Returns decoded byte count, or a value != raw_len on failure.
@@ -66,8 +67,9 @@ struct Segment {
     uint32_t size;   // bytes once decoded
 };
 
-// One mounted .archive. The index stays mapped rather than copied, so a full
-// depot costs tens of MB of address space instead of hundreds of MB of heap.
+// One mounted .archive. The index stays mapped rather than copied into the heap,
+// so mounting a full depot costs address space and page cache, not committed
+// memory -- and every accessor below reads straight out of that mapping.
 class Archive {
 public:
     ~Archive();
@@ -82,19 +84,18 @@ public:
     uint32_t segment_count() const { return segment_count_; }
     uint64_t index_bytes() const { return index_size_; }
 
-    // CRC-64 the packer computed over the index body, straight from the header.
-    // Counts and index length are blind to an archive whose files were replaced
-    // in place; this is not, because the region it covers includes every entry's
-    // content hash and every segment's offset and size.
-    //
-    // Every packer known to this project fills it in -- WolvenKit computes it in
-    // ArchiveWriter.WriteIndex, and every archive sampled on a real install
-    // carries a distinct non-zero value. A hand-built archive that zeroed it
-    // would fall back to the shape-only signals.
+    // The packer's CRC-64 over the index body -- entry table (content hashes
+    // included) and segment table -- so unlike the counts and the index length it
+    // moves when an archive's files are replaced in place. That is what the cache
+    // fingerprint leans on. WolvenKit writes it (ArchiveWriter.WriteIndex) and
+    // every archive sampled on a real install has a distinct non-zero value, but
+    // the format does not require one: a hand-built archive may report 0.
     uint64_t index_crc() const { return index_crc_; }
     uint64_t file_size() const { return file_size_; }
 
-    // Entry accessors, by index into this archive's file table.
+    // Entry accessors, by index into this archive's file table. Unchecked: the
+    // caller must already have established i < entry_count(), and likewise
+    // i < segment_count() for segment().
     uint64_t entry_hash(uint32_t i) const { return rd64(entries_ + i * kEntryStride); }
     int64_t entry_timestamp(uint32_t i) const {
         return static_cast<int64_t>(rd64(entries_ + i * kEntryStride + 8));
@@ -162,11 +163,11 @@ struct PartRange {
 };
 redfs_status resolve_part(const redfs_depot* depot, uint64_t hash, uint32_t part, PartRange* out);
 
-// `abort` lets a long read be cut short between segments. The async worker
-// points it at its shutdown flag so that closing the game does not have to wait
-// out a queue of large reads; synchronous callers pass null. Oodle cannot be
-// interrupted mid-block, so the granularity is one segment -- which is what
-// bounds shutdown latency.
+// `abort` lets a long read be cut short between segments; synchronous callers
+// pass null. The async worker points it at its cancel flag, which both
+// redfs_shutdown and redfs_depot_close raise. Oodle cannot be interrupted
+// mid-block, so one segment is the finest granularity available -- and it is
+// what bounds how long either of those calls blocks.
 redfs_status read_part(const redfs_depot* depot, uint64_t hash, uint32_t part, uint8_t* dst,
                        uint64_t capacity, uint64_t* out_size,
                        const std::atomic<bool>* abort = nullptr);
@@ -203,30 +204,27 @@ struct redfs_cr2w {
     std::vector<redfs::Cr2wImport> imports;
     std::vector<redfs::Cr2wChunk> chunks;
     std::vector<redfs::Cr2wBuffer> buffers;
-    // CString values are decoded on demand; the handle owns them so that
+    // CString values are decoded on demand and owned by the handle, so
     // redfs_value::as.s stays valid for as long as the caller holds the CR2W.
-    // Keyed by source pointer so decoding the same property twice reuses the
-    // result instead of growing the handle on every query.
+    // Keyed by source pointer so re-querying a property reuses the decoded string
+    // instead of growing the handle on every query.
     //
-    // Mutated by cr2w_decode, which means a CR2W handle is SINGLE-THREADED --
-    // see the threading note in redfs.h. Depot reads remain safe to share; it is
-    // only an individual redfs_cr2w* that must not be touched from two threads.
+    // cr2w_decode mutates both through a const_cast, which is what makes a CR2W
+    // handle SINGLE-THREADED -- see the threading note in redfs.h. The depot
+    // stays shareable; it is an individual redfs_cr2w* two threads must not touch.
     std::vector<std::unique_ptr<std::string>> owned_strings;
     std::unordered_map<const uint8_t*, std::string*> string_cache;
 
-    // Both accessors must bounds-check the *offset*, not just the index. A
-    // corrupt name table holds arbitrary offsets, and every returned pointer is
-    // handed to strcmp -- so an unchecked one reads until it hits an unmapped
-    // page. cr2w_parse additionally guarantees the table ends in a NUL, which is
-    // what makes an in-range offset safe to walk.
+    // Both accessors bounds-check the *offset*, not just the index: a corrupt
+    // name table holds arbitrary offsets and every returned pointer is handed to
+    // strcmp, so an unchecked one reads until it hits an unmapped page. What makes
+    // an in-range offset safe to walk is cr2w_parse's guarantee that the string
+    // table ends in a NUL. Both return "" rather than null for the same reason,
+    // including for a default-constructed handle, which nothing prevents.
     const char* name(uint32_t i) const {
         return i < names.size() ? str(names[i]) : "";
     }
     const char* str(uint32_t off) const {
-        // The null check covers a default-constructed handle, which callers
-        // should never see but which nothing structurally prevents. Both
-        // accessors are contracted to return a valid C string, never null:
-        // every result reaches strcmp.
         return (strings && off < strings_size) ? strings + off : "";
     }
 };
@@ -248,14 +246,14 @@ redfs_status cr2w_walk_array(const redfs_cr2w* f, const redfs_value* array, redf
 redfs_status cr2w_walk_in(const redfs_cr2w* f, const redfs_value* parent, const char* prop_path,
                           redfs_prop_fn fn, void* user);
 
-// Decodes one property's bytes into a typed value.
+// Decodes one property's bytes into a typed value. Writes through `f`'s const to
+// fill the string cache, so it inherits the single-threaded rule on owned_strings.
 void cr2w_decode(const redfs_cr2w* f, const char* type, const uint8_t* data, uint32_t size,
                  redfs_value* out);
 
 // --- mesh --------------------------------------------------------------------
 
-// Extends the public redfs_mesh_chunk with the stream locations needed to
-// compute the box, which callers never see.
+// The public redfs_mesh_chunk plus the stream locations the box sweep needs.
 struct MeshChunk {
     uint32_t index = 0;
     uint32_t lod_mask = 1;
@@ -275,14 +273,11 @@ struct MeshAppearance {
     std::vector<std::string> chunk_materials;  // parallel to chunks
 };
 
-// A fully decoded mesh. IMMUTABLE once built.
-//
-// That immutability is the whole design. The cache hands the same object to
-// every caller, so anything that mutates it after publication is a data race --
-// and redfs_mesh_chunk_at returns an interior pointer callers may hold, so a
-// vector that grows after publication is a use-after-free waiting to happen.
-// public_chunks is therefore populated at CONSTRUCTION (mesh_build, and
-// cache deserialize), never on open.
+// A fully decoded mesh. IMMUTABLE once built: the cache hands the same object to
+// every caller, so a write after publication is a data race -- and since
+// redfs_mesh_chunk_at returns an interior pointer into public_chunks, a resize
+// after publication is a use-after-free. finalize() therefore runs at
+// CONSTRUCTION (mesh_build, and the cache loader), never on open.
 //
 // Ownership is shared: the cache holds a reference and so does every open
 // handle, so closing the cache cannot pull the object out from under a caller
@@ -295,8 +290,7 @@ struct MeshData {
     std::vector<MeshChunk> chunks;
     std::vector<MeshAppearance> appearances;
 
-    // Mirrors `chunks` in the public struct layout, so redfs_mesh_chunk_at can
-    // return a pointer straight into it.
+    // `chunks` in the public struct layout; redfs_mesh_chunk_at points into it.
     std::vector<redfs_mesh_chunk> public_chunks;
 
     // Derives public_chunks from chunks. Call once, before publication.
@@ -306,9 +300,9 @@ struct MeshData {
 }  // namespace redfs
 
 // The handle a caller holds. Deliberately not the mesh itself: it exists to own
-// a reference, so redfs_mesh_close always means "drop my reference" regardless
-// of whether the cache is on, and an outstanding handle keeps the data alive
-// past redfs_cache_close.
+// a reference, so redfs_mesh_close always means "drop mine" whether or not the
+// cache is on, and an outstanding handle keeps the data alive past
+// redfs_cache_close.
 struct redfs_mesh {
     std::shared_ptr<const redfs::MeshData> data;
 };
@@ -322,15 +316,17 @@ redfs_status mesh_build(const redfs_depot* depot, uint64_t hash, Mesh* out);
 
 // --- mesh cache --------------------------------------------------------------
 
-// Returns a cached mesh if one exists, otherwise builds and records it. The
-// result is shared: the caller's reference keeps it alive independently of the
-// cache, so cache_close cannot invalidate a live handle.
+// Returns the cached mesh if there is one, otherwise builds it -- and records it
+// only when the cache is open on this depot. The result is shared: the caller's
+// reference keeps it alive independently of the cache, so cache_close cannot
+// invalidate a live handle.
 redfs_status mesh_acquire(const redfs_depot* depot, uint64_t hash,
                           std::shared_ptr<const Mesh>* out);
 
-// Drops every cached entry and re-fingerprints against the depot as it is NOW.
-// Called when the archive set changes; without it a mount after cache_open
-// serves pre-mount geometry and flushes new entries under the stale label.
+// Re-fingerprints against the depot as it is NOW and drops every entry if the
+// fingerprint moved; a no-op for a depot the cache does not belong to. Called
+// when the archive set changes -- without it a mount after cache_open serves
+// pre-mount geometry and flushes new entries under the stale label.
 void cache_invalidate(const redfs_depot* depot);
 redfs_status cache_open(const redfs_depot* depot, const char* file);
 redfs_status cache_flush();
@@ -349,6 +345,8 @@ redfs_status paths_load(const redfs_depot* depot, const char* file, uint32_t* ou
 void paths_add(const char* path);
 void paths_enable();
 void paths_learn_imports(const redfs_cr2w* f);
+// Null when the hash is unknown. A hit is interned for the life of the process,
+// so the pointer never dangles and never has to be freed.
 const char* path_from_hash(uint64_t hash);
 uint32_t paths_count();
 
