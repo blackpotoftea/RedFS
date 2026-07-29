@@ -596,10 +596,11 @@ REDFS_API const char* redfs_mesh_chunk_material(const redfs_mesh* mesh, uint32_t
 
 /* --- mesh cache -------------------------------------------------------------
  *
- * Computing chunk bounds costs a geometry decompress (~10 ms for a body mesh).
- * Point RedFS at a file and every redfs_mesh_open result is remembered: the
- * first call for a mesh computes, every later call -- including after a restart
- * -- is a lookup.
+ * Computing chunk bounds costs a geometry decompress. Measured over 200 meshes
+ * sampled across a stock install: median 0.7 ms, mean 1.0 ms, p90 2.3 ms, worst
+ * 7.1 ms. Point RedFS at a file and every redfs_mesh_open result is remembered:
+ * the first call for a mesh computes, every later call -- including after a
+ * restart -- is a lookup.
  *
  * The cache fingerprints the mounted archive set and silently discards itself
  * when that moves, so a game patch, a new mod, or an archive REPLACED IN PLACE

@@ -1,15 +1,18 @@
 # Full vertex stream decoding
 
-**Status: NOT implemented.** Research complete, design below.
+**Status: NOT implemented.** Nothing below exists in the library. Research is
+complete and the design is settled enough to build from; the API sketches are
+proposals, not declarations you can call.
 
-RedFS decodes vertex **positions** only, because that is what bounding boxes
-need. Normals, tangents, UVs, colours, bone indices and weights are all sitting in
-the same buffer, already read and decompressed, and simply not interpreted.
+RedFS decodes vertex **positions** only, because that is what bounding boxes need.
+Normals, tangents, UVs, colours, bone indices and weights all sit in the same
+render buffer that the bounding-box sweep already decompresses, and are simply
+never interpreted.
 
 ## What is already known
 
 Positions work (see `done/mesh-geometry.md`): the geometry buffer is reached, the
-chunk table is parsed, and the stride and offset for slot 0 are read correctly.
+chunk table is parsed, and the offset and stride for slot 0 are read correctly.
 Everything below is about the *other* slots.
 
 ## The layout descriptor
@@ -33,12 +36,19 @@ streamIndex   Uint8                                   -- which slot
 streamType    GpuWrapApiVertexPackingEStreamType
 ```
 
-So the decode is table-driven, not hardcoded: walk `elements`, and for each one
-the stream it lives in is `byteOffsets[element.streamIndex]` with stride
-`slotStrides[element.streamIndex]`.
+So a decode can be table-driven rather than hardcoded: walk `elements`, and the
+stream an element lives in starts at `byteOffsets[element.streamIndex]`. That half
+is proven — it is what WolvenKit does, and RedFS's position path is its degenerate
+case, `byteOffsets[0]`.
 
-That is the piece already proven in the position path — RedFS just always uses
-slot 0 today.
+The stride half is **not** established. See the open question below.
+
+Two things about those two arrays. `slotStrides` is `Uint8` while `byteOffsets` is
+`Uint32`, so a reader that assumes symmetry gets the wrong stride. And they
+disagree about how many slots exist — `slotStrides` holds 8 entries, `byteOffsets`
+only 5 — so `streamIndex` has to be bounds-checked against 5, not 8, before it
+indexes an offset. WolvenKit indexes `ByteOffsets[StreamIndex]` unchecked and would
+throw on a file naming a higher slot.
 
 A real dump, from a terrain mesh chunk:
 
@@ -46,7 +56,7 @@ A real dump, from a terrain mesh chunk:
 vertexLayout   GpuWrapApiVertexLayoutDesc
   elements     static:32,GpuWrapApiVertexPackingPackingElement  [5 items]
   slotStrides  static:8,Uint8                                   [8 items]
-    [0] 8      <- positions: 4 x int16
+    [0] 8      <- position: 3 x int16 read, the remaining 2 bytes are not
     [1] 0
     ...
   slotMask     129
@@ -56,11 +66,9 @@ byteOffsets    static:5,Uint32
   [1..4] 0
 ```
 
-Note `slotStrides` is `Uint8` while the adjacent `byteOffsets` is `Uint32`.
-
 ## What WolvenKit does
 
-`MeshTools.GetMeshesinfo` maps usages to offsets:
+`MeshTools.GetMeshesinfo` maps usages to stream offsets:
 
 ```csharp
 foreach (var element in cv.VertexLayout.Elements) {
@@ -71,24 +79,52 @@ foreach (var element in cv.VertexLayout.Elements) {
 }
 ```
 
-and the encodings it then applies:
+and `MeshTools.ContainRawMesh` then applies these encodings:
 
-| attribute | encoding |
-|---|---|
-| position | 3 × `int16`, `/32767 * quantScale + quantOffset`, stride from slot 0 |
-| UV0 / UV1 | 2 × half float, stride 4 |
-| normal / tangent | packed into `u32` (`Converters.TenBitShifted` style) |
-| colour | 4 × `u8` / 255 |
-| bone indices | `u8` each, at `posOffset + i*stride + 8` |
-| bone weights | `f32` each, at `posOffset + i*stride + 8 + weightCount` |
+| attribute | encoding | where |
+|---|---|---|
+| position | 3 × `int16`, `/32767 * quantScale + quantOffset` | slot 0, stride from `slotStrides[0]` |
+| UV0 | 2 × half float | its own slot, stride 4 |
+| normal | `u32`, 10 bits per axis (`Converters.TenBitShifted`) | shares a slot with tangent |
+| tangent | `u32`, same packing; top 2 bits are the sign | same slot, at +4 |
+| colour | 4 × `u8` / 255 | shares a slot with UV1 |
+| UV1 | 2 × half float | same slot, at +4 |
+| bone indices | `u8` each | `posOffset + i*stride + 8` |
+| bone weights | `u8` each, `/255`, then renormalised to sum to 1 | `posOffset + i*stride + 8 + weightCount` |
+| garment morph | 3 × half float | `posOffset + i*stride + 8 + 2*weightCount` |
 
-Bone data sharing the position stride is worth noting — it is not a separate
-slot; it sits after the position within the same vertex.
+Two things in that table are easy to get wrong. **Bone weights are bytes, not
+floats** — WolvenKit reads `byte / 255f` and then divides each vertex's weights by
+their sum, substituting `(bone 0, weight 1)` when they sum to zero. And **bone data
+shares the position stride**: it is not a separate slot but a fixed +8 into the
+same vertex, past the position's 6 bytes and the 2 nobody reads.
+
+How many weights a vertex has is not declared directly either. WolvenKit counts
+the `PS_SkinIndices` elements in the layout and multiplies by 4.
+
+## The open question: where non-position strides come from
+
+WolvenKit does **not** read `slotStrides` for anything but slot 0. It derives the
+others from which attributes are present — stride 4 for a lone normal, 8 when a
+tangent shares the slot, likewise for colour and UV1 — and hardcodes the +4 offset
+of the second member. That is a layout assumption, not a value read from the file.
+
+Whether `slotStrides` is populated above index 0 in cooked meshes is unverified.
+In the one layout dumped so far `slotStrides[1]` is 0 while `slotMask` is 129
+(slots 0 and 7 in use), so `slotStrides[7]` was never examined. A table-driven
+decode that trusts `slotStrides[element.streamIndex]` would read a stride of 0 if
+the field is genuinely unset.
+
+**Resolve this first.** The two candidates are: honour `slotStrides` when non-zero
+and otherwise sum element sizes derived from `element.type`; or reproduce
+WolvenKit's presence-based rules. The first is more principled, the second is known
+to work on shipping content. Dumping the layouts of a few hundred meshes decides
+it, and that is cheap.
 
 ## Design
 
-Keep it table-driven and let the caller pull only what it wants. Fabricating a
-fat vertex struct would force everyone to pay for attributes they do not need.
+Keep it table-driven and let the caller pull only what it wants. Fabricating a fat
+vertex struct would force everyone to pay for attributes they do not need.
 
 ```c
 typedef enum redfs_vertex_usage {
@@ -125,28 +161,43 @@ REDFS_API redfs_status redfs_mesh_read_indices(const redfs_depot*, const redfs_m
 
 ### Notes
 
-**Indices are the easier half and are already located.**
-`chunkIndices.teOffset` plus `header.indexBufferOffset` gives the start;
-`chunkIndices.pe` gives the width (`IBCT_IndexUShort` seen in the wild).
-`redfs_mesh_read_indices` could ship independently of the attribute work and
-would already enable custom rendering and collision.
+**Indices are the easier half.** The start is `header.indexBufferOffset` plus
+`chunkIndices.teOffset`, and `chunkIndices.pe` gives the width
+(`IBCT_IndexUShort` = 1, `IBCT_IndexUInt` = 0). `redfs_mesh_desc_of` already
+exposes `index_buffer_offset` and `index_buffer_size`; the per-chunk `teOffset` and
+`pe` are not read today, since the box sweep has no use for them. Worth honouring
+`pe` rather than following WolvenKit here — its exporter reads `uint16`
+unconditionally, which is right for everything sampled but wrong by construction
+for a `IBCT_IndexUInt` chunk.
+
+`redfs_mesh_read_indices` could ship independently of the attribute work and would
+already enable custom collision and geometry analysis.
 
 **The caller supplies the buffer.** Vertex data is large and callers usually have
 somewhere specific for it to go.
 
-**Positions stay where they are.** The existing bbox path must not start
-depending on this; it is deliberately minimal so the cache stays cheap.
+**Positions stay where they are.** The existing bbox path must not start depending
+on this; it is deliberately minimal so the cache stays cheap.
 
-**Nothing new is read from disk** when the mesh is already open — the geometry
-buffer has been decompressed. Though note the cache stores only *derived* results,
-so a cached mesh would need a re-read to serve attributes. Either accept that or
-let attribute reads bypass the cache.
+**Every attribute read costs a fresh decompress.** `mesh_build` frees the geometry
+buffer as soon as the sweep is done, and neither `MeshData` nor the on-disk cache
+retains it — the boxes are all that is kept. So an attribute read after
+`redfs_mesh_open` re-reads and re-decompresses the render buffer, cache hit or not.
+The alternatives are to accept that cost per call, or to fold attribute decoding
+into `mesh_build` while the buffer is still live and let the caller say up front
+what it wants. Retaining the buffer on `MeshData` is not an option worth
+considering: it is the largest part of a mesh, and the cache exists precisely to
+avoid holding it.
 
 ## Effort
 
 Half a day for indices. Two to three days for full attributes, most of it in the
-packed normal/tangent formats, which are the fiddly part and where WolvenKit's
-`Converters` is the reference.
+packed normal/tangent formats. `Converters.TenBitShifted` is the reference:
+`x = bits 0..9`, `y = 10..19`, `z = 20..29`, each dequantized as
+`(v * 2 / 1023) - 1`, with bits 30..31 giving the tangent sign — mapped there as
+`0 -> +1`, `3 -> -1`, anything else `0`, over a comment conceding the mapping is
+guesswork that only has to hold for normals. That is the part to verify against
+rendered output rather than to transcribe.
 
 ## Whether it is worth doing
 
@@ -154,5 +205,5 @@ Unclear, and worth saying so. A mod that wants to *render* game geometry usually
 wants the game to render it. The concrete uses are custom collision, procedural
 placement, and analysis — none of which have been asked for.
 
-`redfs_mesh_read_indices` alone is cheap and plausibly useful. The rest should
-wait for a real caller.
+`redfs_mesh_read_indices` alone is cheap and plausibly useful. The rest should wait
+for a real caller.

@@ -209,14 +209,22 @@ int scenario_dll_load_unload(const char* dll_path) {
         // share a CRT here, but relying on that is how cross-module heap bugs
         // start. The free function travels through the user pointer because a
         // capturing lambda cannot decay to the C callback type.
+        // Passed straight through `user`: a capturing lambda cannot decay to the C
+        // callback type, and a function pointer already fits in void*.
+        //
+        // It must NOT be cached in a static. This function runs once per round and
+        // each round loads a fresh image, so a function-local static would hold
+        // round 0's address forever and later rounds would call into memory that
+        // FreeLibrary has unmapped. That reproduced as an intermittent
+        // access violation -- intermittent because the reloaded DLL usually lands
+        // at the same base, so the stale pointer happens to remain valid.
         using FreeFn = void (*)(redfs_blob*);
-        static FreeFn s_free = fn_blob_free;
         for (int i = 0; i < 200; ++i)
             fn_async(depot, fn_hash("base\\big\\payload.bin"), REDFS_PART_ALL,
                      [](redfs_status, redfs_blob b, void* user) {
                          reinterpret_cast<FreeFn>(user)(&b);
                      },
-                     reinterpret_cast<void*>(s_free));
+                     reinterpret_cast<void*>(fn_blob_free));
 
         // This is the call under test. Without it, FreeLibrary below unmaps code
         // the worker is still executing.

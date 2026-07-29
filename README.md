@@ -3,32 +3,38 @@
 Read Cyberpunk 2077 `.archive` files directly, at runtime, from native code.
 
 A mod that needs a game texture, voice line, or mesh currently has to extract it
-with WolvenKit, repack it, and ship the copy. RedFS removes that step: point it
-at the player's own install and read what you need, when you need it. Nothing is
+with WolvenKit, repack it, and ship the copy. RedFS removes that step: point it at
+the player's own install and read what you need, when you need it. Nothing is
 extracted to disk, nothing is redistributed, and no game internals are touched.
 
-Static `.lib` or `RedFS.dll`, stable C ABI, optional C++ header.
+Static `.lib` or `RedFS.dll`, stable C ABI (`include/redfs.h`), optional
+header-only C++ facade (`include/redfs.hpp`).
 
 **[How to use it](docs/USAGE.md)** · [Integration & lifecycle](docs/INTEGRATION.md) ·
 [API reference](docs/API.md) · [all docs](docs/README.md)
 
 ```c
+#include "redfs.h"
+
 redfs_depot* depot;
-redfs_depot_open(NULL, REDFS_SCAN_ALL, &depot);      /* auto-detects the install */
+if (redfs_depot_open(NULL, REDFS_SCAN_ALL, &depot) != REDFS_OK)  /* NULL: auto-detect */
+    return;
 
 redfs_blob dds;
-redfs_texture_read_dds(depot, redfs_hash("base\\icon\\foo.xbm"), &dds);
-/* dds.data is a complete DDS -- hand it to CreateDDSTextureFromMemory */
-redfs_blob_free(&dds);
+if (redfs_texture_read_dds(depot, redfs_hash("base\\icon\\foo.xbm"), &dds) == REDFS_OK) {
+    /* dds.data is a complete DDS -- hand it to CreateDDSTextureFromMemory */
+    redfs_blob_free(&dds);
+}
+redfs_depot_close(depot);
 ```
 
 ## Why this works
 
 The `.archive` container is fully understood: a header, an index of
 `(hash -> segment range)`, and a segment table of `(offset, compressed size,
-size)`. Compression is Oodle Kraken behind a 8-byte `KARK` header, and
+size)`. Compressed segments are Oodle Kraken behind an 8-byte `KARK` header, and
 `oo2ext_7_win64.dll` ships with every copy of the game — inside the game process
-it is already loaded, so RedFS resolves it with `GetModuleHandle` and never
+it is already loaded, so RedFS binds it by name with `GetModuleHandle` and never
 redistributes it.
 
 That means **no address-library offsets and no hooks**, so a game patch does not
@@ -43,23 +49,19 @@ break RedFS the way it breaks tools that hook `ResourceDepot`.
 | Mount the whole depot | **~30 ms** |
 | Resident cost | 8.7 MB heap + ~89 MB file-backed index mapping (evictable) |
 | Read one 40 KB file from the middle of a 24 GB archive | **0.16 ms** |
-| Bulk decode throughput | 300–780 MB/s |
-| Mesh chunk bounds, uncached | ~1–2 ms |
-| Mesh chunk bounds, cached | **0.00 ms** |
+| `redfs_mesh_open`, uncached (computes chunk bounds) | median **0.72 ms**, p90 2.27 ms |
+| `redfs_mesh_open`, cached | ~0 ms |
+
+The mesh figure is 200 meshes sampled by stride across a stock install, with no
+RedFS mesh cache and a warm OS page cache: min 0.05, median 0.72, mean 0.98,
+p90 2.27, max 7.14 ms. The spread is mesh size, so budget against p90 rather than
+the median if you are deciding what fits in a frame.
 
 **Reads are true random access.** Nothing is bulk-extracted. Lookup is a binary
 search over the sorted index; then only that file's byte window is mapped and
-decoded. Cost is O(size of the file you asked for) and independent of where it
-sits:
-
-```
-depth      reads   bytes      avg ms   MB/s
-0-20%      60      7,883,935  0.352    356
-20-40%     60      5,301,367  0.238    354
-40-60%     60      3,666,863  0.179    326
-60-80%     60      6,585,506  0.245    427
-80-100%    60      8,009,581  0.305    418
-```
+decoded, so cost is O(size of the file you asked for) and independent of where it
+sits: sixty reads from each of five slices of one 24 GB archive give
+356 / 354 / 326 / 427 / 418 MB/s. Reproduce with `redfs_cli bench`.
 
 ## What it gives you
 
@@ -68,8 +70,10 @@ depth      reads   bytes      avg ms   MB/s
 ```c
 uint64_t     redfs_hash(const char* depot_path);   /* normalise + FNV1a64 */
 int          redfs_exists(depot, hash);
-redfs_status redfs_stat(depot, hash, &info);
+redfs_status redfs_stat(depot, hash, &info);       /* size, sha1, winning archive */
+redfs_status redfs_enumerate(depot, fn, user);     /* every entry, hash-ordered */
 redfs_status redfs_read(depot, hash, part, &blob); /* MAIN | ALL | buffer i */
+redfs_status redfs_read_into(depot, hash, part, dst, capacity, &written);
 redfs_status redfs_read_async(depot, hash, part, cb, user);
 ```
 
@@ -80,17 +84,25 @@ only need metadata.
 
 ### Paths, both directions
 
-`pathToHash` is a pure function. `hashToPath` cannot be — FNV1a is one-way and
+`redfs_hash` is a pure function. The reverse cannot be — FNV1a is one-way and
 archives keep no path table — so it is a dictionary, filled from three sources:
 
 1. **CR2W import tables**, learned automatically as you read files. Free, and the
-   only source that knows paths a mod invented.
+   only source that knows paths a mod invented. Off until you call
+   `redfs_path_load` or `redfs_path_enable`.
 2. **A path list**: WolvenKit's `usedhashes.kark`, or plain text, one per line.
 3. **`redfs_path_add`**.
 
-Only paths that resolve in the mounted depot are kept, so a hit always names a
-readable file. On a stock install WolvenKit's list gives **544,496 of 544,670
-files — 99.97 % coverage.**
+**Only the path list is filtered against the mounted depot.** Import learning and
+`redfs_path_add` cannot be — neither has a depot to check against — so a hit tells
+you what a file is *called*, not that it is readable. Call `redfs_exists`, or just
+handle `REDFS_E_NOT_FOUND` from the read.
+
+The string `redfs_path_from_hash` returns stays valid for the lifetime of the
+process; later additions from any source cannot invalidate a pointer you hold.
+
+On the reference install WolvenKit's list resolves **544,496 of the depot's
+544,670 files — 99.97 % coverage.**
 
 For hosts that cannot hold a `uint64` exactly (Lua numbers are doubles and lose
 precision above 2⁵³), keys cross as decimal strings:
@@ -109,30 +121,33 @@ live entity.
 
 ```c
 redfs_mesh* m;
-redfs_mesh_open(depot, redfs_hash(path), &m);
+if (redfs_mesh_open(depot, redfs_hash(path), &m) != REDFS_OK) return;
 
 for (uint32_t i = 0; i < redfs_mesh_chunk_count(m); ++i) {
     const redfs_mesh_chunk* c = redfs_mesh_chunk_at(m, i);
-    /* c->index, c->lod, c->vertex_count, c->index_count,
-       c->bbox_min[3], c->bbox_max[3],
-       c->bounds_valid  -- 0 means no box could be computed */
+    if (!c->bounds_valid) continue;  /* boxes are all-zero; do not read them */
+    /* c->index, c->lod, c->lod_mask, c->vertex_count, c->index_count,
+       c->bbox_min[3], c->bbox_max[3] */
 }
 redfs_mesh_close(m);
 ```
 
 **The bounding box is not stored anywhere in the format.** `rendChunk` carries
 vertex/index counts, a `lodMask` and stream offsets; only `CMesh` has a box, and
-it covers the whole mesh. So RedFS computes it — dequantizing each chunk's
-positions from the geometry buffer:
+it covers the whole mesh. So RedFS computes it, dequantizing each chunk's
+positions out of the geometry buffer:
 
 ```
 p = int16 / 32767 * header.quantizationScale + header.quantizationOffset
 ```
 
 Boxes come out in mesh-local **game space (Z up)**, matching component
-transforms — not the Y-up flip glTF exporters apply.
+transforms — not the Y-up flip glTF exporters apply. A chunk whose geometry is
+absent, streamed out, or fails its span check gets `bounds_valid == 0` and a
+zeroed box: about 1 stock mesh in 10,000, so test the flag rather than testing
+the box against zero.
 
-What that buys you, on `player_female_average\t0_000_pwa_base__full.mesh`:
+What that buys you, on the stock `t0_000_pwa_base__full.mesh` (LOD 1 only):
 
 ```
 idx  lod  verts   tris   material     bbox min (x y z)        bbox max (x y z)
@@ -147,8 +162,9 @@ idx  lod  verts   tris   material     bbox min (x y z)        bbox max (x y z)
 ```
 
 A clean vertical stack, feet to head. "Which chunks are the chest" stops being a
-guess and becomes `z > 1.2` — on any mesh, vanilla or modded, without knowing
-anything about the mod.
+guess and becomes a `z` threshold — on any mesh, vanilla or modded, without
+knowing anything about the mod. `tools/example_chest.cpp` does exactly this,
+taking the top third of whatever the mesh spans and emitting the `chunkMask`.
 
 Chunks repeat per LOD, so filter on `c->lod` to get one copy.
 
@@ -169,33 +185,60 @@ redfs_cache_open(depot, "redfs_mesh.cache");
 /* every redfs_mesh_open from now on is remembered, across restarts */
 ```
 
-First call for a mesh computes (~1–2 ms); every later call, including after a
-game restart, is a lookup (0.00 ms). Warm a known set up front if you prefer:
+First call for a mesh computes it (median 0.72 ms, up to ~7 ms for a large one);
+every later call, including after a game restart, is a lookup. To precompute a
+known set up front:
 
 ```c
 redfs_cache_warm(depot, hashes, count, &computed);
 ```
 
-The cache stores a fingerprint of the mounted archive set and silently discards
-itself if that set moves, so a patch or a newly installed mod can never serve
-stale geometry.
+`redfs_cache_warm` **requires a cache already open on this depot** and returns
+`REDFS_E_INVALID_ARG` without one, rather than paying for decodes it would
+immediately discard.
+
+Two things to know:
+
+- **There is one cache per process and it belongs to the depot you passed to
+  `redfs_cache_open`.** Entries are keyed by hash alone, and the same hash means
+  different bytes in a different depot, so `redfs_mesh_open` on any *other* depot
+  bypasses the cache entirely. If you keep two depots, only one benefits.
+- The cache fingerprints the mounted archive set — per archive: path, entry
+  count, index size, index CRC and declared file size — and silently discards
+  itself when that moves. The CRC is what catches an archive **replaced in
+  place**, where a re-cook keeps the same file and segment counts and every other
+  input stays byte-identical. Mounting after `redfs_cache_open` re-checks.
 
 Precomputing *every* mesh in the depot is not viable — there are ~10⁵ of them, so
-it would cost minutes of startup and gigabytes. Lazy population gets the same
+it would cost minutes of startup and gigabytes. Lazy population reaches the same
 end state for the meshes you actually touch.
+
+A mesh handle is a `shared_ptr` internally, so `redfs_mesh_close` is always
+correct to call, cached or not, and a handle stays valid across
+`redfs_cache_close`.
 
 ### Textures
 
 ```c
 redfs_texture_desc d;
-redfs_texture_desc_of(depot, hash, &d);   /* w/h/mips/slices/DXGI format */
+redfs_texture_desc_of(depot, hash, &d);  /* extent, mips, slices, DXGI format */
 
 redfs_blob dds;
-redfs_texture_read_dds(depot, hash, &dds);  /* complete in-memory DDS */
-redfs_texture_read_raw(depot, hash, &d, &blob);  /* just the pixels */
+redfs_texture_read_dds(depot, hash, &dds);   /* complete in-memory DDS */
+
+redfs_blob raw;
+redfs_texture_read_raw(depot, hash, &d, &raw);  /* just the pixels, plus desc */
 ```
 
-Handles `CBitmapTexture`, `CTextureArray`, `CCubeTexture`.
+Handles `CBitmapTexture`, `CTextureArray`, `CCubeTexture`; anything else is
+rejected with `REDFS_E_UNSUPPORTED` rather than described from the wrong chunk.
+
+### Audio
+
+`redfs_audio_info_of` parses a `.wem` header — codec, channels, sample rate,
+payload offset — and `redfs_audio_walk_chunks` enumerates its RIFF chunks,
+including Wwise's private `vorb` and `seek`. RedFS does not decode audio; see
+[Known gaps](#known-gaps).
 
 ### CR2W introspection
 
@@ -210,32 +253,61 @@ redfs_cr2w_walk_array(f, &array_value, visit_elem, NULL);
 redfs_cr2w_import_path(f, i);                            /* dependency list */
 ```
 
-## Mod managers
+## Mount order, mods and mod managers
 
-`redfs_depot_open` scans `archive/pc/content`, `ep1`, `mods/` (REDmod) and
-`archive/pc/mod` automatically, in the game's own order. Lookup is one flat
-namespace; later mounts override earlier ones, so a legacy `.archive` beats a
-REDmod one which beats the base game, and `zz_` prefixes win exactly as modders
-expect. Files a mod *adds* read like any other. `redfs_stat` reports which
-archive actually won.
+`redfs_depot_open` scans four archive sets in the game's own order, and **later
+mounts win**:
+
+```
+archive/pc/content  ->  archive/pc/ep1  ->  mods/<name>/archives  ->  archive/pc/mod
+```
+
+So a legacy `.archive` beats a REDmod one, which beats the base game. Lookup is
+one flat namespace, files a mod *adds* read like any other, and `redfs_stat`
+reports which archive actually won.
+
+Ordering *within* a set is not uniform, and this trips people up:
+
+- **Under `archive/pc`** (`content`, `ep1`, `mod`) archives mount in filename
+  order and the alphabetically **last** one wins — which is why modders prefix
+  with `zz_`. These folders are scanned top level only.
+- **REDmod is searched recursively** — `mods/<name>/archives` and everything
+  beneath it — ordered by full path and then **reversed**. So inside a single
+  REDmod the ordinally **first** path wins and a `zz_` prefix **loses**. Between
+  REDmod folders the later folder name still wins.
+
+Both match WolvenKit's `ArchiveManager`, which is the reference for what the game
+does.
 
 **MO2 / Vortex:** their VFS only exists inside processes they launch. Running
 *inside* a game launched by MO2, the merged mod archives already appear under
-`archive/pc/mod` and `REDFS_SCAN_ALL` finds them. Running a tool *outside* MO2,
+`archive/pc/mod` and `REDFS_SCAN_ALL` finds them. Running a tool *outside* MO2
 they are invisible — mount the staging folder explicitly:
 
 ```c
 redfs_depot_mount_dir(depot, "D:\\mods\\SomeMod", &mounted);
 ```
 
-## Threading
+## Threading and lifecycle
 
-A depot is immutable once open, so reads, stats and texture calls are safe from
-any number of threads. `redfs_depot_mount*` and `redfs_depot_close` are not —
-open first, then share.
+A depot is immutable once open, so `redfs_read*`, `redfs_stat`,
+`redfs_enumerate`, `redfs_texture_*` and `redfs_mesh_*` are safe from any number
+of threads. **Not** safe: `redfs_depot_mount*`, `redfs_depot_close`,
+`redfs_shutdown`, `redfs_cache_*` and `redfs_path_*` — open first, then share.
+
+A single `redfs_cr2w` handle is single-threaded: decoding a `CString` caches it
+on the handle. Share the depot, give each thread its own handle. The typed
+helpers above are unaffected; each builds a private handle per call.
 
 Reads take milliseconds. Call them off the render thread, or use
-`redfs_read_async` (the callback runs on RedFS's worker; marshal back yourself).
+`redfs_read_async` — the callback runs on RedFS's worker, so marshal back
+yourself.
+
+`redfs_depot_close` cancels anything still queued against that depot; those
+callbacks fire with `REDFS_E_CANCELLED`, so nothing is left waiting. Call
+`redfs_shutdown` before your DLL can be unloaded — from RED4ext's
+`Main(EMainReason::Unload)` or CET's `onShutdown`, and **never from `DllMain`**.
+[docs/INTEGRATION.md](docs/INTEGRATION.md) covers the whole lifecycle.
 
 ## Building
 
@@ -244,8 +316,13 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-Produces `redfs_static.lib` (link into your own DLL), `RedFS.dll`, and two tools.
-C++20, MSVC, Windows x64. No dependencies.
+Produces `redfs_static.lib` (link into your own DLL), `RedFS.dll`, two tools
+(`redfs_cli`, `redfs_verify`) and a worked example (`example_chest`). C++20, MSVC,
+Windows x64. No external dependencies — Oodle is bound by name at runtime.
+
+`REDFS_ABI_VERSION` is **2**. Check `redfs_abi_version()` against it at startup if
+you link `RedFS.dll`; version 2 added `redfs_mesh_chunk::bounds_valid`, so
+anything built against 1 needs a recompile.
 
 ## Verifying
 
@@ -255,14 +332,15 @@ C++20, MSVC, Windows x64. No dependencies.
 ```
 
 Four configurations, because each catches what the others cannot: **release**
-(logic), **debug** (leaks, via the CRT heap), **asan** (out-of-bounds and
-use-after-free in every parser), **install** (format correctness against external
-oracles).
+(logic), **debug** (leaks, via the CRT heap, measured as steady state across two
+full passes), **asan** (out-of-bounds and use-after-free in every parser),
+**install** (format correctness against external oracles).
 
 Unit tests need no game: `tests/fixtures.cpp` builds `.archive` and CR2W
 containers byte-exactly from nothing, which also makes it possible to test
-malformed input that no real install would ever produce. 31 cases, 243 checks,
-under a second.
+malformed input no real install would ever produce. **70 cases, 1175 checks, ~1.6
+seconds.** A separate `redfs_lifecycle` binary covers teardown — abrupt exit,
+shutdown under load, and a real `LoadLibrary`/`FreeLibrary` cycle.
 
 A deterministic mutation fuzzer hammers both parsers — corrupt archives must
 produce errors, never crashes. Under ASan it caught a real out-of-bounds read:
@@ -270,13 +348,14 @@ produce errors, never crashes. Under ASan it caught a real out-of-bounds read:
 corrupt name table sent `strcmp` off the end of the buffer. Details and the rest
 of the tooling story in [docs/done/testing.md](docs/done/testing.md).
 
-`redfs_cli selftest` mounts the depot, samples 400 files across all 57 archives,
-decodes them, and checks sizes against the index.
+`redfs_cli selftest` mounts the depot, samples 400 files spread across the
+archives, decodes them, and checks sizes against the index.
 
 `redfs_verify` is the real check — it validates against oracles outside RedFS:
 
 - **Texture headers** go to DirectXTex (WolvenKit's `texconv.dll`), which parses
-  them independently; its answer must match what RedFS claimed.
+  them independently; extent, mips, DXGI format, slice count and the cubemap flag
+  must all match what RedFS claimed.
 - **Texture payloads** are checked by arithmetic: how many bytes a mip chain of
   that exact format and extent *must* occupy, versus the size the archive
   actually stores. Those numbers come from different places, so a wrong DXGI
@@ -284,19 +363,21 @@ decodes them, and checks sizes against the index.
 - **Mesh bounds** are checked against `CMesh.boundingBox` — written by CDPR's
   cooker, never read by the code being tested. The union of computed chunk boxes
   must fall inside it; a wrong stride or quantization scale escapes immediately.
+- **`redfs_mesh_desc_of` against `redfs_mesh_open`**, which reach chunk and
+  appearance counts by different routes and must agree.
 
-Current results on the reference install:
+The last full sweep, on the reference install: **11,255 textures — 0 header
+mismatches, 0 payload size mismatches; 12,000 meshes — 0 chunk unions escaping the
+stored `CMesh` box, 0 `desc_of`/`mesh_open` disagreements.** A small number of
+meshes have no computable bounds and are reported as such rather than counted
+clean; see `bounds_valid` above.
 
-```
-11255 textures checked
-  0 header mismatches vs DirectXTex
-  0 payload size mismatches
-  0 skipped (format not in the reference table)
-
-20000 meshes checked
-  0 chunk unions escaping the stored CMesh box
-  2 with no computable bounds (geometry absent)
-```
+**What the sweep does not cover:** the reference install has no
+`archive/pc/mod` folder and no REDmod folders under `mods/`, so both mod scan
+paths — including the recursive REDmod discovery and its reversed ordering — are
+exercised only by synthesized fixtures, never against real mod content. The
+ordering rules above are derived from WolvenKit's `ArchiveManager` and covered by
+unit tests, not confirmed against a modded install.
 
 That sweep found three real bugs during development: `texture_desc_of` happily
 describing a mesh's *embedded* texture instead of refusing; `textureData` being
@@ -305,11 +386,10 @@ texture resources and `SerializationDeferredDataBuffer` everywhere else; and a
 minority of textures whose blob header records the mip-biased extent while the
 buffer holds the unbiased surface, which produced a DDS that decoded to garbage.
 
-The bounds check needs a tolerance that scales two ways — one int16 quantization
-step is `extent/32767`, and a mesh authored at world coordinate 2800 has ~2.4e-4
-between representable floats there. A fixed epsilon flags large meshes for being
-large and distant ones for being distant; both were test bugs, not library bugs,
-and the code comments say so.
+The bounds check needs a tolerance that scales with both mesh extent and distance
+from the origin; a fixed epsilon flags large meshes for being large and distant
+ones for being distant. That and the rest of the oracle design is in
+[docs/done/verification.md](docs/done/verification.md).
 
 ## Scope
 
@@ -325,6 +405,10 @@ set of boxes.
   channels, rate, payload offset, RIFF chunk walk), but converting to ogg/mp3
   means bundling Vorbis and Opus, and Wwise Vorbis needs its codebooks rebuilt —
   that is ww2ogg/vgmstream/ffmpeg's job, not an archive reader's.
+- **`redfs_audio_probe` is not cheap.** Kraken cannot decode a prefix, so
+  identifying a container from its first 16 bytes decodes the whole main
+  segment — tens of MB for music. Call it off the game thread, or skip it when
+  the extension already tells you what you have.
 - **Voice-over `.opuspak`** needs its paired `.opusinfo` to index; RedFS reports
   the container type and hands back raw bytes but does not demux it. Format
   mapped, design in [docs/audio-opus.md](docs/audio-opus.md).
@@ -342,6 +426,7 @@ in [docs/roadmap.md](docs/roadmap.md).
 ## Documentation
 
 - **[docs/USAGE.md](docs/USAGE.md)** — build, link, recipes, pitfalls
+- **[docs/INTEGRATION.md](docs/INTEGRATION.md)** — lifecycle inside the game
 - **[docs/API.md](docs/API.md)** — the requested call surface, mapped
 - **[docs/done/](docs/done/)** — research and design for what is built: the two
   container formats, path hashing, the texture and mesh pipelines, API

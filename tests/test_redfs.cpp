@@ -849,7 +849,10 @@ struct ElemCollect {
 int collect_elems(uint32_t, const redfs_value* v, void* user) {
     auto* c = static_cast<ElemCollect*>(user);
     if (v->kind == REDFS_KIND_UINT) c->values.push_back(v->as.u);
-    if (v->kind == REDFS_KIND_NAME) c->names.emplace_back(v->as.s ? v->as.s : "");
+    // NAME and STRING both land in `names`: an enum element and a CString/NodeRef
+    // element are both "a piece of text" as far as a collecting test cares.
+    if (v->kind == REDFS_KIND_NAME || v->kind == REDFS_KIND_STRING)
+        c->names.emplace_back(v->as.s ? v->as.s : "");
     return 1;
 }
 }  // namespace
@@ -978,6 +981,58 @@ TEST(cr2w, enum_and_string_arrays_are_sized_correctly) {
             CHECK_STR(c.names[0].c_str(), "TCM_None");
             CHECK_STR(c.names[1].c_str(), "TCM_DXTAlpha");
             CHECK_STR(c.names[2].c_str(), "TCM_QualityColor");
+        }
+    });
+}
+
+TEST(cr2w, noderef_is_a_length_prefixed_string_not_eight_bytes) {
+    // NodeRef was listed in fixed_width as 8 bytes and decoded with
+    // Uint64/TweakDBID. It is neither: in CR2W it is a VLQ length-prefixed string
+    // encoded exactly like CString. Red4Reader::ReadNodeRef calls
+    // ReadLengthPrefixedString, and the only two overrides of it -- RedPackageReader
+    // and PersistencySystem2Parser -- are not on the CR2W path.
+    //
+    // Two consequences, both fixed here: a scalar decoded to the first 8 bytes of
+    // its prefix-plus-characters as an integer, and an array:NodeRef strode 8 bytes
+    // through variable-length strings instead of walking them.
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+
+    // VLQ prefix 0x80 | len, negative-signed => UTF-8.
+    fixture::Buf one;
+    one.u8(0x80 | 5);
+    one.raw("node1", 5);
+    b.prop("target", "NodeRef", one.bytes.data(), one.size());
+
+    // Three refs of DIFFERENT lengths -- a stride of 8 cannot walk these.
+    fixture::Buf many;
+    for (const char* s : {"a", "bbbb", "ccccccccc"}) {
+        const size_t n = std::strlen(s);
+        many.u8(static_cast<uint8_t>(0x80 | n));
+        many.raw(s, n);
+    }
+    b.prop_array("refs", "NodeRef", 3, many.bytes.data(), many.size());
+
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        redfs_value v{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "target", &v));
+        // A string, not an integer.
+        CHECK_EQ((int)v.kind, (int)REDFS_KIND_STRING);
+        if (v.kind == REDFS_KIND_STRING) CHECK_STR(v.as.s, "node1");
+
+        redfs_value arr{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "refs", &arr));
+        CHECK_EQ((int)arr.kind, (int)REDFS_KIND_ARRAY);
+
+        ElemCollect c;
+        CHECK_OK(redfs_cr2w_walk_array(f, &arr, collect_elems, &c));
+        CHECK_EQ(c.names.size(), 3u);
+        if (c.names.size() == 3) {
+            CHECK_STR(c.names[0].c_str(), "a");
+            CHECK_STR(c.names[1].c_str(), "bbbb");
+            CHECK_STR(c.names[2].c_str(), "ccccccccc");
         }
     });
 }

@@ -153,8 +153,11 @@ if ($GameDir) {
 
     if (Test-Path $TexconvDll) {
         Step "texture + mesh verification vs external oracles ($VerifyCount)" {
+            # 'disagree' matters: the desc_of vs mesh_open cross-check fails the
+            # step via its exit code, but without this pattern the reason never
+            # reached the console -- a failure with no visible cause.
             & "$root\build\redfs_verify.exe" $TexconvDll $GameDir $VerifyCount |
-                Select-String -Pattern 'checked|mismatch|escaping|computable'
+                Select-String -Pattern 'checked|mismatch|escaping|computable|disagree|FAIL'
         }
     } else {
         Write-Host ""

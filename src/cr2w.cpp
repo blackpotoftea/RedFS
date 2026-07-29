@@ -114,8 +114,13 @@ uint32_t fixed_width(const char* type) {
     static const Entry kFixed[] = {
         {"Bool", 1},   {"Int8", 1},    {"Uint8", 1},   {"Int16", 2},  {"Uint16", 2},
         {"CName", 2},  {"Int32", 4},   {"Uint32", 4},  {"Float", 4},  {"Int64", 8},
-        {"Uint64", 8}, {"Double", 8},  {"TweakDBID", 8}, {"NodeRef", 8},
+        {"Uint64", 8}, {"Double", 8},  {"TweakDBID", 8},
     };
+    // Deliberately NOT here: NodeRef. In CR2W it is a VLQ length-prefixed string,
+    // encoded exactly like CString -- Red4Reader::ReadNodeRef calls
+    // ReadLengthPrefixedString, and neither override of it (RedPackageReader,
+    // PersistencySystem2Parser) is on the CR2W path. Listing it as 8 bytes made an
+    // array:NodeRef stride 8 through variable-length strings.
     for (const auto& e : kFixed)
         if (std::strcmp(type, e.name) == 0) return e.size;
     if (starts_with(type, "handle:") || starts_with(type, "whandle:")) return 4;
@@ -201,7 +206,10 @@ struct ElementLayout {
 ElementLayout classify_elements(const char* elem, const uint8_t* first, const uint8_t* limit,
                                 uint32_t count) {
     if (const uint32_t w = fixed_width(elem)) return {ElementLayout::kFixed, w};
-    if (std::strcmp(elem, "CString") == 0) return {ElementLayout::kCString, 0};
+    // NodeRef is length-prefixed like CString, so it has to walk rather than
+    // stride; see fixed_width for why it is not in the fixed table.
+    if (std::strcmp(elem, "CString") == 0 || std::strcmp(elem, "NodeRef") == 0)
+        return {ElementLayout::kCString, 0};
 
     if (count > 0) {
         const uint64_t avail = static_cast<uint64_t>(limit - first);
@@ -287,7 +295,7 @@ void cr2w_decode(const redfs_cr2w* f, const char* type, const uint8_t* data, uin
     } else if (eq("Int64") && size >= 8) {
         out->kind = REDFS_KIND_INT;
         out->as.i = static_cast<int64_t>(rd64(data));
-    } else if ((eq("Uint64") || eq("TweakDBID") || eq("NodeRef")) && size >= 8) {
+    } else if ((eq("Uint64") || eq("TweakDBID")) && size >= 8) {
         out->kind = REDFS_KIND_UINT;
         out->as.u = rd64(data);
     } else if (eq("Float") && size >= 4) {
@@ -303,7 +311,10 @@ void cr2w_decode(const redfs_cr2w* f, const char* type, const uint8_t* data, uin
     } else if (eq("CName") && size >= 2) {
         out->kind = REDFS_KIND_NAME;
         out->as.s = f->name(rd16(data));
-    } else if (eq("CString")) {
+    } else if (eq("CString") || eq("NodeRef")) {
+        // NodeRef shares CString's encoding exactly (see fixed_width). The engine
+        // interns it into a hash pool; RedFS hands back the text, which is what a
+        // caller resolving a node reference actually wants.
         // Decoded strings are owned by the handle (redfs_cr2w::owned_strings) and
         // cached by source pointer, so a property queried every frame allocates
         // once instead of growing the handle until it is closed.
