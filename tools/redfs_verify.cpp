@@ -174,18 +174,31 @@ int main(int argc, char** argv) {
         }
 
         // check 1: DirectXTex agrees with us about what this image is
+        //
+        // arraySize and miscFlags are part of this. They were declared above and
+        // never compared, and that gap is exactly how a cubemap encoding bug --
+        // every emitted cube declaring six times the faces its payload held --
+        // sat behind a clean "0 header mismatches" result. A surface count the
+        // loader disagrees with is a header mismatch like any other.
         const TexMetadata m = g_meta(dds.data, static_cast<int32_t>(dds.size), 0);
+        // On disk arraySize counts cubes; loaders multiply by 6 for a cubemap.
+        // RedFS reports slice_count in faces, so compare in faces.
+        const bool is_cube = (m.miscFlags & 0x4) != 0;  // TEX_MISC_TEXTURECUBE
+        const int64_t faces = m.arraySize * (is_cube ? 6 : 1);
         const bool header_ok = m.width == static_cast<int64_t>(t.width) &&
                                m.height == static_cast<int64_t>(t.height) &&
                                m.mipLevels == static_cast<int64_t>(t.mip_count) &&
-                               m.format == static_cast<int32_t>(t.dxgi_format);
+                               m.format == static_cast<int32_t>(t.dxgi_format) &&
+                               faces == static_cast<int64_t>(t.slice_count) &&
+                               is_cube == (t.is_cubemap != 0);
         if (!header_ok) {
             ++header_mismatch;
-            std::printf("FAIL  0x%016" PRIX64 "  redfs %ux%u mips=%u dxgi=%u, directxtex "
-                        "%lldx%lld mips=%lld dxgi=%d\n",
-                        h, t.width, t.height, t.mip_count, t.dxgi_format,
-                        static_cast<long long>(m.width), static_cast<long long>(m.height),
-                        static_cast<long long>(m.mipLevels), m.format);
+            std::printf("FAIL  0x%016" PRIX64 "  redfs %ux%u mips=%u dxgi=%u slices=%u cube=%u, "
+                        "directxtex %lldx%lld mips=%lld dxgi=%d faces=%lld cube=%d\n",
+                        h, t.width, t.height, t.mip_count, t.dxgi_format, t.slice_count,
+                        t.is_cubemap, static_cast<long long>(m.width),
+                        static_cast<long long>(m.height), static_cast<long long>(m.mipLevels),
+                        m.format, static_cast<long long>(faces), is_cube ? 1 : 0);
         }
 
         // check 2: the stored payload is exactly the size that format demands
@@ -248,10 +261,10 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < n; ++i) {
             const redfs_mesh_chunk* ch = redfs_mesh_chunk_at(m, i);
             if (!ch) continue;
-            bool all_zero = true;
-            for (int a = 0; a < 3; ++a)
-                if (ch->bbox_min[a] != 0.f || ch->bbox_max[a] != 0.f) all_zero = false;
-            if (all_zero) continue;
+            // The API says so directly now. This used to infer "no bounds" from
+            // "all six floats are zero", which also discards any real chunk
+            // centred on the origin with zero extent.
+            if (!ch->bounds_valid) continue;
             ++with_bounds;
             for (int a = 0; a < 3; ++a) {
                 ulo[a] = (std::min)(ulo[a], ch->bbox_min[a]);

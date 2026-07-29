@@ -9,6 +9,7 @@
 #include "internal.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 #include <string.h>  // _stricmp
@@ -104,7 +105,16 @@ uint64_t mip_chain_bytes(uint32_t fmt, uint32_t w, uint32_t h, uint32_t depth, u
                          uint32_t slices) {
     if (w == 0 || h == 0 || mips == 0) return 0;
     uint64_t total = 0;
-    for (uint32_t m = 0; m < mips; ++m) {
+    // The mip count comes from the file and nothing upstream bounds it, so the
+    // trip count is the whole hazard: a crafted 0xFFFFFFFB spins for seconds per
+    // call, five calls per describe_texture, on whatever thread asked -- and this
+    // is a synchronous entry point, so that thread is usually the game's.
+    //
+    // 32 costs nothing legitimate. Level m has extent max(1, w >> m), so for a
+    // 32-bit extent level 31 is the last that can differ from its predecessor;
+    // a complete chain for a 2^31-wide texture is exactly 32 levels, and real
+    // content tops out at 15 (16384x16384). It also keeps `w >> m` defined.
+    for (uint32_t m = 0; m < mips && m < 32; ++m) {
         const uint32_t mw = (std::max)(1u, w >> m);
         const uint32_t mh = (std::max)(1u, h >> m);
         const uint32_t md = (std::max)(1u, depth >> m);
@@ -189,7 +199,14 @@ void write_dds_header(uint8_t* dst, const redfs_texture_desc& d) {
     w.u32(d.dxgi_format);
     w.u32(d.is_3d ? D3D10_TEXTURE3D : D3D10_TEXTURE2D);
     w.u32(d.is_cubemap ? D3D11_MISC_TEXTURECUBE : 0u);
-    w.u32((std::max)(1u, d.slice_count));
+    // On disk, arraySize counts CUBES, not faces: every DDS loader multiplies it
+    // by 6 when MISC_TEXTURECUBE is set (DirectXTK DDSTextureLoader.cpp --
+    // `if (miscFlag & D3D11_RESOURCE_MISC_TEXTURECUBE) { arraySize *= 6; }`).
+    // RED4's sliceCount counts faces, which is what mip_chain_bytes above wants,
+    // so this is the one place the two conventions have to be bridged -- writing
+    // the face count here declared 36 faces for a 6-face payload and every
+    // cubemap we emitted failed to load with ERROR_HANDLE_EOF.
+    w.u32(d.is_cubemap ? (std::max)(1u, d.slice_count / 6u) : (std::max)(1u, d.slice_count));
     w.u32(DDS_ALPHA_MODE_STRAIGHT);
 }
 
@@ -282,9 +299,21 @@ redfs_status describe_texture(const redfs_depot* depot, uint64_t hash, const red
     out->buffer_index = 0;
     if (cr2w_find(&f, blob, "textureData", &tex) == REDFS_OK && tex.kind == REDFS_KIND_BUFFER)
         out->buffer_index = tex.as.buffer;
+    else
+        // Falling through to buffer 0 is usually right -- textures have one
+        // attached buffer -- but when it is not, the caller gets pixels from an
+        // unrelated buffer with nothing to distinguish that from success. Say so,
+        // so a wrong image is traceable from a log rather than a guess.
+        log("texture 0x%016llX: no textureData buffer property; assuming attached buffer 0",
+            static_cast<unsigned long long>(hash));
 
     if (out->width == 0 || out->height == 0)
         return fail(REDFS_E_CORRUPT, "texture header has zero extent");
+    // A complete chain never exceeds 32 levels for any 32-bit extent (see
+    // mip_chain_bytes). Rejecting here rather than silently clamping means a
+    // caller is never handed a descriptor built from a nonsense mip count.
+    if (out->mip_count > 32)
+        return fail(REDFS_E_CORRUPT, "texture header claims %u mips", out->mip_count);
     if (out->dxgi_format == DXGI_UNKNOWN)
         return fail(REDFS_E_UNSUPPORTED, "unmapped texture format (compression=%s rawFormat=%s)",
                     compression, raw_format);
@@ -299,23 +328,42 @@ redfs_status describe_texture(const redfs_depot* depot, uint64_t hash, const red
     // the unbiased surface, and a DDS whose header disagrees with its payload
     // decodes to garbage. The payload is the actual GPU resource, so when a
     // power-of-two rescale makes the two agree exactly, take that reading.
-    if (mip_chain_bytes(out->dxgi_format, out->width, out->height, out->depth, out->mip_count,
-                        out->slice_count) != data_size) {
+    const uint64_t declared = mip_chain_bytes(out->dxgi_format, out->width, out->height,
+                                              out->depth, out->mip_count, out->slice_count);
+    if (declared != data_size) {
+        bool reconciled = false;
         for (uint32_t shift = 1; shift <= 4; ++shift) {
-            const uint32_t w = out->width << shift;
-            const uint32_t h = out->height << shift;
-            if (mip_chain_bytes(out->dxgi_format, w, h, out->depth, out->mip_count + shift,
+            // 64-bit, because `out->width << shift` is a 32-bit shift that wraps:
+            // 0x40000000 << 2 is 0, mip_chain_bytes then returns 0 through its own
+            // zero-extent guard, and a zero-size payload would make that "match" --
+            // committing width = 0 straight past the check eight lines above.
+            const uint64_t w = static_cast<uint64_t>(out->width) << shift;
+            const uint64_t h = static_cast<uint64_t>(out->height) << shift;
+            if (w > 0xFFFFFFFFull || h > 0xFFFFFFFFull) break;
+            if (mip_chain_bytes(out->dxgi_format, static_cast<uint32_t>(w),
+                                static_cast<uint32_t>(h), out->depth, out->mip_count + shift,
                                 out->slice_count) != data_size)
                 continue;
-            log("texture 0x%016llX: header says %ux%u/%u mips but the payload is %ux%u/%u; "
+            log("texture 0x%016llX: header says %ux%u/%u mips but the payload is %llux%llu/%u; "
                 "using the payload",
-                static_cast<unsigned long long>(hash), out->width, out->height, out->mip_count, w,
-                h, out->mip_count + shift);
-            out->width = w;
-            out->height = h;
+                static_cast<unsigned long long>(hash), out->width, out->height, out->mip_count,
+                static_cast<unsigned long long>(w), static_cast<unsigned long long>(h),
+                out->mip_count + shift);
+            out->width = static_cast<uint32_t>(w);
+            out->height = static_cast<uint32_t>(h);
             out->mip_count += shift;
+            reconciled = true;
             break;
         }
+        // No rescale fit. The header is known to disagree with the payload, and
+        // callers get it anyway -- rejecting would break a documented class of
+        // stock content the four-shift search does not cover. Say so, rather
+        // than discarding the one number that proves something is off.
+        if (!reconciled)
+            log("texture 0x%016llX: header describes %llu bytes but the payload is %llu; "
+                "returning the header as-is",
+                static_cast<unsigned long long>(hash), static_cast<unsigned long long>(declared),
+                static_cast<unsigned long long>(data_size));
     }
     return REDFS_OK;
 }
@@ -369,10 +417,14 @@ redfs_status audio_probe(const redfs_depot* depot, uint64_t hash, redfs_audio_fo
     redfs_status st = read_part(depot, hash, REDFS_PART_MAIN, nullptr, 0, &total);
     if (st != REDFS_OK) return st;
 
-    // Decode only enough to see the magic. read_part needs the whole segment, so
-    // cap the work by refusing to sniff absurdly large mains.
-    std::vector<uint8_t> buf(static_cast<size_t>((std::min<uint64_t>)(total, 1u << 20)));
-    if (total <= buf.size()) {
+    // read_part is all-or-nothing -- it returns REDFS_E_RANGE when the buffer is
+    // smaller than the segment -- so there is no such thing as reading "just the
+    // header" here. A previous 1 MiB cap therefore did not limit the work; it
+    // skipped the read entirely for anything larger, left `head` zeroed, and
+    // reported UNKNOWN. That silently covered every music .wem and every
+    // .opuspak, which is to say every file REDFS_AUDIO_OPUSPAK exists for.
+    if (total) {
+        std::vector<uint8_t> buf(static_cast<size_t>(total));
         uint64_t got = 0;
         st = read_part(depot, hash, REDFS_PART_MAIN, buf.data(), buf.size(), &got);
         if (st != REDFS_OK) return st;
@@ -519,6 +571,30 @@ redfs_status audio_walk_chunks(const void* data, uint64_t size, redfs_riff_chunk
                      });
 }
 
+namespace {
+
+// The leading u32 of an array property is a count the file DECLARES; nothing
+// reconciles it against the payload, so a truncated or crafted array can claim
+// four billion elements it does not contain. Walking reports what actually
+// decodes -- which is also what redfs_mesh_chunk_count reports, and two public
+// entry points must not disagree about the same number.
+//
+// Cheap: cr2w_walk_array stops as soon as an element fails to advance, so a
+// bogus count costs a handful of iterations, not its face value.
+uint32_t walked_count(const redfs_cr2w* f, const redfs_value* v) {
+    uint32_t n = 0;
+    cr2w_walk_array(
+        f, v,
+        [](uint32_t, const redfs_value*, void* user) {
+            ++*static_cast<uint32_t*>(user);
+            return 1;
+        },
+        &n);
+    return n;
+}
+
+}  // namespace
+
 redfs_status mesh_desc_of(const redfs_depot* depot, uint64_t hash, redfs_mesh_desc* out) {
     std::vector<uint8_t> storage;
     redfs_cr2w f;
@@ -544,18 +620,22 @@ redfs_status mesh_desc_of(const redfs_depot* depot, uint64_t hash, redfs_mesh_de
     if ((cr2w_find(&f, blob, "header.renderChunkInfos", &v) == REDFS_OK ||
          cr2w_find(&f, blob, "header.renderChunks", &v) == REDFS_OK) &&
         v.kind == REDFS_KIND_ARRAY)
-        out->submesh_count = static_cast<uint32_t>(v.as.u);
+        out->submesh_count = walked_count(&f, &v);
     if (cr2w_find(&f, 0, "appearances", &v) == REDFS_OK && v.kind == REDFS_KIND_ARRAY)
-        out->appearance_count = static_cast<uint32_t>(v.as.u);
+        out->appearance_count = walked_count(&f, &v);
     if (cr2w_find(&f, 0, "materialEntries", &v) == REDFS_OK && v.kind == REDFS_KIND_ARRAY)
-        out->material_count = static_cast<uint32_t>(v.as.u);
+        out->material_count = walked_count(&f, &v);
 
-    out->bbox_min[0] = float_or(f, 0, "boundingBox.Min.X", 0.f);
-    out->bbox_min[1] = float_or(f, 0, "boundingBox.Min.Y", 0.f);
-    out->bbox_min[2] = float_or(f, 0, "boundingBox.Min.Z", 0.f);
-    out->bbox_max[0] = float_or(f, 0, "boundingBox.Max.X", 0.f);
-    out->bbox_max[1] = float_or(f, 0, "boundingBox.Max.Y", 0.f);
-    out->bbox_max[2] = float_or(f, 0, "boundingBox.Max.Z", 0.f);
+    // Stored in the file, so it can be NaN or infinity. Same reasoning as
+    // mesh_build: a non-finite box makes every comparison a caller writes
+    // against it false, which reads as "nothing matched" rather than as an error.
+    auto finite_or_zero = [](float v) { return std::isfinite(v) ? v : 0.f; };
+    out->bbox_min[0] = finite_or_zero(float_or(f, 0, "boundingBox.Min.X", 0.f));
+    out->bbox_min[1] = finite_or_zero(float_or(f, 0, "boundingBox.Min.Y", 0.f));
+    out->bbox_min[2] = finite_or_zero(float_or(f, 0, "boundingBox.Min.Z", 0.f));
+    out->bbox_max[0] = finite_or_zero(float_or(f, 0, "boundingBox.Max.X", 0.f));
+    out->bbox_max[1] = finite_or_zero(float_or(f, 0, "boundingBox.Max.Y", 0.f));
+    out->bbox_max[2] = finite_or_zero(float_or(f, 0, "boundingBox.Max.Z", 0.f));
 
     uint64_t sz = 0;
     if (read_part(depot, hash, out->render_buffer_index, nullptr, 0, &sz) == REDFS_OK)

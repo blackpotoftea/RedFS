@@ -114,7 +114,8 @@ redfs_mesh_open(depot, redfs_hash(path), &m);
 for (uint32_t i = 0; i < redfs_mesh_chunk_count(m); ++i) {
     const redfs_mesh_chunk* c = redfs_mesh_chunk_at(m, i);
     /* c->index, c->lod, c->vertex_count, c->index_count,
-       c->bbox_min[3], c->bbox_max[3] */
+       c->bbox_min[3], c->bbox_max[3],
+       c->bounds_valid  -- 0 means no box could be computed */
 }
 redfs_mesh_close(m);
 ```

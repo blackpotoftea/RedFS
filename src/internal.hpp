@@ -82,6 +82,18 @@ public:
     uint32_t segment_count() const { return segment_count_; }
     uint64_t index_bytes() const { return index_size_; }
 
+    // CRC-64 the packer computed over the index body, straight from the header.
+    // Counts and index length are blind to an archive whose files were replaced
+    // in place; this is not, because the region it covers includes every entry's
+    // content hash and every segment's offset and size.
+    //
+    // Every packer known to this project fills it in -- WolvenKit computes it in
+    // ArchiveWriter.WriteIndex, and every archive sampled on a real install
+    // carries a distinct non-zero value. A hand-built archive that zeroed it
+    // would fall back to the shape-only signals.
+    uint64_t index_crc() const { return index_crc_; }
+    uint64_t file_size() const { return file_size_; }
+
     // Entry accessors, by index into this archive's file table.
     uint64_t entry_hash(uint32_t i) const { return rd64(entries_ + i * kEntryStride); }
     int64_t entry_timestamp(uint32_t i) const {
@@ -109,6 +121,8 @@ private:
     uint32_t entry_count_ = 0;
     uint32_t segment_count_ = 0;
     uint64_t index_size_ = 0;
+    uint64_t index_crc_ = 0;
+    uint64_t file_size_ = 0;
 };
 
 // --- depot -------------------------------------------------------------------
@@ -322,6 +336,9 @@ redfs_status cache_open(const redfs_depot* depot, const char* file);
 redfs_status cache_flush();
 void cache_close();
 uint32_t cache_entry_count();
+// True only when a cache is open AND was opened on this depot -- the cache is
+// process-wide and keyed by hash alone, so it can serve exactly one depot.
+bool cache_is_open(const redfs_depot* depot);
 
 // A fingerprint of the mounted archive set; the cache is discarded when it moves.
 uint64_t depot_fingerprint(const redfs_depot* depot);

@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -32,6 +33,15 @@ using Value = redfs_value;
 using Kind = redfs_kind;
 
 inline const char* to_string(Status s) { return redfs_status_string(s); }
+
+/// True when the loaded RedFS.dll matches the header this was compiled against.
+///
+/// Worth checking because a mismatch is silent: redfs_mesh_chunk has only ever
+/// grown by appending, so field reads still land correctly and only the STRIDE
+/// is wrong -- chunks() then walks a 48-byte array at 44-byte steps and returns
+/// plausible garbage from the second element on. Depot::open checks this for
+/// you; call it directly if you use the C API.
+inline bool abi_ok() { return redfs_abi_version() == REDFS_ABI_VERSION; }
 inline std::string last_error() { return redfs_last_error(); }
 
 /// A depot path, hashed the way the engine hashes it.
@@ -151,8 +161,13 @@ public:
     /// false to stop early.
     template <typename Fn>
     void walk(uint32_t chunk, const char* prop_path, Fn&& fn) const {
+        // remove_reference_t: with a forwarding reference and an lvalue callable,
+        // Fn deduces to L&, and `L&*` is not a type -- MSVC C2528. So passing a
+        // named lambda failed to compile while an inline one worked.
         auto trampoline = [](const char* name, const Value* v, void* user) -> int {
-            return (*static_cast<Fn*>(user))(std::string_view{name}, *v) ? 1 : 0;
+            return (*static_cast<std::remove_reference_t<Fn>*>(user))(std::string_view{name}, *v)
+                       ? 1
+                       : 0;
         };
         redfs_cr2w_walk(h_, chunk, prop_path, trampoline, &fn);
     }
@@ -193,6 +208,11 @@ public:
     const Chunk* chunk(uint32_t i) const { return redfs_mesh_chunk_at(h_, i); }
     uint32_t lod_count() const { return redfs_mesh_lod_count(h_); }
 
+    /// The span BORROWS this Mesh -- do not let it outlive the handle. In
+    /// particular `depot.mesh(p)->chunks()` dangles: the optional temporary dies
+    /// at the end of the full expression. Bind the Mesh to a named variable
+    /// first. (With a cache open the data survives on the cache's reference and
+    /// the mistake appears to work, which is worse than a clean crash.)
     std::span<const Chunk> chunks() const {
         const uint32_t n = chunk_count();
         const Chunk* first = n ? redfs_mesh_chunk_at(h_, 0) : nullptr;
@@ -245,6 +265,9 @@ public:
     /// you want from inside the game.
     static std::optional<Depot> open(const char* game_dir = nullptr,
                                      uint32_t flags = REDFS_SCAN_ALL) {
+        // A struct-layout mismatch produces wrong geometry rather than a crash,
+        // so refusing here is the only point at which it is still diagnosable.
+        if (!abi_ok()) return std::nullopt;
         redfs_depot* h = nullptr;
         if (redfs_depot_open(game_dir, flags, &h) != REDFS_OK) return std::nullopt;
         return Depot{h};
@@ -391,8 +414,9 @@ public:
     /// Visit every file in the depot. `fn` returns false to stop early.
     template <typename Fn>
     void for_each(Fn&& fn) const {
+        // See Cr2w::walk for why remove_reference_t is required here.
         auto trampoline = [](const FileInfo* info, void* user) -> int {
-            return (*static_cast<Fn*>(user))(*info) ? 1 : 0;
+            return (*static_cast<std::remove_reference_t<Fn>*>(user))(*info) ? 1 : 0;
         };
         redfs_enumerate(h_, trampoline, &fn);
     }
@@ -400,17 +424,26 @@ public:
     // --- async ---------------------------------------------------------------
 
     /// Read on RedFS's worker thread. `fn` runs on that worker, not here.
+    ///
+    /// The depot must outlive the read. Destroying this Depot cancels anything
+    /// still queued against it, so the callback still fires -- with
+    /// REDFS_E_CANCELLED rather than data.
     template <typename Fn>
     Status read_async(uint64_t key, uint32_t part, Fn fn) const {
         auto* boxed = new Fn(std::move(fn));
-        return redfs_read_async(
+        const Status st = redfs_read_async(
             h_, key, part,
-            [](Status st, redfs_blob b, void* user) {
+            [](Status s, redfs_blob b, void* user) {
                 auto* f = static_cast<Fn*>(user);
-                (*f)(st, Blob{b});
+                (*f)(s, Blob{b});
                 delete f;
             },
             boxed);
+        // The callback owns `boxed` only once the job is queued. On any other
+        // status redfs.h guarantees it will not fire, so nothing would ever free
+        // it -- one leaked closure, plus whatever it captured, per refused call.
+        if (st != REDFS_OK) delete boxed;
+        return st;
     }
 
     /// Block until every queued async read has finished.

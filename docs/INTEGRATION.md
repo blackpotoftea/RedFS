@@ -271,8 +271,10 @@ here.
 
 1. The game begins tearing down.
 2. RED4ext calls `Main(Unload)` on each plugin, on the main thread.
-3. Your `redfs_shutdown()` drains queued reads, sets the stop flag, wakes the
-   worker and **joins** it. The thread is gone before the call returns.
+3. Your `redfs_shutdown()` **cancels** queued reads — their callbacks fire with
+   `REDFS_E_CANCELLED` — sets the stop flag, wakes the worker and **joins** it.
+   The thread is gone before the call returns. Call `redfs_drain()` first if you
+   want queued work to complete instead.
 4. `redfs_cache_close()` (which `redfs_shutdown` calls for you) flushes pending
    mesh entries to disk. Skip this and you lose the work, not correctness — the
    next run recomputes.
@@ -365,9 +367,18 @@ A depot is **immutable once open**. So:
 | | safe concurrently? |
 |---|---|
 | `redfs_read`, `redfs_stat`, `redfs_exists`, `redfs_enumerate` | yes |
-| `redfs_texture_*`, `redfs_mesh_open`, `redfs_cr2w_*` | yes |
+| `redfs_texture_*`, `redfs_mesh_open`, `redfs_mesh_desc_of` | yes |
+| `redfs_cr2w_*` on **separate** handles | yes |
+| `redfs_cr2w_*` on a **shared** handle | **no** — one handle per thread |
 | `redfs_depot_mount`, `redfs_depot_mount_dir`, `redfs_depot_close` | **no** |
-| `redfs_cache_open`, `redfs_cache_close`, `redfs_shutdown` | **no** |
+| `redfs_cache_*`, `redfs_path_*`, `redfs_shutdown` | **no** |
+
+The `redfs_cr2w` row is not a formality. Decoding a `CString` caches it *on the
+handle* — an `unordered_map` insert and a `vector` push_back — so two threads
+calling `redfs_cr2w_get` on one handle are mutating the same containers with no
+lock. That is heap corruption in the game process, not a stale read. The typed
+helpers (`redfs_texture_*`, `redfs_mesh_*`) are unaffected because each builds a
+private handle per call.
 
 Mount everything during `Load`, then share the depot freely.
 

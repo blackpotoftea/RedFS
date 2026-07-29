@@ -315,6 +315,51 @@ public:
         done_.notify_all();
     }
 
+    // Drop everything queued against `depot` and wait out an in-flight read on
+    // it. Called by redfs_depot_close before the delete.
+    //
+    // A Job holds a raw depot pointer and the worker dereferences it, so deleting
+    // a depot that queued work still names is a use-after-free -- and the C++
+    // facade makes that the DEFAULT order, because ~Depot calls
+    // redfs_depot_close. Documenting "drain first" would not have been enough.
+    //
+    // Like stop(), the wait is bounded by one segment decode rather than by the
+    // queue: cancelled jobs are reported, not completed.
+    void cancel_for(const redfs_depot* depot) {
+        // A callback closing its own depot: the job it belongs to is this one, and
+        // waiting for !busy_ would be waiting on ourselves. Nothing else can be
+        // in flight, since there is a single worker.
+        if (on_worker_thread()) return;
+
+        std::deque<Job> cancelled;
+        {
+            std::unique_lock<std::mutex> lk(m_);
+            for (auto it = queue_.begin(); it != queue_.end();) {
+                if (it->depot == depot) {
+                    cancelled.push_back(*it);
+                    it = queue_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (busy_ && busy_depot_ == depot) {
+                abort_.store(true, std::memory_order_relaxed);
+                cv_.notify_all();
+                done_.wait(lk, [&] { return !busy_ || busy_depot_ != depot; });
+                // Cleared while still holding the lock. The worker needs this same
+                // lock to dequeue its next job, so it cannot pick one up and see a
+                // stale abort -- which would cancel a job nobody asked to cancel.
+                abort_.store(false, std::memory_order_relaxed);
+            }
+            // A drain() may be waiting on a predicate the erase above just made
+            // true, and done_ is otherwise only signalled on job completion.
+            done_.notify_all();
+        }
+
+        for (const Job& job : cancelled)
+            if (job.cb) job.cb(REDFS_E_CANCELLED, redfs_blob{}, job.user);
+    }
+
 private:
     void ensure_thread() {
         if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
@@ -334,6 +379,7 @@ private:
                 job = queue_.front();
                 queue_.pop_front();
                 busy_ = true;
+                busy_depot_ = job.depot;  // so cancel_for can wait on the right job
             }
 
             redfs_blob blob{};
@@ -353,6 +399,7 @@ private:
             {
                 std::lock_guard<std::mutex> lk(m_);
                 busy_ = false;
+                busy_depot_ = nullptr;
             }
             done_.notify_all();
         }
@@ -369,6 +416,7 @@ private:
     std::deque<Job> queue_;
     std::thread thread_;
     bool busy_ = false;
+    const redfs_depot* busy_depot_ = nullptr;
     State state_ = State::kRunning;
     // Read without the lock by an in-flight read, hence atomic.
     std::atomic<bool> abort_{false};
@@ -382,15 +430,31 @@ private:
 void fill_info(const Located& loc, redfs_file_info* out) {
     const Archive* a = loc.archive;
     const uint32_t first = a->entry_seg_start(loc.entry);
-    const uint32_t last = a->entry_seg_end(loc.entry);
+    // Clamp once, up front, rather than bounding the loop variable. The entry's
+    // segment range is raw u32 out of the index and nothing in Archive::open
+    // constrains it: an archive claiming `last = 0xFFFFFFFF` on every entry made
+    // this loop run segment_count times PER ENTRY, so one redfs_enumerate over a
+    // crafted index is entry_count x segment_count iterations -- on the order of
+    // an hour for a 100 MB index, with no allocation and no fault for a watchdog
+    // to notice.
+    //
+    // resolve_part rejects the same malformed range outright, but that is not an
+    // option here: this function returns void and redfs_stat has no way to report
+    // a per-entry rejection to a caller that only wanted the hash.
+    uint32_t last = a->entry_seg_end(loc.entry);
+    if (last > a->segment_count()) last = a->segment_count();
+    if (last < first) last = first;
 
     out->hash = a->entry_hash(loc.entry);
     out->timestamp = a->entry_timestamp(loc.entry);
     out->archive_index = loc.archive_index;
+    // Same clamp feeds this: an unvalidated `last` reported ~4.29e9 buffers, and
+    // redfs.h documents buffer_count as the bound for addressing them -- our own
+    // CLI loops on it.
     out->buffer_count = last > first ? last - first - 1 : 0;
     out->size = 0;
     out->compressed_size = 0;
-    for (uint32_t i = first; i < last && i < a->segment_count(); ++i) {
+    for (uint32_t i = first; i < last; ++i) {
         const Segment s = a->segment(i);
         out->size += s.size;
         out->compressed_size += s.zsize;
@@ -563,7 +627,14 @@ redfs_status redfs_depot_mount_dir(redfs_depot* depot, const char* dir, uint32_t
     return REDFS_OK;
 }
 
-void redfs_depot_close(redfs_depot* depot) { delete depot; }
+void redfs_depot_close(redfs_depot* depot) {
+    if (!depot) return;
+    // Queued async reads hold a raw pointer to this depot, so they have to be
+    // resolved before the memory goes away. Their callbacks fire with
+    // REDFS_E_CANCELLED, which keeps the exactly-once promise in redfs.h.
+    Worker::get().cancel_for(depot);
+    delete depot;
+}
 
 uint32_t redfs_depot_archive_count(const redfs_depot* depot) {
     return depot ? static_cast<uint32_t>(depot->archives.size()) : 0;
@@ -612,17 +683,38 @@ uint64_t redfs_hash_parse(const char* decimal) {
 
 // --- hash -> path ------------------------------------------------------------
 
+// All of these allocate -- the list file is read whole, the decompressed size
+// comes from the file itself, and every intern grows the dictionary -- so they
+// need the same barrier as the rest of the ABI. They were the last unguarded
+// allocating exports.
 redfs_status redfs_path_load(const redfs_depot* depot, const char* list_file, uint32_t* out_kept) {
-    return paths_load(depot, list_file, out_kept);
+    // A null depot used to mean "keep every line", undocumented and reachable
+    // only by accident. Filtering is the whole point of this call.
+    if (!depot || !list_file) return REDFS_E_INVALID_ARG;
+    REDFS_GUARD(paths_load(depot, list_file, out_kept));
 }
 
-void redfs_path_enable(void) { paths_enable(); }
+void redfs_path_enable(void) { REDFS_GUARD_VOID(paths_enable()); }
 
-void redfs_path_add(const char* depot_path) { paths_add(depot_path); }
+void redfs_path_add(const char* depot_path) { REDFS_GUARD_VOID(paths_add(depot_path)); }
 
-uint32_t redfs_path_count(void) { return paths_count(); }
+uint32_t redfs_path_count(void) {
+    // REDFS_GUARD returns a redfs_status and does not fit a uint32_t entry
+    // point; same shape as redfs_cache_entry_count.
+    try {
+        return paths_count();
+    } catch (...) {
+        return 0;
+    }
+}
 
-const char* redfs_path_from_hash(uint64_t hash) { return path_from_hash(hash); }
+const char* redfs_path_from_hash(uint64_t hash) {
+    try {
+        return path_from_hash(hash);
+    } catch (...) {
+        return nullptr;
+    }
+}
 
 // --- lookup ------------------------------------------------------------------
 
@@ -718,7 +810,10 @@ void redfs_shutdown(void) {
     // Order matters: stop the worker before touching the cache, so no in-flight
     // read is still using a depot the caller is about to close.
     Worker::get().stop();
-    cache_close();
+    // cache_close flushes, which serializes every cached mesh into one buffer.
+    // This is the call every host is required to make, so an allocation failure
+    // here would take the game down on the way out.
+    REDFS_GUARD_VOID(cache_close());
 }
 
 // --- CR2W --------------------------------------------------------------------
@@ -922,7 +1017,10 @@ void redfs_mesh_close(redfs_mesh* mesh) {
 }
 
 uint32_t redfs_mesh_chunk_count(const redfs_mesh* mesh) {
-    return mesh && mesh->data ? static_cast<uint32_t>(mesh->data->chunks.size()) : 0;
+    // public_chunks, not chunks: this must answer from the same vector
+    // redfs_mesh_chunk_at hands out, or the two exports disagree about the same
+    // number and redfs.hpp's chunks() span runs past the array.
+    return mesh && mesh->data ? static_cast<uint32_t>(mesh->data->public_chunks.size()) : 0;
 }
 
 const redfs_mesh_chunk* redfs_mesh_chunk_at(const redfs_mesh* mesh, uint32_t index) {
@@ -969,19 +1067,39 @@ const char* redfs_mesh_chunk_material(const redfs_mesh* mesh, uint32_t appearanc
 
 // --- mesh cache --------------------------------------------------------------
 
+// These allocate from data the caller does not control -- cache_open sizes
+// vectors from the contents of a file on disk, and cache_flush builds the whole
+// serialized image in memory -- so they are exactly the entry points that must
+// not let an exception cross back into C.
 redfs_status redfs_cache_open(const redfs_depot* depot, const char* cache_file) {
-    return cache_open(depot, cache_file);
+    REDFS_GUARD(cache_open(depot, cache_file));
 }
 
-redfs_status redfs_cache_flush(void) { return cache_flush(); }
+redfs_status redfs_cache_flush(void) { REDFS_GUARD(cache_flush()); }
 
-void redfs_cache_close(void) { cache_close(); }
+void redfs_cache_close(void) { REDFS_GUARD_VOID(cache_close()); }
 
-uint32_t redfs_cache_entry_count(void) { return cache_entry_count(); }
+uint32_t redfs_cache_entry_count(void) {
+    // REDFS_GUARD returns a redfs_status and so does not fit here. Worth its own
+    // barrier anyway: this is the natural call for a log sink to make while
+    // annotating a message, and re-entering the cache from the sink throws
+    // rather than deadlocks on the MSVC STL.
+    try {
+        return cache_entry_count();
+    } catch (...) {
+        return 0;
+    }
+}
 
 redfs_status redfs_cache_warm(const redfs_depot* depot, const uint64_t* hashes, uint32_t count,
                               uint32_t* out_computed) {
     if (!depot || (!hashes && count)) return REDFS_E_INVALID_ARG;
+    // Without an open cache this does every geometry decompress and then throws
+    // all of it away -- mesh_acquire never inserts, so the count is unchanged on
+    // both sides of every iteration and the caller is told 0 after paying full
+    // price. Fail loudly instead of wasting seconds silently.
+    if (!cache_is_open(depot))
+        return fail(REDFS_E_INVALID_ARG, "redfs_cache_warm requires a cache opened on this depot");
     uint32_t computed = 0;
     for (uint32_t i = 0; i < count; ++i) {
         const uint32_t before = cache_entry_count();
@@ -991,7 +1109,7 @@ redfs_status redfs_cache_warm(const redfs_depot* depot, const uint64_t* hashes, 
         redfs_mesh_close(m);
     }
     if (out_computed) *out_computed = computed;
-    return cache_flush();
+    REDFS_GUARD(cache_flush());
 }
 
 }  // extern "C"

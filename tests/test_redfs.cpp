@@ -11,12 +11,16 @@
 #include <atomic>
 #include <cstdio>
 #include <string>
+#include <chrono>
 #include <thread>
 #include <vector>
 
 #include <windows.h>
 
 #include "redfs.h"
+// Included so the C++ facade's templates are actually instantiated somewhere --
+// they were not, which is how a compile error in for_each survived.
+#include "redfs.hpp"
 
 using fixture::ArchiveBuilder;
 using fixture::Cr2wBuilder;
@@ -1079,6 +1083,34 @@ TEST(texture, rejects_non_texture) {
     CHECK_ERR(redfs_texture_desc_of(d.depot, key, &t), REDFS_E_UNSUPPORTED);
 }
 
+TEST(texture, absurd_mip_count_is_rejected_not_spun_on) {
+    // mipCount went from the file straight into a loop bound. 0xFFFFFFFB spun
+    // ~3 s per call to mip_chain_bytes and describe_texture makes five of them,
+    // measured at ~16 s total -- on the calling thread, which for a synchronous
+    // entry point is the game's. REDFS_GUARD converts exceptions; a spin throws
+    // nothing, so nothing caught it.
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\test\\hugemips.xbm");
+    // The format has to actually resolve, or describe_texture bails at the
+    // DXGI_UNKNOWN gate and never reaches the loop -- which is how the first
+    // version of this test passed against the unfixed code.
+    ab.add(key,
+           fixture::make_texture_cr2w(4, 4, 0xFFFFFFFBu, "TCM_QualityColor", "TRF_TrueColor", true),
+           {std::vector<uint8_t>(64, 0)});
+
+    TempDepot d("hugemips.archive", ab.build());
+    if (!d.depot) return;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    redfs_texture_desc t{};
+    CHECK_ERR(redfs_texture_desc_of(d.depot, key, &t), REDFS_E_CORRUPT);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    // Deliberately generous -- the point is 16 000 vs. instant, not a benchmark.
+    CHECK(ms < 1000);
+}
+
 TEST(mesh, chunks_bounds_and_appearances) {
     const uint32_t chunks = 4, verts = 8;
     const float scale = 10.0f, offset = 0.0f;
@@ -1321,6 +1353,54 @@ TEST(paths, learned_from_imports) {
               "base\\learned\\from_import.mt");
 }
 
+TEST(paths, non_canonical_imports_resolve_under_the_canonical_hash) {
+    // Import strings are archive content and are not guaranteed canonical. They
+    // were hashed raw while paths_add and redfs_hash both sanitize, so a mixed
+    // case or forward-slash import landed under a key redfs_hash could never
+    // produce: the entry was permanently dead and the real path stayed
+    // unresolvable.
+    redfs_path_enable();
+
+    Cr2wBuilder b;
+    b.import("Base/Learned/MixedCase.mt", "IMaterial");
+    b.begin_chunk("Root");
+    b.prop_u32("x", 1);
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w*) {});
+    CHECK_STR(redfs_path_from_hash(redfs_hash("base\\learned\\mixedcase.mt")),
+              "base\\learned\\mixedcase.mt");
+}
+
+TEST(paths, returned_pointer_survives_later_additions) {
+    // redfs.h promises the returned string "stays valid for the lifetime of the
+    // process". It used to be an interior pointer into a std::vector<char> that
+    // any later insert could reallocate -- and the documented usage pattern
+    // (resolve a hash to a path, then open that mesh, which parses a CR2W and
+    // learns its imports) is exactly the sequence that invalidated it.
+    //
+    // Two successive lookups with nothing in between always looked fine, which
+    // is why this survived. The failure needs an intervening add.
+    redfs_path_enable();
+    redfs_path_add("base\\stable\\first.mesh");
+
+    const char* p = redfs_path_from_hash(redfs_hash("base\\stable\\first.mesh"));
+    CHECK(p != nullptr);
+    if (!p) return;
+
+    // Comfortably more than enough to force repeated reallocation of any single
+    // growing buffer.
+    for (int i = 0; i < 20000; ++i) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "base\\stable\\f%d.mesh", i);
+        redfs_path_add(buf);
+    }
+
+    // Against the old code this reads freed memory; under ASan it is a hard
+    // failure rather than a lucky pass.
+    CHECK_STR(p, "base\\stable\\first.mesh");
+}
+
 // =============================================================================
 // API contracts
 // =============================================================================
@@ -1440,6 +1520,89 @@ TEST(api, async_read_and_shutdown) {
 
     // Async work posted after shutdown is dropped rather than queued forever.
     redfs_drain();
+}
+
+TEST(api, cpp_facade_accepts_named_callables) {
+    // redfs.hpp's for_each and Cr2w::walk took Fn&& and then did
+    // static_cast<Fn*>. For an lvalue callable Fn deduces to L&, and `L&*` is not
+    // a type -- MSVC rejects it with C2528. So passing a named lambda did not
+    // compile while an inline one did.
+    //
+    // It went unnoticed because nothing in the tree instantiated either template:
+    // the C++ facade had no test coverage at all. This test exists mostly to be
+    // COMPILED -- if the deduction regresses, the build breaks here.
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\facade.bin");
+    ab.add(key, std::vector<uint8_t>(32, 0x11));
+    const std::string p = temp_path("facade.archive");
+    ArchiveBuilder::write(p, ab.build());
+
+    redfs_depot* h = nullptr;
+    redfs_depot_open_empty(&h);
+    if (h) {
+        CHECK_OK(redfs_depot_mount(h, p.c_str()));
+        redfs::Depot d{h};  // takes ownership; ~Depot closes it
+
+        int seen = 0;
+        // The whole point: a NAMED callable, not a temporary.
+        auto count_files = [&seen](const redfs::FileInfo&) {
+            ++seen;
+            return true;
+        };
+        d.for_each(count_files);
+        CHECK_EQ(seen, 1);
+
+        // And the ABI handshake the facade now performs on open.
+        CHECK(redfs::abi_ok());
+    }
+    std::remove(p.c_str());
+}
+
+TEST(api, closing_a_depot_resolves_its_queued_reads) {
+    // A queued Job holds a RAW depot pointer and the worker dereferences it, so
+    // redfs_depot_close deleting the depot out from under the queue was a
+    // use-after-free: ~redfs_depot unmaps every archive index while the worker is
+    // reading one.
+    //
+    // Documenting "drain first" would not have been enough -- redfs::Depot's
+    // destructor calls redfs_depot_close, so the unsafe order is what the C++
+    // facade does by default.
+    //
+    // Under ASan against the old code this is a hard failure. Without ASan it is
+    // a nondeterministic one, which is why it needs to exist rather than being
+    // argued about.
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\closerace.bin");
+    ab.add(key, std::vector<uint8_t>(64 * 1024, 0x3C));
+    const std::string p = temp_path("closerace.archive");
+    ArchiveBuilder::write(p, ab.build());
+
+    redfs_depot* d = nullptr;
+    redfs_depot_open_empty(&d);
+    if (d) {
+        CHECK_OK(redfs_depot_mount(d, p.c_str()));
+
+        std::atomic<int> calls{0};
+        // Deep enough that the worker cannot possibly have finished them all
+        // before the close below.
+        for (int i = 0; i < 64; ++i) {
+            redfs_read_async(d, key, REDFS_PART_ALL,
+                             [](redfs_status, redfs_blob b, void* u) {
+                                 static_cast<std::atomic<int>*>(u)->fetch_add(1);
+                                 redfs_blob_free(&b);
+                             },
+                             &calls);
+        }
+
+        // No drain, no shutdown. Straight to close, exactly as ~Depot does.
+        redfs_depot_close(d);
+
+        // Every callback must still have fired exactly once -- cancelled counts,
+        // dropped does not. redfs.h promises exactly-once for anything that
+        // returned REDFS_OK.
+        CHECK_EQ(calls.load(), 64);
+    }
+    std::remove(p.c_str());
 }
 
 TEST(api, shutdown_cancels_queued_work) {
@@ -1642,6 +1805,82 @@ TEST(api, mount_invalidates_the_mesh_cache) {
     }
     std::remove(p1.c_str());
     std::remove(p2.c_str());
+}
+
+TEST(api, cache_notices_an_archive_replaced_in_place) {
+    // The fingerprint mixed path + entry count + index size, and none of those
+    // move when an archive's FILES change but its SHAPE does not. Re-cook a mesh,
+    // repack with the same file and segment counts, and every input was
+    // byte-identical -- so the cache validated and kept serving the old geometry,
+    // across restarts, with nothing in the log. redfs.h says a game patch or a
+    // new mod cannot serve stale geometry; this is the case that could.
+    //
+    // The sibling test above only covers ADDING an archive, where a new path
+    // enters the mix. That is why this survived the whole suite.
+    const uint64_t key = redfs_hash("base\\recook.mesh");
+
+    // Identical structure -- same chunk count, same vertex count, hence the same
+    // number of segments at the same sizes. Only the quantization scale differs,
+    // which is what moves the bounds.
+    ArchiveBuilder v1;
+    v1.add(key, fixture::make_mesh_cr2w(3, 6, 1.0f, 0.0f), {fixture::make_mesh_geometry(3, 6)});
+    ArchiveBuilder v2;
+    v2.add(key, fixture::make_mesh_cr2w(3, 6, 4.0f, 0.0f), {fixture::make_mesh_geometry(3, 6)});
+
+    const std::vector<uint8_t> bytes1 = v1.build();
+    const std::vector<uint8_t> bytes2 = v2.build();
+    // The premise: same length, different content. If these ever diverge in size
+    // the test has stopped exercising the bug it was written for.
+    CHECK_EQ(bytes1.size(), bytes2.size());
+    CHECK(bytes1 != bytes2);
+
+    const std::string p = temp_path("recook.archive");
+    const std::string cache_file = temp_path("recook.cache");
+    std::remove(cache_file.c_str());
+
+    float first_max = 0.f;
+    ArchiveBuilder::write(p, bytes1);
+    {
+        redfs_depot* d = nullptr;
+        redfs_depot_open_empty(&d);
+        if (d) {
+            CHECK_OK(redfs_depot_mount(d, p.c_str()));
+            CHECK_OK(redfs_cache_open(d, cache_file.c_str()));
+            redfs_mesh* m = nullptr;
+            CHECK_OK(redfs_mesh_open(d, key, &m));
+            const redfs_mesh_chunk* c = redfs_mesh_chunk_at(m, 0);
+            CHECK(c != nullptr);
+            if (c) first_max = c->bbox_max[0];
+            redfs_mesh_close(m);
+            CHECK_OK(redfs_cache_flush());  // persist under v1's fingerprint
+            redfs_cache_close();
+            redfs_depot_close(d);
+        }
+    }
+    CHECK(first_max != 0.f);
+
+    // Replace the archive in place, exactly as a mod update or a re-cook does.
+    ArchiveBuilder::write(p, bytes2);
+    {
+        redfs_depot* d = nullptr;
+        redfs_depot_open_empty(&d);
+        if (d) {
+            CHECK_OK(redfs_depot_mount(d, p.c_str()));
+            CHECK_OK(redfs_cache_open(d, cache_file.c_str()));
+            redfs_mesh* m = nullptr;
+            CHECK_OK(redfs_mesh_open(d, key, &m));
+            const redfs_mesh_chunk* c = redfs_mesh_chunk_at(m, 0);
+            CHECK(c != nullptr);
+            // Before the index CRC joined the fingerprint, this handed back v1's
+            // box straight out of the cache file.
+            if (c) CHECK(c->bbox_max[0] != first_max);
+            redfs_mesh_close(m);
+            redfs_cache_close();
+            redfs_depot_close(d);
+        }
+    }
+    std::remove(p.c_str());
+    std::remove(cache_file.c_str());
 }
 
 namespace {

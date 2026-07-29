@@ -29,9 +29,14 @@ dictionary from three places:
   plain text, one path per line. This is the bulk source.
 - **`redfs_path_add`** for anything you know yourself.
 
-Only paths that resolve in the mounted depot are retained, so a hit always names
-a file you can really read. Measured on the reference install: **544,496 of
-544,670 files — 99.97 % coverage**, loaded in well under a second.
+The **path list** is filtered: only entries that resolve in the mounted depot are
+retained. Measured on the reference install: **544,496 of 544,670 files —
+99.97 % coverage**, loaded in well under a second.
+
+The other two sources are not filtered and cannot be — import learning happens
+inside CR2W parsing, which has no depot, and `redfs_path_add` takes only a
+string. So a hit tells you what a file is *called*, not that it is readable.
+Check `redfs_exists` if you need that, or just handle `REDFS_E_NOT_FOUND`.
 
 Without a list loaded, this still works for anything reachable through an import
 table, which grows as you read. It just will not be exhaustive.
@@ -75,12 +80,15 @@ redfs_mesh_lod_count(m);          /* lodCount     */
 redfs_mesh_appearance_name(m, i); /* appearanceNames[] */
 
 const redfs_mesh_chunk* c = redfs_mesh_chunk_at(m, i);
-/*  c->index         the bit in chunkMask
-    c->lod           which detail level
-    c->vertex_count  (you said take it if free -- it was)
+/*  c->index          the bit in chunkMask
+    c->lod            which detail level
+    c->vertex_count   (you said take it if free -- it was)
     c->index_count
-    c->bbox_min[3]   the one you actually need
-    c->bbox_max[3]                                        */
+    c->bbox_min[3]    the one you actually need
+    c->bbox_max[3]
+    c->bounds_valid   0 when no box could be computed -- check it, because
+                      the boxes are then all-zero, which reads exactly like a
+                      real chunk at the origin (~1 stock mesh in 10,000)  */
 
 redfs_mesh_chunk_material(m, appearance, c->index);   /* materialName */
 ```

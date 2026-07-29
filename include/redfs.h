@@ -9,8 +9,10 @@
  *
  * Threading: a redfs_depot is immutable once opened. redfs_read* / redfs_stat /
  * redfs_texture_* / redfs_mesh_* are safe to call concurrently from any number
- * of threads. redfs_depot_mount / redfs_depot_close / redfs_shutdown /
- * redfs_cache_* are NOT (open first, then share).
+ * of threads. redfs_depot_mount / redfs_depot_mount_dir / redfs_depot_close /
+ * redfs_shutdown / redfs_cache_* / redfs_path_* are NOT (open first, then
+ * share) -- mounting rebuilds the depot index in place, and a concurrent read
+ * walks it while it is being reallocated.
  *
  * An individual redfs_cr2w handle is SINGLE-THREADED: decoding a CString caches
  * it on the handle, so two threads calling redfs_cr2w_get on the same handle
@@ -38,8 +40,11 @@
 extern "C" {
 #endif
 
-/* Bump on any breaking change to the layout of structs or the meaning of a call. */
-#define REDFS_ABI_VERSION 1
+/* Bump on any breaking change to the layout of structs or the meaning of a call.
+ *
+ * 2: redfs_mesh_chunk gained bounds_valid. Recompile anything built against 1.
+ */
+#define REDFS_ABI_VERSION 2
 
 /* ------------------------------------------------------------------------- */
 /* status                                                                     */
@@ -122,6 +127,10 @@ REDFS_API redfs_status redfs_depot_mount(redfs_depot* depot, const char* archive
 REDFS_API redfs_status redfs_depot_mount_dir(redfs_depot* depot, const char* dir,
                                              uint32_t* out_mounted);
 
+/* Cancels anything still queued by redfs_read_async against this depot -- those
+ * callbacks fire with REDFS_E_CANCELLED -- and waits out a read already in
+ * flight, bounded by one segment decode. So closing a depot with work
+ * outstanding is safe; it is not a reason to call redfs_drain first. */
 REDFS_API void redfs_depot_close(redfs_depot* depot);
 
 REDFS_API uint32_t    redfs_depot_archive_count(const redfs_depot* depot);
@@ -176,9 +185,14 @@ REDFS_API uint64_t redfs_hash_parse(const char* decimal);
  *      path per line.
  *   3. redfs_path_add.
  *
- * Only paths that resolve in the mounted depot are retained, so a hit always
- * names a file you can actually read. On a stock install that keeps roughly a
- * quarter of WolvenKit's shipped list.
+ * Source 2 retains only paths that resolve in the mounted depot -- on a stock
+ * install that keeps roughly a quarter of WolvenKit's shipped list.
+ *
+ * Sources 1 and 3 are NOT filtered, and structurally cannot be: import learning
+ * happens inside CR2W parsing, which has no depot (redfs_cr2w_open does not take
+ * one), and redfs_path_add takes only a string. So a hit tells you what a file
+ * is CALLED, not that it is readable -- check redfs_exists, or just handle
+ * REDFS_E_NOT_FOUND from the read.
  *
  * Import learning is off until the dictionary is switched on by either
  * redfs_path_load or redfs_path_enable.
@@ -190,7 +204,9 @@ REDFS_API void         redfs_path_add(const char* depot_path);
 REDFS_API uint32_t     redfs_path_count(void);
 
 /* NULL when the hash is not in the dictionary. The returned string stays valid
- * for the lifetime of the process. */
+ * for the lifetime of the process -- interned strings live in an arena that is
+ * never moved or freed, so later additions from any source cannot invalidate a
+ * pointer you already hold. */
 REDFS_API const char* redfs_path_from_hash(uint64_t hash);
 
 /* ------------------------------------------------------------------------- */
@@ -210,7 +226,8 @@ typedef struct redfs_file_info {
 REDFS_API int          redfs_exists(const redfs_depot* depot, uint64_t hash);
 REDFS_API redfs_status redfs_stat(const redfs_depot* depot, uint64_t hash, redfs_file_info* out_info);
 
-/* Return 0 to stop the walk. Called with the depot lock released; do not mutate the depot. */
+/* Return 0 to stop the walk. Do not mutate the depot from the callback -- the
+ * walk holds no lock and iterates the index in place. */
 typedef int (*redfs_enum_fn)(const redfs_file_info* info, void* user);
 REDFS_API redfs_status redfs_enumerate(const redfs_depot* depot, redfs_enum_fn fn, void* user);
 
@@ -430,7 +447,12 @@ typedef enum redfs_audio_format {
     REDFS_AUDIO_OPUSINFO
 } redfs_audio_format;
 
-/* Sniffs the container from the first bytes of the file. Cheap: reads segment 0 only. */
+/* Identifies the container from the first bytes of the file.
+ *
+ * NOT cheap: it decodes the whole main segment to look at 16 bytes, because
+ * Kraken cannot decode a prefix -- a partial read is not something the format
+ * offers. Costs a decompress proportional to that segment, which for music is
+ * tens of MB. Call it off the game thread. */
 REDFS_API redfs_status redfs_audio_probe(const redfs_depot* depot, uint64_t hash,
                                          redfs_audio_format* out_format);
 
@@ -534,6 +556,12 @@ typedef struct redfs_mesh_chunk {
     uint32_t index_count;
     float    bbox_min[3];
     float    bbox_max[3];
+    /* 0 when no box could be computed -- the geometry buffer was absent,
+     * streamed out, or failed its span check. The boxes are then all-zero, which
+     * is otherwise indistinguishable from a real chunk sitting at the origin, so
+     * test this before treating a box as a fact. Rare but real: about 1 stock
+     * mesh in 10,000. */
+    uint32_t bounds_valid;
 } redfs_mesh_chunk;
 
 REDFS_API redfs_status redfs_mesh_open(const redfs_depot* depot, uint64_t hash,
@@ -541,8 +569,15 @@ REDFS_API redfs_status redfs_mesh_open(const redfs_depot* depot, uint64_t hash,
 REDFS_API void         redfs_mesh_close(redfs_mesh* mesh);
 
 REDFS_API uint32_t                redfs_mesh_chunk_count(const redfs_mesh* mesh);
+/* The returned pointer is owned by `mesh` and stays valid until you call
+ * redfs_mesh_close on it. Do not hold it past that. */
 REDFS_API const redfs_mesh_chunk* redfs_mesh_chunk_at(const redfs_mesh* mesh, uint32_t index);
 REDFS_API uint32_t                redfs_mesh_lod_count(const redfs_mesh* mesh);
+/* Whole-mesh box. Unlike the per-chunk boxes above, this one IS stored in the
+ * file (CMesh.boundingBox) and is returned as found -- RedFS does not compute or
+ * verify it beyond replacing a non-finite value with 0. It covers the whole
+ * mesh, so it cannot answer "which chunks are the chest"; use the chunk boxes
+ * for that. */
 REDFS_API void redfs_mesh_bounds(const redfs_mesh* mesh, float out_min[3], float out_max[3]);
 
 /* Appearances are the named material sets a component selects by CName. */
@@ -558,13 +593,25 @@ REDFS_API const char* redfs_mesh_chunk_material(const redfs_mesh* mesh, uint32_t
 /* --- mesh cache -------------------------------------------------------------
  *
  * Computing chunk bounds costs a geometry decompress (~10 ms for a body mesh).
- * Archives never change, so the result is cacheable forever. Point RedFS at a
- * file and every redfs_mesh_open result is remembered: the first call for a mesh
- * computes, every later call -- including after a restart -- is a lookup.
+ * Point RedFS at a file and every redfs_mesh_open result is remembered: the
+ * first call for a mesh computes, every later call -- including after a restart
+ * -- is a lookup.
  *
- * The cache records a fingerprint of the mounted archive set and silently
- * discards itself if that set changes, so a game patch or a new mod cannot
- * serve stale geometry.
+ * The cache records a fingerprint of the mounted archive set -- each archive's
+ * path, entry count, index size, index CRC and declared file size -- and
+ * silently discards itself if any of those move. So a game patch, a new mod, or
+ * an existing archive REPLACED IN PLACE (a re-cook that keeps the same file and
+ * segment counts) cannot serve stale geometry: the index CRC covers the file and
+ * segment tables, so it moves with the contents and not just the shape.
+ *
+ * Mounting after redfs_cache_open re-checks the fingerprint and drops the cache
+ * if it changed, so mount order does not have to be perfect.
+ *
+ * There is ONE cache per process, and it belongs to the depot you pass here.
+ * Entries are keyed by hash alone, and the same hash means different bytes in a
+ * different depot -- so redfs_mesh_open on any other depot bypasses the cache
+ * entirely rather than risking a cross-depot answer. If you keep two depots,
+ * only one of them benefits.
  */
 REDFS_API redfs_status redfs_cache_open(const redfs_depot* depot, const char* cache_file);
 /* Write pending entries to disk. Also happens on redfs_cache_close. */
@@ -573,7 +620,11 @@ REDFS_API void         redfs_cache_close(void);
 REDFS_API uint32_t     redfs_cache_entry_count(void);
 
 /* Precompute a list of meshes up front -- the "warm it at load" pattern.
- * Skips anything already cached. Returns how many were newly computed. */
+ * Skips anything already cached. Returns how many were newly computed.
+ *
+ * Requires a cache opened on this depot; without one every result would be
+ * computed and immediately discarded, so it returns REDFS_E_INVALID_ARG rather
+ * than burning the time silently. */
 REDFS_API redfs_status redfs_cache_warm(const redfs_depot* depot, const uint64_t* hashes,
                                         uint32_t count, uint32_t* out_computed);
 
@@ -581,6 +632,19 @@ REDFS_API redfs_status redfs_cache_warm(const redfs_depot* depot, const uint64_t
 /* diagnostics                                                                */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * Diagnostics sink. Three things your callback has to cope with:
+ *
+ *   - It may be invoked from RedFS's WORKER thread, not only from yours. Any
+ *     failure inside redfs_read_async reports from there.
+ *   - It may be invoked CONCURRENTLY. Synchronize your own logger; RedFS does
+ *     not serialize calls into it.
+ *   - `message` is valid only for the duration of the call. It points at a
+ *     stack buffer. Copy it if you keep it.
+ *
+ * It is never invoked with a RedFS lock held, so calling back into RedFS from
+ * the sink is safe.
+ */
 typedef void (*redfs_log_fn)(const char* message, void* user);
 REDFS_API void redfs_set_log(redfs_log_fn fn, void* user);
 

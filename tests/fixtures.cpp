@@ -1,6 +1,8 @@
 #include "fixtures.hpp"
 
+#include <array>
 #include <cstdio>
+#include <cstring>
 
 namespace fixture {
 
@@ -106,6 +108,51 @@ std::vector<uint8_t> Cr2wBuilder::build(uint32_t version) {
 
 // --- archive -----------------------------------------------------------------
 
+namespace {
+
+// Reflected CRC-64, poly 0xC96C5795D7870F42, init and xorout all-ones -- the
+// same algorithm the real packer uses (WolvenKit.Core/CRC/CRC64Algo.cs: the
+// table is generated from this poly, and Compute() defaults crc to ~0 and
+// returns ~crc).
+//
+// RedFS never validates this field; it only mixes it into the depot
+// fingerprint as an opaque change detector. Matching the real polynomial is
+// therefore not load-bearing -- it just keeps synthesized archives honest.
+uint64_t crc64(const uint8_t* data, size_t len) {
+    static const auto table = [] {
+        std::array<uint64_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint64_t c = i;
+            for (int k = 0; k < 8; ++k)
+                c = (c & 1) ? (c >> 1) ^ 0xC96C5795D7870F42ull : c >> 1;
+            t[i] = c;
+        }
+        return t;
+    }();
+
+    uint64_t crc = ~0ull;
+    for (size_t i = 0; i < len; ++i)
+        crc = (crc >> 8) ^ table[static_cast<uint8_t>(crc ^ data[i])];
+    return ~crc;
+}
+
+// Stand-in for the per-entry SHA-1. It must be derived from CONTENT, not from
+// the entry index: the whole point of the index CRC is to notice an archive
+// whose files were replaced in place, and that only works if replacing a
+// file's bytes changes the bytes of its index entry. An index-derived
+// placeholder makes the CRC blind to exactly the case it exists to catch.
+void content_digest(const std::vector<std::vector<uint8_t>>& segments, uint8_t out[20]) {
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (const auto& s : segments)
+        for (uint8_t b : s) h = (h ^ b) * 0x00000100000001B3ull;
+    for (int i = 0; i < 20; ++i) {
+        out[i] = static_cast<uint8_t>(h);
+        h = (h ^ static_cast<uint8_t>(i)) * 0x00000100000001B3ull;
+    }
+}
+
+}  // namespace
+
 std::vector<uint8_t> ArchiveBuilder::build() const {
     constexpr size_t kHeaderEnd = 0xAC;  // Header.EXTENDED_SIZE
 
@@ -151,7 +198,9 @@ std::vector<uint8_t> ArchiveBuilder::build() const {
         out.u32(file_ranges[i].second);
         out.u32(0);  // deps start
         out.u32(0);  // deps end
-        for (int b = 0; b < 20; ++b) out.u8(static_cast<uint8_t>(i));  // sha1 placeholder
+        uint8_t digest[20];
+        content_digest(files_[i].segments, digest);
+        for (int b = 0; b < 20; ++b) out.u8(digest[b]);
     }
 
     // segments (16 bytes each)
@@ -162,6 +211,17 @@ std::vector<uint8_t> ArchiveBuilder::build() const {
     }
 
     const uint32_t index_size = static_cast<uint32_t>(out.size() - index_position);
+
+    // The real packer CRCs the index BODY -- the three counts, every file entry,
+    // every segment descriptor, every dependency -- and stores it in the header
+    // field at index_position + 8 (ArchiveWriter.WriteIndex). Mirror that, so a
+    // rebuild with different file content yields a different CRC even when the
+    // entry count, segment count and index length are all unchanged.
+    {
+        const size_t body = static_cast<size_t>(index_position) + 16;
+        const uint64_t crc = crc64(out.bytes.data() + body, out.bytes.size() - body);
+        std::memcpy(out.bytes.data() + static_cast<size_t>(index_position) + 8, &crc, 8);
+    }
 
     // patch the header now that positions are known
     Buf head;
@@ -229,8 +289,16 @@ std::vector<uint8_t> make_texture_cr2w(uint32_t width, uint32_t height, uint32_t
             const uint16_t type = b.name("TEXTYPE_2D");
             b.prop_in("type", "GpuWrapApieTextureType", &type, 2);
             b.prop_in_u16("sliceCount", 1);
-            const uint8_t mc = static_cast<uint8_t>(mips);
-            b.prop_in("mipCount", "Uint8", &mc, 1);
+            // Stock cooks store mipCount as Uint8, but the property's type name
+            // travels in the file, so a hostile archive can declare Uint32 and
+            // any value that fits. Widen automatically so a test can express
+            // that without every caller caring.
+            if (mips > 0xFF) {
+                b.prop_in_u32("mipCount", mips);
+            } else {
+                const uint8_t mc = static_cast<uint8_t>(mips);
+                b.prop_in("mipCount", "Uint8", &mc, 1);
+            }
         }
         b.end_struct();
     }

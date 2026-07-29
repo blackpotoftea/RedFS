@@ -114,6 +114,7 @@ redfs_status Archive::open(const std::string& path) {
 
     const uint64_t index_pos = rd64(header + 8);
     const uint32_t index_size = rd32(header + 16);
+    const uint64_t declared_size = rd64(header + 32);
     if (index_size < kIndexHeaderSize)
         return fail(REDFS_E_CORRUPT, "%s has a truncated index", path.c_str());
 
@@ -129,17 +130,29 @@ redfs_status Archive::open(const std::string& path) {
     if (!view_) return fail(REDFS_E_IO, "cannot map index of %s (error %lu)", path.c_str(), ::GetLastError());
 
     const uint8_t* idx = static_cast<const uint8_t*>(view_) + delta;
-    entry_count_ = rd32(idx + 16);
-    segment_count_ = rd32(idx + 20);
+    // The whole 28-byte index header is inside the mapping: index_size is checked
+    // against kIndexHeaderSize above, and the view spans delta + index_size.
+    //
+    // Read into locals and commit to members only after validation, so the class
+    // never carries counts that describe a table it does not have. It makes the
+    // real invariant -- the counts mean something iff entries_ is set -- hold by
+    // construction rather than by every caller destroying a failed Archive.
+    const uint64_t crc = rd64(idx + 8);
+    const uint32_t entries = rd32(idx + 16);
+    const uint32_t segments = rd32(idx + 20);
     const uint32_t dep_count = rd32(idx + 24);
 
-    const uint64_t need = kIndexHeaderSize + static_cast<uint64_t>(entry_count_) * kEntryStride +
-                          static_cast<uint64_t>(segment_count_) * kSegmentStride +
+    const uint64_t need = kIndexHeaderSize + static_cast<uint64_t>(entries) * kEntryStride +
+                          static_cast<uint64_t>(segments) * kSegmentStride +
                           static_cast<uint64_t>(dep_count) * 8ull;
     if (need > index_size)
         return fail(REDFS_E_CORRUPT, "%s index claims %llu bytes but is %u", path.c_str(),
                     static_cast<unsigned long long>(need), index_size);
 
+    file_size_ = declared_size;
+    index_crc_ = crc;
+    entry_count_ = entries;
+    segment_count_ = segments;
     entries_ = idx + kIndexHeaderSize;
     segments_ = entries_ + static_cast<size_t>(entry_count_) * kEntryStride;
     index_size_ = index_size;
@@ -242,10 +255,22 @@ redfs_status resolve_part(const redfs_depot* depot, uint64_t hash, uint32_t part
         out->last = start + 1;
     } else {
         // buffer i == segment start + 1 + i
-        const uint32_t seg = start + 1 + part;
+        //
+        // 64-bit, because `part` is a caller-supplied parameter of redfs_read,
+        // redfs_read_into, redfs_part_size and redfs_read_async, and none of them
+        // validates it. In 32-bit this wrapped: start=5 with part=0xFFFFFFFA gave
+        // seg=0, the check below passed, and the caller got a DIFFERENT file's
+        // main segment back with REDFS_OK where redfs.h promises REDFS_E_RANGE.
+        // A host passing a signed -3 or lower through an FFI lands there without
+        // trying (-1 and -2 are the two documented sentinels, handled above).
+        //
+        // An earlier review dismissed this as unreachable because a `part` the
+        // library derives from CR2W is capped at 0x7FFFFFFE. That bound is real
+        // but covers only the internal callers; it never applied to the C ABI.
+        const uint64_t seg = static_cast<uint64_t>(start) + 1u + part;
         if (seg >= end) return REDFS_E_RANGE;
-        out->first = seg;
-        out->last = seg + 1;
+        out->first = static_cast<uint32_t>(seg);
+        out->last = out->first + 1;
     }
     return REDFS_OK;
 }

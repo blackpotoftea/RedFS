@@ -24,6 +24,9 @@
 #include <mutex>
 #include <unordered_map>
 
+#include <io.h>
+#include <windows.h>
+
 namespace redfs {
 namespace {
 
@@ -34,7 +37,15 @@ struct Cache {
     std::mutex mutex;
     std::string file;
     uint64_t fingerprint = 0;
-    bool enabled = false;
+    // Read without the lock on mesh_acquire's fast path. redfs.h declares the
+    // cache calls not concurrency-safe, so a host following the contract cannot
+    // race -- but a plain bool read outside the lock is still formally UB, and
+    // the same pattern was already made atomic in paths.cpp.
+    std::atomic<bool> enabled{false};
+    // The depot cache_open was called with. Compared for identity only and NEVER
+    // dereferenced -- it may dangle after redfs_depot_close, and a stored depot
+    // pointer that gets used is the trap this codebase already declined once.
+    const redfs_depot* owner = nullptr;
     bool dirty = false;
     // shared_ptr, not unique_ptr: an open handle holds its own reference, so
     // clearing the cache cannot free a mesh a caller is still reading.
@@ -132,6 +143,19 @@ struct Reader {
     }
 };
 
+// Smallest on-disk footprint of each repeated element, straight from serialize()
+// above. These turn every declared count into a bound the file itself has to pay
+// for, which is what keeps a 68-byte cache file from asking for 56 MB of chunks.
+//
+// They also close a subtler hole: the writer applies no caps at all, so any
+// fixed reader limit can be exceeded by a record serialize() happily produced,
+// and deserialize() rejecting it truncates the rest of the file. A bound derived
+// from bytes remaining is satisfied by construction on the write side, so the
+// two halves cannot disagree.
+constexpr uint32_t kChunkBytes = 6 * 4 + 6 * 4;  // 5 x u32 + bounds_valid + 6 x f32
+constexpr uint32_t kAppearanceBytes = 4 + 4;     // empty name + material count
+constexpr uint32_t kMaterialBytes = 4;           // empty string
+
 bool deserialize(Reader& r, Mesh* m) {
     m->hash = r.u64();
     m->lod_count = r.u32();
@@ -139,7 +163,17 @@ bool deserialize(Reader& r, Mesh* m) {
     const uint32_t appearance_count = r.u32();
     for (int i = 0; i < 3; ++i) m->bbox_min[i] = r.f32();
     for (int i = 0; i < 3; ++i) m->bbox_max[i] = r.f32();
-    if (!r.ok || chunk_count > (1u << 20) || appearance_count > (1u << 16)) return false;
+    if (!r.ok) return false;
+
+    const size_t left = static_cast<size_t>(r.end - r.p);
+    if (chunk_count > left / kChunkBytes || appearance_count > left / kAppearanceBytes)
+        return false;
+
+    // mesh_build guarantees >= 1 (mesh.cpp, via max(1u, ...) and lowest_lod); a
+    // cache file is external input and carries no such guarantee. Clamp rather
+    // than reject: rejecting would discard every later record in the file over a
+    // value that repairs trivially, and redfs.h documents these as 1-based.
+    if (m->lod_count == 0) m->lod_count = 1;
 
     m->chunks.resize(chunk_count);
     for (auto& c : m->chunks) {
@@ -151,66 +185,103 @@ bool deserialize(Reader& r, Mesh* m) {
         c.bounds_valid = r.u32() != 0;
         for (int i = 0; i < 3; ++i) c.bbox_min[i] = r.f32();
         for (int i = 0; i < 3; ++i) c.bbox_max[i] = r.f32();
+        if (c.lod == 0) c.lod = 1;
     }
     m->appearances.resize(appearance_count);
     for (auto& a : m->appearances) {
         a.name = r.str();
         const uint32_t n = r.u32();
-        if (!r.ok || n > (1u << 20)) return false;
+        if (!r.ok || n > static_cast<size_t>(r.end - r.p) / kMaterialBytes) return false;
         a.chunk_materials.resize(n);
         for (auto& mat : a.chunk_materials) mat = r.str();
+        // Truncate AFTER reading, never before: the count is part of the stream,
+        // so skipping entries here would desynchronise every later record.
+        // mesh_build caps materials at the chunk count, and internal.hpp
+        // documents the two as parallel -- the load path has to honour that too,
+        // or a cached mesh reports materials for chunks it does not have.
+        if (a.chunk_materials.size() > m->chunks.size())
+            a.chunk_materials.resize(m->chunks.size());
     }
     return r.ok;
 }
 
-void load_from_disk(Cache& c) {
+// What a load attempt did, so the caller can report it after unlocking. Nothing
+// in here touches the log sink: that is host code, it runs on this thread, and
+// it is free to call back into the cache -- which would re-enter a mutex this
+// thread already holds.
+struct LoadReport {
+    enum class Result { kNoFile, kBadHeader, kWrongFingerprint, kLoaded };
+    Result result = Result::kNoFile;
+    uint32_t loaded = 0;
+    uint32_t declared = 0;
+};
+
+LoadReport load_from_disk(Cache& c) {
+    LoadReport rep;
     FILE* f = std::fopen(c.file.c_str(), "rb");
-    if (!f) return;
+    if (!f) return rep;
 
     std::fseek(f, 0, SEEK_END);
     const long len = std::ftell(f);
     std::fseek(f, 0, SEEK_SET);
     if (len < 24) {
         std::fclose(f);
-        return;
+        return rep;
     }
     std::vector<uint8_t> buf(static_cast<size_t>(len));
     const size_t got = std::fread(buf.data(), 1, buf.size(), f);
     std::fclose(f);
-    if (got != buf.size()) return;
+    if (got != buf.size()) return rep;
 
     Reader r{buf.data(), buf.data() + buf.size()};
     if (r.u32() != kMagic || r.u32() != kVersion) {
-        log("mesh cache %s has an unrecognised header; starting fresh", c.file.c_str());
-        return;
+        rep.result = LoadReport::Result::kBadHeader;
+        return rep;
     }
     const uint64_t fingerprint = r.u64();
     if (fingerprint != c.fingerprint) {
-        log("mesh cache %s was built for a different archive set; discarding", c.file.c_str());
-        return;
+        rep.result = LoadReport::Result::kWrongFingerprint;
+        return rep;
     }
-    const uint32_t count = r.u32();
+    rep.declared = r.u32();
     r.u32();  // reserved
 
-    uint32_t loaded = 0;
-    for (uint32_t i = 0; i < count && r.ok; ++i) {
+    rep.result = LoadReport::Result::kLoaded;
+    for (uint32_t i = 0; i < rep.declared && r.ok; ++i) {
         auto m = std::make_shared<Mesh>();
+        // A partial record leaves the reader positioned mid-field with no way to
+        // resynchronise, so stopping is the only option -- but the caller is told
+        // how many of the declared entries actually made it, because silently
+        // reporting the survivors as the whole file hides real corruption.
         if (!deserialize(r, m.get())) break;
         // Same rule as mesh_build: the public view is derived before the object
         // is published, so a cached mesh is immutable from here on.
         m->finalize();
         const uint64_t h = m->hash;
         c.entries[h] = std::const_pointer_cast<const Mesh>(m);
-        ++loaded;
+        ++rep.loaded;
     }
-    log("mesh cache: loaded %u entries from %s", loaded, c.file.c_str());
+    return rep;
 }
 
 }  // namespace
 
 uint64_t depot_fingerprint(const redfs_depot* depot) {
-    // Path + entry count + index size of every mounted archive. Cheap, and it
-    // moves whenever the set of archives or their contents change.
+    // Per archive: path, entry count, index size, index CRC, declared file size.
+    //
+    // The CRC is the load-bearing one. Path, entry count and index size are all
+    // blind to an archive whose files were replaced IN PLACE -- re-cook a mesh
+    // with edited vertices and repack, and as long as the file count, segment
+    // count and dependency count are unchanged, the index is exactly as long as
+    // before and every one of those three inputs is byte-identical. The cache
+    // would then validate and keep serving the old geometry, forever, which is
+    // the precise failure this fingerprint exists to prevent.
+    //
+    // The packer's index CRC covers the entry table and the segment table, so it
+    // moves when a file's content hash or a segment's offset/size moves. It costs
+    // one read of a header field already in the mapping -- no extra I/O, and O(1)
+    // per archive rather than the O(entries) a sweep of the per-entry SHA-1s
+    // would cost on every mount.
     uint64_t h = 0xCBF29CE484222325ull;
     auto mix = [&h](const void* data, size_t len) {
         const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -220,8 +291,12 @@ uint64_t depot_fingerprint(const redfs_depot* depot) {
         mix(a->path().data(), a->path().size());
         const uint32_t n = a->entry_count();
         const uint64_t bytes = a->index_bytes();
+        const uint64_t crc = a->index_crc();
+        const uint64_t fsize = a->file_size();
         mix(&n, sizeof(n));
         mix(&bytes, sizeof(bytes));
+        mix(&crc, sizeof(crc));
+        mix(&fsize, sizeof(fsize));
     }
     return h;
 }
@@ -229,48 +304,103 @@ uint64_t depot_fingerprint(const redfs_depot* depot) {
 redfs_status cache_open(const redfs_depot* depot, const char* file) {
     if (!depot || !file) return REDFS_E_INVALID_ARG;
     Cache& c = cache();
-    std::lock_guard<std::mutex> lock(c.mutex);
 
-    c.file = file;
-    c.fingerprint = depot_fingerprint(depot);
-    c.entries.clear();
-    c.enabled = true;
-    c.dirty = false;
-    load_from_disk(c);
+    LoadReport rep;
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(c.mutex);
+        c.file = file;
+        c.fingerprint = depot_fingerprint(depot);
+        c.entries.clear();
+        c.enabled.store(true, std::memory_order_relaxed);
+        c.owner = depot;
+        c.dirty = false;
+        rep = load_from_disk(c);
+        path = c.file;
+    }
+
+    // Lock released before any of this reaches the host's sink.
+    switch (rep.result) {
+        case LoadReport::Result::kNoFile:
+            break;
+        case LoadReport::Result::kBadHeader:
+            log("mesh cache %s has an unrecognised header; starting fresh", path.c_str());
+            break;
+        case LoadReport::Result::kWrongFingerprint:
+            log("mesh cache %s was built for a different archive set; discarding", path.c_str());
+            break;
+        case LoadReport::Result::kLoaded:
+            if (rep.loaded != rep.declared)
+                log("mesh cache: loaded %u of %u entries from %s (file is truncated or corrupt)",
+                    rep.loaded, rep.declared, path.c_str());
+            else
+                log("mesh cache: loaded %u entries from %s", rep.loaded, path.c_str());
+            break;
+    }
     return REDFS_OK;
 }
 
 redfs_status cache_flush() {
     Cache& c = cache();
-    std::lock_guard<std::mutex> lock(c.mutex);
-    if (!c.enabled || !c.dirty) return REDFS_OK;
 
-    std::vector<uint8_t> out;
-    out.reserve(1 << 20);
-    put_u32(out, kMagic);
-    put_u32(out, kVersion);
-    put_u64(out, c.fingerprint);
-    put_u32(out, static_cast<uint32_t>(c.entries.size()));
-    put_u32(out, 0);  // reserved
-    for (const auto& [hash, mesh] : c.entries) serialize(out, *mesh);
+    // Built under the lock, emitted after it. See LoadReport.
+    char message[512] = {0};
+    bool failed = false;
 
-    // Write to a sibling then rename, so a crash mid-write cannot corrupt a
-    // cache that was previously good.
-    const std::string tmp = c.file + ".tmp";
-    FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (!f) return fail(REDFS_E_IO, "cannot write %s", tmp.c_str());
-    const size_t wrote = std::fwrite(out.data(), 1, out.size(), f);
-    std::fclose(f);
-    if (wrote != out.size()) {
-        std::remove(tmp.c_str());
-        return fail(REDFS_E_IO, "short write to %s", tmp.c_str());
+    {
+        std::lock_guard<std::mutex> lock(c.mutex);
+        if (!c.enabled.load(std::memory_order_relaxed) || !c.dirty) return REDFS_OK;
+
+        std::vector<uint8_t> out;
+        out.reserve(1 << 20);
+        put_u32(out, kMagic);
+        put_u32(out, kVersion);
+        put_u64(out, c.fingerprint);
+        put_u32(out, static_cast<uint32_t>(c.entries.size()));
+        put_u32(out, 0);  // reserved
+        for (const auto& [hash, mesh] : c.entries) serialize(out, *mesh);
+
+        // Write to a sibling then replace it in, so a crash mid-write cannot
+        // corrupt a cache that was previously good.
+        const std::string tmp = c.file + ".tmp";
+        FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (!f) {
+            std::snprintf(message, sizeof(message), "cannot write %s", tmp.c_str());
+            failed = true;
+        } else {
+            // fwrite reports bytes accepted into the FILE buffer, not bytes that
+            // reached the disk. On a network share, a synced folder or a
+            // removable drive, a write failure surfaces at flush or close and
+            // nowhere else -- so checking fwrite alone would call a truncated
+            // file a success and then promote it over a good cache.
+            bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
+            if (ok) ok = std::fflush(f) == 0 && ::_commit(::_fileno(f)) == 0;
+            if (std::fclose(f) != 0) ok = false;  // close either way, then judge
+
+            if (!ok) {
+                std::remove(tmp.c_str());
+                std::snprintf(message, sizeof(message), "cannot write %s", tmp.c_str());
+                failed = true;
+            } else if (!::MoveFileExA(tmp.c_str(), c.file.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                // One atomic step. Deleting the destination first opens a window
+                // where neither file exists, and a rename that then fails -- a
+                // scanner or backup tool holding the path is enough -- destroys
+                // the good cache instead of preserving it.
+                std::remove(tmp.c_str());
+                std::snprintf(message, sizeof(message), "cannot replace %s (error %lu)",
+                              c.file.c_str(), ::GetLastError());
+                failed = true;
+            } else {
+                c.dirty = false;
+                std::snprintf(message, sizeof(message),
+                              "mesh cache: wrote %zu entries (%zu bytes)", c.entries.size(),
+                              out.size());
+            }
+        }
     }
-    std::remove(c.file.c_str());
-    if (std::rename(tmp.c_str(), c.file.c_str()) != 0)
-        return fail(REDFS_E_IO, "cannot replace %s", c.file.c_str());
 
-    c.dirty = false;
-    log("mesh cache: wrote %zu entries (%zu bytes)", c.entries.size(), out.size());
+    if (failed) return fail(REDFS_E_IO, "%s", message);
+    log("%s", message);
     return REDFS_OK;
 }
 
@@ -279,7 +409,14 @@ void cache_close() {
     Cache& c = cache();
     std::lock_guard<std::mutex> lock(c.mutex);
     c.entries.clear();
-    c.enabled = false;
+    c.enabled.store(false, std::memory_order_relaxed);
+    c.owner = nullptr;
+}
+
+bool cache_is_open(const redfs_depot* depot) {
+    Cache& c = cache();
+    std::lock_guard<std::mutex> lock(c.mutex);
+    return c.enabled.load(std::memory_order_relaxed) && c.owner == depot;
 }
 
 uint32_t cache_entry_count() {
@@ -292,7 +429,14 @@ redfs_status mesh_acquire(const redfs_depot* depot, uint64_t hash,
                           std::shared_ptr<const Mesh>* out) {
     Cache& c = cache();
 
-    if (c.enabled) {
+    // Entries are keyed by hash alone, and a hash means different bytes in
+    // different depots. There is one cache for the process, so it can only ever
+    // belong to one depot: anything asked for on behalf of another must bypass
+    // it entirely, or depot B is served depot A's geometry and B's results are
+    // flushed under A's fingerprint.
+    const bool usable = c.enabled.load(std::memory_order_relaxed) && c.owner == depot;
+
+    if (usable) {
         std::lock_guard<std::mutex> lock(c.mutex);
         auto it = c.entries.find(hash);
         if (it != c.entries.end()) {
@@ -307,7 +451,7 @@ redfs_status mesh_acquire(const redfs_depot* depot, uint64_t hash,
     const redfs_status st = mesh_build(depot, hash, mesh.get());
     if (st != REDFS_OK) return st;
 
-    if (c.enabled) {
+    if (usable) {
         std::lock_guard<std::mutex> lock(c.mutex);
         // Another thread may have inserted it while we were building; keep
         // whichever won so all callers observe one object per hash.
@@ -326,21 +470,27 @@ redfs_status mesh_acquire(const redfs_depot* depot, uint64_t hash,
 
 void cache_invalidate(const redfs_depot* depot) {
     Cache& c = cache();
-    std::lock_guard<std::mutex> lock(c.mutex);
-    if (!c.enabled) return;
+    size_t dropped = 0;
+    {
+        std::lock_guard<std::mutex> lock(c.mutex);
+        if (!c.enabled.load(std::memory_order_relaxed)) return;
+        // Mounting into a depot the cache does not belong to says nothing about
+        // the archive set the cache was built from.
+        if (c.owner != depot) return;
 
-    // Both halves are required. Re-fingerprinting alone would leave the stale
-    // in-memory entries live and merely relabel them on flush -- turning a
-    // reproducible staleness bug into an intermittent one. Dropping entries
-    // alone would let the next flush write fresh data under the old label.
-    const uint64_t before = c.fingerprint;
-    c.fingerprint = depot_fingerprint(depot);
-    if (c.fingerprint == before) return;  // archive set unchanged; keep the cache
+        // Both halves are required. Re-fingerprinting alone would leave the stale
+        // in-memory entries live and merely relabel them on flush -- turning a
+        // reproducible staleness bug into an intermittent one. Dropping entries
+        // alone would let the next flush write fresh data under the old label.
+        const uint64_t before = c.fingerprint;
+        c.fingerprint = depot_fingerprint(depot);
+        if (c.fingerprint == before) return;  // archive set unchanged; keep the cache
 
-    if (!c.entries.empty())
-        log("mesh cache: archive set changed, dropping %zu entries", c.entries.size());
-    c.entries.clear();
-    c.dirty = false;  // nothing worth writing under the new fingerprint yet
+        dropped = c.entries.size();
+        c.entries.clear();
+        c.dirty = false;  // nothing worth writing under the new fingerprint yet
+    }
+    if (dropped) log("mesh cache: archive set changed, dropping %zu entries", dropped);
 }
 
 }  // namespace redfs

@@ -81,9 +81,14 @@ For anything the caller knows itself.
 **only keep paths whose hash resolves in the mounted depot.**
 
 The reasoning is that an unresolvable path is useless — you cannot read the file
-— so retaining it costs memory for nothing. And a hit then carries a guarantee:
-if `redfs_path_from_hash` returns a string, that file is readable right now, in
-this install, with these mods.
+— so retaining it costs memory for nothing.
+
+**This applies to the list and to `redfs_path_add`, not to import learning.**
+`paths_learn_imports` runs inside `cr2w_parse`, which has no depot — and cannot
+be given one, because `redfs_cr2w_open` does not take a depot at all. So imports
+are learned unfiltered, and a hit means "this is what the file is called", not
+"this file is readable". The header said otherwise for a while; that was wrong
+about the one source that is always on.
 
 Filtering also makes coverage measurable rather than notional. On the reference
 install:
@@ -92,14 +97,33 @@ install:
 544,496 of 544,670 files resolve  --  99.97 %
 ```
 
-Storage is one flat `std::vector<char>` of NUL-terminated strings plus a sorted
-`{u64 hash, u32 offset}` index — 12 bytes per entry, no per-path allocation,
-binary-searched. Additions land in a small pending list and merge in batches so
-that learning from imports during a read burst does not re-sort on every file.
+Storage is an arena of fixed 1 MiB blocks holding NUL-terminated strings, plus a
+sorted `{u64 hash, const char* str}` index — 16 bytes per entry, binary-searched.
+
+The arena matters more than it looks. This was originally one flat
+`std::vector<char>` with `{u64 hash, u32 offset}` entries, which is smaller on
+paper — except it is not, because the struct pads to 16 bytes either way, so the
+pointer is free. And the vector could not keep the promise the header makes:
+`redfs_path_from_hash` returns an interior pointer, and every later insert may
+reallocate the buffer under pointers already handed out. Blocks are never moved
+and never freed, so interned pointers are stable for the process lifetime.
+
+Additions land in a small pending list and merge in batches, so learning from
+imports during a read burst does not re-sort on every file. The merge sorts only
+the new run and `inplace_merge`s it — re-sorting the whole dictionary each time
+made a full load quadratic. Note this lowers the constant, not the complexity
+class: the merge is linear per call but still runs O(N/B) times.
 
 Hashing the list uses the raw line first and falls back to the sanitising hash if
 that misses, since the shipped list is already normalised and re-normalising
-every line would be wasted work.
+every line would be wasted work. Whichever form produced the winning hash is the
+form that gets interned — storing the raw line under a sanitised key handed
+callers back text that was not the canonical path.
+
+Import strings get no such benefit of the doubt: they are archive content, so
+they are sanitised before hashing. Hashing them raw filed non-canonical imports
+under keys `redfs_hash` can never produce, leaving the entry dead and the real
+path unresolvable.
 
 ## Practical consequence
 

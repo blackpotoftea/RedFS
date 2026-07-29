@@ -82,15 +82,22 @@ buffer, get `REDFS_E_RANGE` and the required size if it is too small.
 
 ### The mesh-handle wrinkle
 
-`redfs_mesh_open` returns a handle that the **cache may own**. Initially
-`redfs_mesh_close` always deleted, which double-frees a cached mesh on the second
-open. Now the handle carries a `caller_owned` flag, set only on a cache miss with
-the cache disabled, and `close` respects it.
+`redfs_mesh_open` returns a handle that the **cache may also hold**. Initially
+`redfs_mesh_close` always deleted, which double-freed a cached mesh on the second
+open. The first fix added a `caller_owned` flag, set only on a cache miss with
+the cache disabled, so that `close` became a no-op on cached meshes.
 
-Worth flagging as the sharpest edge in the API: the same call returns borrowed or
-owned memory depending on configuration. The alternative — refcounting — was more
-machinery than the problem deserved, but this is the place a future change is
-most likely to go wrong.
+That was the wrong fix, and it was recorded here as "the sharpest edge in the
+API" rather than as the bug it was: the same call returned borrowed or owned
+memory depending on configuration, and nothing stopped a caller from holding a
+"borrowed" pointer past `redfs_cache_close`. Refcounting was dismissed at the
+time as more machinery than the problem deserved.
+
+It is now a `shared_ptr`. Every handle carries its own reference, `close` is
+always correct to call, and a handle stays valid across `redfs_cache_close` —
+the entry leaves the map, the object survives until the last handle closes. The
+lesson worth keeping is that the flag was a way of documenting a lifetime hazard
+instead of removing it.
 
 ## Errors
 
