@@ -23,7 +23,10 @@ param(
     [string] $GameDir,
     [string] $TexconvDll = "C:\Work\WorkSpace\Cyberpunk\WolvenKit\WolvenKit.Common\lib\texconv.dll",
     [int]    $FuzzIterations = 30000,
-    [int]    $VerifyCount = 4000,
+    # 12000, not 4000. The sampled depot holds exactly one cubemap and it sits at
+    # about index 11,000, so every smaller count skipped the cubemap encoding path
+    # entirely -- and reported a clean run while doing it. Costs ~18 s.
+    [int]    $VerifyCount = 12000,
     [switch] $SkipAsan,
     [switch] $Rebuild
 )
