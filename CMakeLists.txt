@@ -73,6 +73,34 @@ if(REDFS_BUILD_CLI)
     target_link_libraries(example_chest PRIVATE redfs_static)
 endif()
 
+# --- RED4ext plugin (optional) -------------------------------------------------
+#
+# The only thing in this repository that runs inside the game. Off unless you
+# point REDFS_RED4EXT_SDK at a checkout of https://github.com/WopsS/RED4ext.SDK,
+# because most people building RedFS do not have one and a missing dependency
+# should not break the build for them.
+#
+#   cmake -B build -DREDFS_RED4EXT_SDK=C:/path/to/RED4ext.SDK
+#
+# Statically linked on purpose: a plugin should ship as one self-contained DLL,
+# and it removes any question of which module owns the depot.
+set(REDFS_RED4EXT_SDK "" CACHE PATH "Path to a RED4ext.SDK checkout; enables the in-game plugin")
+
+if(REDFS_RED4EXT_SDK)
+    if(NOT EXISTS "${REDFS_RED4EXT_SDK}/include/RED4ext/RED4ext.hpp")
+        message(FATAL_ERROR
+            "REDFS_RED4EXT_SDK=${REDFS_RED4EXT_SDK} does not look like a RED4ext.SDK checkout "
+            "(no include/RED4ext/RED4ext.hpp)")
+    endif()
+    add_library(redfs_red4ext_plugin SHARED examples/red4ext_plugin/Main.cpp)
+    target_link_libraries(redfs_red4ext_plugin PRIVATE redfs_static)
+    target_include_directories(redfs_red4ext_plugin PRIVATE "${REDFS_RED4EXT_SDK}/include")
+    # The SDK needs a recent standard and leans on Windows headers being unpolluted.
+    target_compile_features(redfs_red4ext_plugin PRIVATE cxx_std_20)
+    set_target_properties(redfs_red4ext_plugin PROPERTIES OUTPUT_NAME RedFS.SmokeTest)
+    message(STATUS "RED4ext plugin enabled (SDK: ${REDFS_RED4EXT_SDK})")
+endif()
+
 # --- tests --------------------------------------------------------------------
 # These need no game install: every input is synthesized by tests/fixtures.cpp.
 if(REDFS_BUILD_TESTS)

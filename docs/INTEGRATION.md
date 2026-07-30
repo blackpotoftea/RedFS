@@ -11,16 +11,40 @@ wrong.
 
 ## Read this first: none of it has run inside the game
 
-There is no RED4ext plugin in this repository and nothing is deployed to
-`red4ext/plugins/`. Every figure below comes from offline harnesses —
-`redfs_test`, `redfs_lifecycle`, `redfs_verify`, `redfs_cli selftest` — against
-synthesized archives, or against a real install read from *outside* the game
-process. The RED4ext sample is written to the SDK's documented shape and has never
-been compiled here.
+There is now a plugin — `examples/red4ext_plugin` — and it **compiles and links
+against the real RED4ext SDK**, exporting `Main` / `Query` / `Supports`. That is
+where the evidence stops. It has never been loaded by the game: RED4ext is not
+installed on the machine this was developed on, so no part of RedFS has run inside
+the Cyberpunk process.
 
-The lifecycle rules are therefore constraints derived from the code and from
-teardown tests that reproduce what RED4ext does to a plugin. Claims about the game's
-own behaviour are cited to WolvenKit as the reference implementation, not observed.
+Building it did earn one fact immediately. The sample below previously used
+`RED4ext::PluginHandle` and `RED4EXT_SEMVER`, neither of which the SDK defines —
+it had been written to a remembered shape and never compiled. Apply the same
+suspicion to the rest of this document until someone runs it.
+
+Every figure below comes from offline harnesses — `redfs_test`, `redfs_lifecycle`,
+`redfs_verify`, `redfs_cli selftest` — against synthesized archives, or against a
+real install read from *outside* the game process. The lifecycle rules are
+therefore constraints derived from the code and from teardown tests that reproduce
+what RED4ext does to a plugin. Claims about the game's own behaviour are cited to
+WolvenKit as the reference implementation, not observed.
+
+### What loading it would actually establish
+
+Three things no offline harness can reach:
+
+1. **Install auto-detection.** `redfs_depot_open(nullptr, ...)` walks up from the
+   running executable. Outside the game that branch is never taken.
+2. **Oodle against the resident DLL.** The game already has `oo2ext_7_win64.dll`
+   loaded, so `GetModuleHandleW` should find it without touching disk; standalone
+   tools take a fallback path instead.
+3. **Unload ordering for real.** RED4ext calls `Main(Unload)` and then
+   `FreeLibrary`. `redfs_lifecycle` reproduces that shape, but with a test harness
+   driving it rather than RED4ext's plugin manager.
+
+To try it: install RED4ext, build with `-DREDFS_RED4EXT_SDK=<path>`, drop
+`RedFS.SmokeTest.dll` in `red4ext/plugins/RedFS.SmokeTest/`, launch, and read
+`red4ext/logs/`.
 
 ---
 
@@ -111,11 +135,11 @@ redfs_depot* g_depot = nullptr;
 void on_redfs_log(const char* msg, void*) { /* copy it into your own logger */ }
 }  // namespace
 
-RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle handle,
-                                        RED4ext::EMainReason reason,
-                                        const RED4ext::Sdk* sdk) {
+RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle,
+                                        RED4ext::v1::EMainReason reason,
+                                        const RED4ext::v1::Sdk* sdk) {
     switch (reason) {
-    case RED4ext::EMainReason::Load: {
+    case RED4ext::v1::EMainReason::Load: {
         if (redfs_abi_version() != REDFS_ABI_VERSION) {
             sdk->logger->ErrorF(handle, "RedFS ABI %u, expected %u",
                                 redfs_abi_version(), REDFS_ABI_VERSION);
@@ -137,23 +161,35 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle handle,
         break;
     }
 
-    case RED4ext::EMainReason::Unload:
+    case RED4ext::v1::EMainReason::Unload:
         redfs_shutdown();          // order matters -- see Shutdown
         redfs_depot_close(g_depot);
         g_depot = nullptr;
+        redfs_set_log(nullptr, nullptr);   // the sink points into this module
         break;
     }
     return true;
 }
 
-RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::PluginInfo* info) {
+RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* info) {
     info->name = L"MyPlugin";
-    info->version = RED4EXT_SEMVER(1, 0, 0);
-    info->runtime = RED4EXT_RUNTIME_LATEST;
-    info->sdk = RED4EXT_SDK_LATEST;
+    info->author = L"You";
+    info->version = RED4EXT_V1_SEMVER(1, 0, 0);
+    info->runtime = RED4EXT_V1_RUNTIME_VERSION_LATEST;
+    info->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
 
-RED4EXT_C_EXPORT uint32_t RED4EXT_CALL Supports() { return RED4EXT_API_VERSION_LATEST; }
+RED4EXT_C_EXPORT uint32_t RED4EXT_CALL Supports() { return RED4EXT_API_VERSION_1; }
+```
+
+The `v1` namespace and the `RED4EXT_V1_*` spellings are what the SDK actually
+defines — an earlier version of this sample used `RED4ext::PluginHandle` and
+`RED4EXT_SEMVER`, which do not exist and never compiled. `examples/red4ext_plugin`
+is a working version of the above and is built by CI-less opt-in:
+
+```
+cmake -B build -DREDFS_RED4EXT_SDK=C:/path/to/RED4ext.SDK
+cmake --build build --target redfs_red4ext_plugin
 ```
 
 ### Never touch RedFS from `DllMain`
