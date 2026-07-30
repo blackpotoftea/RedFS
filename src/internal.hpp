@@ -44,6 +44,10 @@ bool load(const char* game_dir);
 bool available();
 // Returns decoded byte count, or a value != raw_len on failure.
 int64_t decompress(const void* comp, int64_t comp_len, void* raw, int64_t raw_len);
+// Releases the pooled decoder scratch. Call only once no decode can be in
+// flight -- redfs_shutdown does it after the worker is joined. Safe to repeat,
+// and decoding still works afterwards; the pool just refills.
+void free_scratch();
 }  // namespace oodle
 
 // --- path hashing ------------------------------------------------------------

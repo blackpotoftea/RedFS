@@ -867,6 +867,10 @@ void redfs_shutdown(void) {
     // Every host is required to make this call, so an allocation failure here
     // must not take the game down on the way out.
     REDFS_GUARD_VOID(cache_close());
+    // After the join, so no decode is still holding a block. Without this the
+    // scratch pool -- up to ~450 KB per concurrent decode -- outlives an
+    // unload/reload cycle and shows up as a leak under ASan.
+    oodle::free_scratch();
 }
 
 // --- CR2W --------------------------------------------------------------------
