@@ -656,7 +656,71 @@ int bench_collect(const redfs_file_info* info, void* user) {
 // shipped game is Wwise Vorbis, whose setup headers Wwise strips, so turning one
 // into PCM needs a codebook rebuild plus a Vorbis decoder that lives elsewhere.
 // The codec column exists so that stops being a surprise.
-int cmd_voice(redfs_depot* d, const char* list, int want) {
+// Writes `bytes` to a temp file and returns its path, or an empty string.
+std::string write_temp(const char* stem, const void* bytes, size_t n) {
+    const char* tmp = std::getenv("TEMP");
+    if (!tmp) tmp = ".";
+    std::string p = std::string(tmp) + "\\redfs_" + stem;
+    FILE* f = std::fopen(p.c_str(), "wb");
+    if (!f) return {};
+    const bool ok = std::fwrite(bytes, 1, n, f) == n;
+    std::fclose(f);
+    if (!ok) {
+        std::remove(p.c_str());
+        return {};
+    }
+    return p;
+}
+
+// Validates a WAV rather than trusting an exit code: magic, PCM tag, and the
+// internal consistency of byteRate/blockAlign against rate/channels/bits. A
+// decoder that half-failed usually still writes a file.
+struct WavCheck {
+    bool ok = false;
+    uint32_t rate = 0, frames = 0, data_bytes = 0;
+    uint16_t channels = 0, bits = 0;
+    double seconds = 0;
+};
+
+WavCheck check_wav(const std::string& path) {
+    WavCheck w;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return w;
+    uint8_t h[44];
+    const bool got = std::fread(h, 1, sizeof h, f) == sizeof h;
+    std::fseek(f, 0, SEEK_END);
+    const long total = std::ftell(f);
+    std::fclose(f);
+    if (!got || total < 44) return w;
+
+    auto u16 = [&h](int o) { return static_cast<uint16_t>(h[o] | (h[o + 1] << 8)); };
+    auto u32 = [&h](int o) {
+        return static_cast<uint32_t>(h[o] | (h[o + 1] << 8) | (h[o + 2] << 16) |
+                                    (static_cast<uint32_t>(h[o + 3]) << 24));
+    };
+    if (std::memcmp(h, "RIFF", 4) != 0 || std::memcmp(h + 8, "WAVE", 4) != 0) return w;
+    if (std::memcmp(h + 12, "fmt ", 4) != 0 || std::memcmp(h + 36, "data", 4) != 0) return w;
+    if (u16(20) != 1) return w;  // not PCM
+
+    w.channels = u16(22);
+    w.rate = u32(24);
+    w.bits = u16(34);
+    w.data_bytes = u32(40);
+    if (!w.channels || !w.rate || !w.bits) return w;
+
+    const uint32_t block = w.channels * w.bits / 8u;
+    if (u16(32) != block) return w;                 // blockAlign disagrees
+    if (u32(28) != w.rate * block) return w;        // byteRate disagrees
+    if (u32(4) != static_cast<uint32_t>(total) - 8) return w;  // riff size disagrees
+    if (w.data_bytes % block) return w;             // partial frame
+
+    w.frames = w.data_bytes / block;
+    w.seconds = static_cast<double>(w.frames) / w.rate;
+    w.ok = w.frames > 0;
+    return w;
+}
+
+int cmd_voice(redfs_depot* d, const char* list, int want, const char* vgmstream) {
     uint32_t kept = 0;
     if (redfs_path_load(d, list, &kept) != REDFS_OK) {
         std::printf("path list: %s\n", redfs_last_error());
@@ -685,10 +749,11 @@ int cmd_voice(redfs_depot* d, const char* list, int want) {
     std::printf("voice lines in depot   %zu\n", voices.size());
 
     std::map<std::string, int> codecs;
-    std::vector<double> read_ms, parse_ms;
+    std::vector<double> read_ms, parse_ms, decode_ms;
     std::vector<uint64_t> sizes;
-    double secs = 0;
-    uint64_t bytes = 0;
+    double secs = 0, audio_secs = 0;
+    uint64_t bytes = 0, pcm_bytes = 0;
+    int decoded = 0, decode_failed = 0, wav_bad = 0;
     // Stride rather than take a prefix: enumeration is hash-ordered, so a prefix
     // would sample one corner of the hash space and possibly one archive.
     const size_t stride = voices.size() / static_cast<size_t>(want > 0 ? want : 1) + 1;
@@ -710,6 +775,41 @@ int cmd_voice(redfs_depot* d, const char* list, int want) {
             sizes.push_back(b.size);
             bytes += b.size;
             secs += ai.duration_seconds;
+
+            // Optional second half: hand the bytes to an external decoder and
+            // verify what comes back is a real WAV. RedFS supplies the .wem; the
+            // codec is somebody else's, deliberately.
+            if (vgmstream) {
+                const std::string wem = write_temp("voice.wem", b.data, (size_t)b.size);
+                if (!wem.empty()) {
+                    const std::string wav = std::string(wem) + ".wav";
+                    // Quoted twice: cmd.exe strips the outer pair, so a path with
+                    // spaces (Program Files, and TEMP under a named user) survives.
+                    std::string cmd = "\"\"" + std::string(vgmstream) + "\" -o \"" + wav +
+                                      "\" \"" + wem + "\"\" >nul 2>&1";
+                    const auto d0 = std::chrono::steady_clock::now();
+                    const int rc = std::system(cmd.c_str());
+                    const auto d1 = std::chrono::steady_clock::now();
+
+                    if (rc != 0) {
+                        ++decode_failed;
+                    } else {
+                        const WavCheck w = check_wav(wav);
+                        if (!w.ok) {
+                            ++wav_bad;
+                        } else {
+                            ++decoded;
+                            decode_ms.push_back(
+                                std::chrono::duration<double, std::milli>(d1 - d0).count());
+                            audio_secs += w.seconds;
+                            pcm_bytes += w.data_bytes;
+                        }
+                    }
+                    // Nothing is kept: this measures and verifies, it does not export.
+                    std::remove(wav.c_str());
+                    std::remove(wem.c_str());
+                }
+            }
         }
         redfs_blob_free(&b);
     }
@@ -742,9 +842,34 @@ int cmd_voice(redfs_depot* d, const char* list, int want) {
                 at(read_ms, 0.9), read_ms.back());
     std::printf("  %-22s %8.4f  %8.4f  %8.4f\n", "parse header", at(parse_ms, 0.5),
                 at(parse_ms, 0.9), parse_ms.back());
-    std::printf("\nmilliseconds. Payload offset and size are resolved by the parse, so these\n");
+    if (!decode_ms.empty()) {
+        std::sort(decode_ms.begin(), decode_ms.end());
+        std::printf("  %-22s %8.1f  %8.1f  %8.1f\n", "decode to WAV (ext)", at(decode_ms, 0.5),
+                    at(decode_ms, 0.9), decode_ms.back());
+    }
+    std::printf("\nmilliseconds. Payload offset and size are resolved by the parse, so the first\n");
     std::printf("two stages are the whole cost of getting playable bytes addressable.\n");
-    std::printf("Decoding is NOT included and NOT provided: see docs/audio-opus.md.\n");
+
+    if (vgmstream) {
+        std::printf("\nWAV verification (%s)\n", vgmstream);
+        std::printf("  decoded and valid    %d\n", decoded);
+        std::printf("  decoder failed       %d\n", decode_failed);
+        std::printf("  WAV rejected         %d\n", wav_bad);
+        if (decoded) {
+            std::printf("  audio produced       %.1f s, %.1f MB of PCM\n", audio_secs,
+                        pcm_bytes / 1048576.0);
+            std::printf("  expansion            %.1fx over the .wem bytes\n",
+                        static_cast<double>(pcm_bytes) / static_cast<double>(bytes));
+        }
+        std::printf("\nEvery WAV is checked field by field -- RIFF/WAVE/fmt/data present, PCM tag,\n");
+        std::printf("and byteRate and blockAlign consistent with rate, channels and bit depth --\n");
+        std::printf("because a half-failed decode still writes a file. Nothing is kept on disk.\n");
+        std::printf("The decoder is external on purpose: every voice line is Wwise Vorbis, whose\n");
+        std::printf("setup headers Wwise strips, and RedFS does not bundle codecs.\n");
+    } else {
+        std::printf("Decoding is not included. Pass a vgmstream-cli path as the third argument\n");
+        std::printf("to decode each line to WAV and verify it.\n");
+    }
     return 0;
 }
 
@@ -830,7 +955,9 @@ void usage() {
         "  tex <key> [out.dds]           texture descriptor, optionally as DDS\n"
         "  mesh <key>                    mesh geometry layout\n"
         "  audio <key>                   sniff the audio container\n"
-        "  voice <list> [n]              cost of fetching n random voice lines\n"
+        "  voice <list> [n] [vgmstream]  cost of fetching n random voice lines;\n"
+        "                                with vgmstream-cli.exe, also decode each to\n"
+        "                                WAV and verify it (nothing is kept)\n"
         "  bench                         read cost vs position inside an archive\n"
         "  selftest                      verify the library against the install\n"
         "\n"
@@ -901,7 +1028,8 @@ int main(int argc, char** argv) {
     else if (std::strcmp(cmd, "mesh") == 0 && rest >= 1) rc = cmd_mesh(d, args[0]);
     else if (std::strcmp(cmd, "audio") == 0 && rest >= 1) rc = cmd_audio(d, args[0]);
     else if (std::strcmp(cmd, "voice") == 0 && rest >= 1)
-        rc = cmd_voice(d, args[0], rest >= 2 ? std::atoi(args[1]) : 300);
+        rc = cmd_voice(d, args[0], rest >= 2 ? std::atoi(args[1]) : 300,
+                       rest >= 3 ? args[2] : nullptr);
     else usage();
 
     if (cache_file) redfs_cache_close();

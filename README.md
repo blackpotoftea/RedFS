@@ -28,7 +28,7 @@ if (redfs_texture_read_dds(depot, redfs_hash("base\\icon\\foo.xbm"), &dds) == RE
 redfs_depot_close(depot);
 ```
 
-## Why this works
+## How it works
 
 The `.archive` container is fully understood: a header, an index of
 `(hash -> segment range)`, and a segment table of `(offset, compressed size,
