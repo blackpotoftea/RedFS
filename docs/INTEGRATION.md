@@ -38,6 +38,16 @@ Three things no offline harness can reach:
 2. **Oodle against the resident DLL.** The game already has `oo2ext_7_win64.dll`
    loaded, so `GetModuleHandleW` should find it without touching disk; standalone
    tools take a fallback path instead.
+
+   Sharing that module means sharing its *plugin allocator*, which is
+   process-global and belongs to whoever installed it last — in the game, to
+   CDPR. Theirs asserts the moment it is called (`OodleMallocAligned called
+   unexpectedly`, `wrapperKraken.cpp:85`), because the engine only ever calls
+   Oodle through APIs it can hand preallocated memory to. So RedFS has to supply
+   its own decoder scratch on every decode; passing null asks Oodle to allocate
+   and takes the game down on the first compressed read. This is the one item
+   here that had actually shipped broken — binding the function was exercised,
+   calling it in-process was not.
 3. **Unload ordering for real.** RED4ext calls `Main(Unload)` and then
    `FreeLibrary`. `redfs_lifecycle` reproduces that shape, but with a test harness
    driving it rather than RED4ext's plugin manager.

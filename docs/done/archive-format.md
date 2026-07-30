@@ -192,7 +192,12 @@ block:
 | `+0x04` | `u32` | `raw_size` — decoded length claimed by the block |
 | `+0x08` | | Kraken bitstream, `zsize - 8` bytes |
 
-Decoded with `OodleLZ_Decompress(src + 8, zsize - 8, dst, raw)`.
+Decoded with `OodleLZ_Decompress(src + 8, zsize - 8, dst, raw)`, plus a
+caller-supplied `decoderMemory` — sized once from
+`OodleLZDecoder_MemorySizeNeeded(Invalid, -1)` (462288 bytes against 2.31) and
+pooled across decodes. Leaving it null makes Oodle allocate through the
+process-global plugin allocator, which inside the game is CDPR's and asserts on
+sight; see `src/oodle.cpp`.
 
 `raw_size` occasionally disagrees with the segment table's `size`, and the two
 implementations resolve it in **opposite directions**:
