@@ -9,6 +9,7 @@
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -646,6 +647,107 @@ int bench_collect(const redfs_file_info* info, void* user) {
     return 1;
 }
 
+// What does fetching one voice line out of the archives cost, and what is in it?
+//
+// The question this answers is a consumer's: a mod that plays game dialogue at
+// runtime needs to know whether a fetch fits in a frame. It measures only the part
+// RedFS owns -- index lookup, read with Kraken decode, RIFF parse, payload located
+// -- because RedFS deliberately does not decode audio. Every voice line in the
+// shipped game is Wwise Vorbis, whose setup headers Wwise strips, so turning one
+// into PCM needs a codebook rebuild plus a Vorbis decoder that lives elsewhere.
+// The codec column exists so that stops being a surprise.
+int cmd_voice(redfs_depot* d, const char* list, int want) {
+    uint32_t kept = 0;
+    if (redfs_path_load(d, list, &kept) != REDFS_OK) {
+        std::printf("path list: %s\n", redfs_last_error());
+        return 1;
+    }
+
+    std::vector<uint64_t> voices;
+    redfs_enumerate(
+        d,
+        [](const redfs_file_info* i, void* u) {
+            const char* p = redfs_path_from_hash(i->hash);
+            if (!p) return 1;
+            const size_t n = std::strlen(p);
+            // Voice-over only: \vo\ excludes sfx and music, which have very
+            // different sizes and would blur the distribution.
+            if (n > 4 && std::strcmp(p + n - 4, ".wem") == 0 && std::strstr(p, "\\vo\\"))
+                static_cast<std::vector<uint64_t>*>(u)->push_back(i->hash);
+            return 1;
+        },
+        &voices);
+
+    if (voices.empty()) {
+        std::printf("no voice-over .wem resolved; is this the right path list?\n");
+        return 1;
+    }
+    std::printf("voice lines in depot   %zu\n", voices.size());
+
+    std::map<std::string, int> codecs;
+    std::vector<double> read_ms, parse_ms;
+    std::vector<uint64_t> sizes;
+    double secs = 0;
+    uint64_t bytes = 0;
+    // Stride rather than take a prefix: enumeration is hash-ordered, so a prefix
+    // would sample one corner of the hash space and possibly one archive.
+    const size_t stride = voices.size() / static_cast<size_t>(want > 0 ? want : 1) + 1;
+
+    for (size_t k = 0; k < voices.size() && static_cast<int>(read_ms.size()) < want; k += stride) {
+        const auto t0 = std::chrono::steady_clock::now();
+        redfs_blob b{};
+        if (redfs_read(d, voices[k], REDFS_PART_MAIN, &b) != REDFS_OK) continue;
+        const auto t1 = std::chrono::steady_clock::now();
+
+        redfs_audio_info ai{};
+        const redfs_status st = redfs_audio_info_parse(b.data, b.size, &ai);
+        const auto t2 = std::chrono::steady_clock::now();
+
+        if (st == REDFS_OK && ai.data_size > 0) {
+            codecs[redfs_audio_codec_name(ai.codec)]++;
+            read_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            parse_ms.push_back(std::chrono::duration<double, std::milli>(t2 - t1).count());
+            sizes.push_back(b.size);
+            bytes += b.size;
+            secs += ai.duration_seconds;
+        }
+        redfs_blob_free(&b);
+    }
+    if (read_ms.empty()) {
+        std::printf("nothing parsed\n");
+        return 1;
+    }
+
+    // Sort up front rather than inside the accessor. Function arguments are
+    // unsequenced, so `at(v, 0.5)` and `v.back()` in one printf could evaluate
+    // back() before the sort -- which printed a max below the p90.
+    std::sort(read_ms.begin(), read_ms.end());
+    std::sort(parse_ms.begin(), parse_ms.end());
+    std::sort(sizes.begin(), sizes.end());
+    auto at = [](const std::vector<double>& v, double p) {
+        return v[static_cast<size_t>(v.size() * p)];
+    };
+
+    std::printf("sampled                %zu lines, %.1f MB\n\n", read_ms.size(),
+                bytes / 1048576.0);
+    for (const auto& [name, n] : codecs)
+        std::printf("codec                  %s (%d)\n", name.c_str(), n);
+    std::printf("file size              median %llu bytes, max %llu\n",
+                static_cast<unsigned long long>(sizes[sizes.size() / 2]),
+                static_cast<unsigned long long>(sizes.back()));
+    if (secs > 0)
+        std::printf("audio duration         %.1f s across the sample\n", secs);
+    std::printf("\n  %-22s %9s %9s %9s\n", "stage", "median", "p90", "max");
+    std::printf("  %-22s %8.3f  %8.3f  %8.3f\n", "read (incl. Kraken)", at(read_ms, 0.5),
+                at(read_ms, 0.9), read_ms.back());
+    std::printf("  %-22s %8.4f  %8.4f  %8.4f\n", "parse header", at(parse_ms, 0.5),
+                at(parse_ms, 0.9), parse_ms.back());
+    std::printf("\nmilliseconds. Payload offset and size are resolved by the parse, so these\n");
+    std::printf("two stages are the whole cost of getting playable bytes addressable.\n");
+    std::printf("Decoding is NOT included and NOT provided: see docs/audio-opus.md.\n");
+    return 0;
+}
+
 int cmd_bench(redfs_depot* d) {
     std::vector<BenchPick> all;
     redfs_enumerate(d, bench_collect, &all);
@@ -728,6 +830,7 @@ void usage() {
         "  tex <key> [out.dds]           texture descriptor, optionally as DDS\n"
         "  mesh <key>                    mesh geometry layout\n"
         "  audio <key>                   sniff the audio container\n"
+        "  voice <list> [n]              cost of fetching n random voice lines\n"
         "  bench                         read cost vs position inside an archive\n"
         "  selftest                      verify the library against the install\n"
         "\n"
@@ -797,6 +900,8 @@ int main(int argc, char** argv) {
         rc = cmd_tex(d, args[0], rest >= 2 ? args[1] : nullptr);
     else if (std::strcmp(cmd, "mesh") == 0 && rest >= 1) rc = cmd_mesh(d, args[0]);
     else if (std::strcmp(cmd, "audio") == 0 && rest >= 1) rc = cmd_audio(d, args[0]);
+    else if (std::strcmp(cmd, "voice") == 0 && rest >= 1)
+        rc = cmd_voice(d, args[0], rest >= 2 ? std::atoi(args[1]) : 300);
     else usage();
 
     if (cache_file) redfs_cache_close();
