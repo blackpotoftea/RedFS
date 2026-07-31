@@ -22,6 +22,12 @@
 param(
     [string] $GameDir,
     [string] $TexconvDll = "C:\Work\WorkSpace\Cyberpunk\WolvenKit\WolvenKit.Common\lib\texconv.dll",
+    # Both content checks need a path list: `verify` and the round-trip select
+    # files by glob, and globbing needs names the dictionary knows.
+    [string] $PathList = "C:\Work\WorkSpace\Cyberpunk\WolvenKit\WolvenKit.Common\Resources\usedhashes.kark",
+    [string] $WolvenKitCli = "C:\Modding\wolwenKit_upacker\WolvenKit.CLI.exe",
+    # One WolvenKit process per file, so this is the slow one: ~2 s each.
+    [int]    $RoundTripCount = 10,
     [int]    $FuzzIterations = 30000,
     # 12000, not 4000. The sampled depot holds exactly one cubemap and it sits at
     # about index 11,000, so every smaller count skipped the cubemap encoding path
@@ -149,6 +155,34 @@ if ($GameDir) {
 
     Step "selftest against the install" {
         & "$root\build\redfs_cli.exe" --game $GameDir selftest | Select-Object -Last 2
+    }
+
+    # The archive's own SHA-1, which RedFS cannot influence. Single-segment files
+    # only -- see docs/done/verification.md, oracle 7 -- so the patterns are the
+    # ones where it applies. Exit 2 means everything checked passed but something
+    # was skipped, which for these should not happen.
+    Step "decoded bytes vs the archive's SHA-1" {
+        foreach ($pat in @("*.wem", "*.opuspak", "*.json", "*.mlsetup", "*.scene")) {
+            & "$root\build\redfs_cli.exe" --game $GameDir verify $PathList $pat 150 |
+                Select-String -Pattern 'matched the index|coverage|FAILED|INCOMPLETE'
+            if ($LASTEXITCODE -ne 0) { throw "verify $pat exited $LASTEXITCODE" }
+        }
+    }
+
+    # Multi-segment resources, where that oracle does not apply and a second
+    # independent reader is the only check available.
+    if (Test-Path $WolvenKitCli) {
+        Step "multi-segment resources vs WolvenKit's own extraction" {
+            foreach ($pat in @("*.mesh", "*.xbm", "*.ent", "*.app")) {
+                & "$root\tools\roundtrip.ps1" -GameDir $GameDir -List $PathList `
+                    -WolvenKit $WolvenKitCli -Pattern $pat -Count $RoundTripCount |
+                    Select-String -Pattern 'identical prefix|FAIL'
+                if ($LASTEXITCODE -ne 0) { throw "roundtrip $pat exited $LASTEXITCODE" }
+            }
+        }
+    } else {
+        Write-Host ""
+        Write-Host "  (skipping WolvenKit round-trip: $WolvenKitCli not found)" -ForegroundColor Yellow
     }
 
     if (Test-Path $TexconvDll) {
