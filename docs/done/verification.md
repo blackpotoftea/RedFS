@@ -167,7 +167,17 @@ checked-in baseline of our own output could show.
 
 For multi-segment files the index SHA-1 matches neither the main segment, nor
 every segment concatenated, nor buffer 0 — it covers something this reader cannot
-reconstruct, most likely the pre-cook source. Those are skipped, not failed.
+reconstruct, most likely the pre-cook source.
+
+**Coverage is part of the result, and the exit code says so.** Those files are
+skipped, and a run that skipped anything exits `2` (INCOMPLETE) rather than `0`.
+That distinction is the whole value of the command: `verify "*.mesh"` examines
+200 files, can check 1, and passes it — reporting that as success would be a
+green light for having verified 0.5 % of what was asked. Narrow the pattern to
+what the oracle actually covers if you want a clean run.
+
+    verify "*.wem"   -> 200 of 200 verifiable, 100.0%, exit 0
+    verify "*.mesh"  ->   1 of 200 verifiable,   0.5%, exit 2
 
 That split lands almost exactly on the bulk audio, which is where it is most
 useful, because nothing else here verifies audio content at all:

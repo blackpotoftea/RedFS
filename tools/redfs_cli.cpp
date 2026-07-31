@@ -317,21 +317,42 @@ int cmd_verify(redfs_depot* d, const char* list_file, const char* pattern, uint3
     if (st != REDFS_OK) return die("find", st);
     const double took = ms_since(t0);
 
-    std::printf("%u match \"%s\"; verified %u, skipped %u multi-segment\n", total, pattern,
-                v.checked, v.skipped_multi);
+    const uint32_t examined = v.checked + v.skipped_multi;
+    std::printf("%u match \"%s\"\n", total, pattern);
     if (v.checked)
         std::printf("%u of %u matched the index SHA-1 (%.1f MB in %.1f s, %.0f MB/s)\n", v.matched,
                     v.checked, v.bytes / 1048576.0, took / 1000.0,
                     v.bytes / 1048576.0 / (took / 1000.0));
     if (v.read_failed) std::printf("%u failed to read\n", v.read_failed);
 
-    // A run that verified nothing is not a pass. The usual cause is a pattern
-    // that selects only multi-segment resources, where the oracle does not apply.
+    // COVERAGE IS PART OF THE RESULT, not a footnote. The oracle only applies to
+    // single-segment files, so a pattern selecting mostly meshes or textures gets
+    // almost everything skipped -- and reporting that as success would be a green
+    // light for having checked nothing, which is the failure this command exists
+    // to catch. Skipping is therefore a non-zero exit: narrow the pattern to what
+    // is actually verifiable (.wem, .opuspak, .json) if you want a clean run.
+    std::printf("coverage: %u of %u examined were verifiable (%.1f%%)", v.checked, examined,
+                examined ? 100.0 * v.checked / examined : 0.0);
+    if (v.skipped_multi)
+        std::printf("; %u skipped as multi-segment, where the index SHA-1 does not apply",
+                    v.skipped_multi);
+    std::printf("\n");
+
     if (!v.checked) {
-        std::printf("nothing verifiable matched -- single-segment files only\n");
+        std::printf("FAILED: nothing verifiable matched\n");
         return 1;
     }
-    return v.matched == v.checked && !v.read_failed ? 0 : 1;
+    if (v.matched != v.checked || v.read_failed) {
+        std::printf("FAILED: %u mismatched, %u unreadable\n", v.checked - v.matched,
+                    v.read_failed);
+        return 1;
+    }
+    if (v.skipped_multi) {
+        std::printf("INCOMPLETE: everything checked passed, but %u of %u could not be checked\n",
+                    v.skipped_multi, examined);
+        return 2;
+    }
+    return 0;
 }
 
 int cmd_stat(redfs_depot* d, const char* key) {
