@@ -13,9 +13,38 @@
 #include <string>
 #include <vector>
 
+#include <windows.h>
+#include <bcrypt.h>
+
 #include "redfs.h"
 
 namespace {
+
+// The system SHA-1, not one of ours. The whole point of `verify` is to check
+// RedFS against a hash RedFS did not compute, so the digest has to come from
+// somewhere RedFS has no say in.
+bool sha1(const void* data, uint64_t len, uint8_t out[20]) {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    if (::BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM, nullptr, 0) != 0) return false;
+    BCRYPT_HASH_HANDLE h = nullptr;
+    bool ok = false;
+    if (::BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0) == 0) {
+        // BCryptHashData takes a ULONG, so feed it in chunks: a .opuspak runs to
+        // ~1 MB but nothing in the format caps a segment at 4 GB.
+        ok = true;
+        const uint8_t* p = static_cast<const uint8_t*>(data);
+        while (len && ok) {
+            const ULONG chunk = len > 0x10000000u ? 0x10000000u : static_cast<ULONG>(len);
+            ok = ::BCryptHashData(h, const_cast<PUCHAR>(p), chunk, 0) == 0;
+            p += chunk;
+            len -= chunk;
+        }
+        ok = ok && ::BCryptFinishHash(h, out, 20, 0) == 0;
+        ::BCryptDestroyHash(h);
+    }
+    ::BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -213,6 +242,96 @@ int cmd_find(redfs_depot* d, const char* list_file, const char* pattern, uint32_
     else
         std::printf("%u matches\n", matched);
     return 0;
+}
+
+// --- verify ------------------------------------------------------------------
+//
+// Checks what RedFS decompresses against the SHA-1 the archive index already
+// carries for that entry. That hash is an ORACLE: CDPR computed it at cook time,
+// it is stored per entry at +0x24 of the file table, and nothing RedFS does can
+// influence it. So a match is evidence the Kraken decode produced the original
+// bytes -- not merely that it produced the same bytes as last time, which is all
+// a checked-in baseline of our own output could ever show.
+//
+// It only applies to SINGLE-SEGMENT files. Measured against a stock 2.31 install:
+// for buffer_count == 0 the index SHA-1 is the hash of the decompressed content
+// (2,327 of 2,328 sampled), and for anything with attached buffers it matches
+// neither the main segment, nor every segment concatenated, nor buffer 0 -- it
+// covers something this reader cannot reconstruct. So multi-segment files are
+// counted and skipped rather than reported as failures.
+//
+// That split is less limiting than it sounds, because it falls almost exactly on
+// the bulk audio: 119,857 .wem and 1,878 .opuspak are single-segment, while
+// .mesh and .xbm essentially never are. For those, see the WolvenKit round-trip
+// in docs/verification.md.
+
+struct Verifier {
+    redfs_depot* depot;
+    uint32_t checked, matched, skipped_multi, read_failed, limit;
+    uint64_t bytes;
+};
+
+int verify_visit(uint64_t key, const char* path, void* user) {
+    auto* v = static_cast<Verifier*>(user);
+
+    redfs_file_info info{};
+    if (redfs_stat(v->depot, key, &info) != REDFS_OK) return 1;
+    if (info.buffer_count != 0) {
+        ++v->skipped_multi;
+        return v->checked + v->skipped_multi < v->limit;
+    }
+
+    redfs_blob blob{};
+    const redfs_status st = redfs_read(v->depot, key, REDFS_PART_ALL, &blob);
+    if (st != REDFS_OK) {
+        ++v->read_failed;
+        std::printf("  READ  %-58.58s %s\n", path, redfs_status_string(st));
+        return v->checked + v->skipped_multi < v->limit;
+    }
+
+    ++v->checked;
+    v->bytes += blob.size;
+    uint8_t got[20];
+    if (sha1(blob.data, blob.size, got) && std::memcmp(got, info.sha1, 20) == 0) {
+        ++v->matched;
+    } else {
+        std::printf("  SHA1  %-58.58s\n        want ", path);
+        for (int i = 0; i < 20; ++i) std::printf("%02x", info.sha1[i]);
+        std::printf("\n        got  ");
+        for (int i = 0; i < 20; ++i) std::printf("%02x", got[i]);
+        std::printf("\n");
+    }
+    redfs_blob_free(&blob);
+    return v->checked + v->skipped_multi < v->limit;
+}
+
+int cmd_verify(redfs_depot* d, const char* list_file, const char* pattern, uint32_t limit) {
+    uint32_t kept = 0;
+    const redfs_status load = redfs_path_load(d, list_file, &kept);
+    if (load != REDFS_OK) return die("path_load", load);
+
+    Verifier v{d, 0, 0, 0, 0, limit, 0};
+    uint32_t total = 0;
+    const auto t0 = Clock::now();
+    const redfs_status st = redfs_find(d, pattern, verify_visit, &v, &total);
+    if (st != REDFS_OK) return die("find", st);
+    const double took = ms_since(t0);
+
+    std::printf("%u match \"%s\"; verified %u, skipped %u multi-segment\n", total, pattern,
+                v.checked, v.skipped_multi);
+    if (v.checked)
+        std::printf("%u of %u matched the index SHA-1 (%.1f MB in %.1f s, %.0f MB/s)\n", v.matched,
+                    v.checked, v.bytes / 1048576.0, took / 1000.0,
+                    v.bytes / 1048576.0 / (took / 1000.0));
+    if (v.read_failed) std::printf("%u failed to read\n", v.read_failed);
+
+    // A run that verified nothing is not a pass. The usual cause is a pattern
+    // that selects only multi-segment resources, where the oracle does not apply.
+    if (!v.checked) {
+        std::printf("nothing verifiable matched -- single-segment files only\n");
+        return 1;
+    }
+    return v.matched == v.checked && !v.read_failed ? 0 : 1;
 }
 
 int cmd_stat(redfs_depot* d, const char* key) {
@@ -970,6 +1089,9 @@ void usage() {
         "  paths <list> [key...]         load a dictionary, resolve hashes to paths\n"
         "  find <list> <pattern> [n]     files matching a glob (* ?); a bare word\n"
         "                                is taken as a substring\n"
+        "  verify <list> <pattern> [n]   decode matches and check them against the\n"
+        "                                SHA-1 in the archive index (single-segment\n"
+        "                                files only -- .wem, .opuspak, .json)\n"
         "  stat <key>                    where a file lives and how big it is\n"
         "  extract <key> <out> [part]    part = main | all | <buffer index>\n"
         "  cr2w <key> [chunk] [path]     chunks, imports and properties\n"
@@ -1034,6 +1156,8 @@ int main(int argc, char** argv) {
         rc = cmd_paths(d, args[0], rest - 1, args + 1);
     else if (std::strcmp(cmd, "find") == 0 && rest >= 2)
         rc = cmd_find(d, args[0], args[1], rest >= 3 ? std::strtoul(args[2], nullptr, 10) : 40);
+    else if (std::strcmp(cmd, "verify") == 0 && rest >= 2)
+        rc = cmd_verify(d, args[0], args[1], rest >= 3 ? std::strtoul(args[2], nullptr, 10) : 500);
     else if (std::strcmp(cmd, "chunks") == 0 && rest >= 1)
         rc = cmd_chunks(d, args[0], rest >= 2 ? args[1] : nullptr,
                         rest >= 3 ? std::strtoul(args[2], nullptr, 10) : 0);

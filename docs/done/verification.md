@@ -145,6 +145,62 @@ A weaker but useful signal: CR2W parses yield **coherent depot paths** in import
 tables. Random bytes do not produce
 `base\materials\multilayered_terrain.mt`.
 
+## Oracle 7 — the archive's own SHA-1 over decompressed content
+
+The strongest oracle available offline, and it was sitting in the index the whole
+time. Every file table entry carries a SHA-1 at `+0x24`
+(`done/archive-format.md`). **For single-segment files that hash is the SHA-1 of
+the decompressed content.** CDPR computed it at cook time and nothing RedFS does
+can influence it, so a match is evidence the Kraken decode reproduced the
+original bytes — not merely that it reproduced last week's bytes, which is all a
+checked-in baseline of our own output could show.
+
+`redfs_cli verify <list> <pattern> [n]` runs it. The digest comes from the system
+(`bcrypt`), not from anything in this repo.
+
+**It applies only where `buffer_count == 0`.** Measured on a stock 2.31 install:
+
+| | sampled | index SHA-1 == decompressed content |
+|---|---|---|
+| `buffer_count == 0` | 2,328 | 2,327 |
+| `buffer_count >= 1` | 660 | **0** |
+
+For multi-segment files the index SHA-1 matches neither the main segment, nor
+every segment concatenated, nor buffer 0 — it covers something this reader cannot
+reconstruct, most likely the pre-cook source. Those are skipped, not failed.
+
+That split lands almost exactly on the bulk audio, which is where it is most
+useful, because nothing else here verifies audio content at all:
+
+| pattern | files | single-segment | verified |
+|---|---|---|---|
+| `*.wem` | 119,857 | yes | 400/400, 700/700 across runs |
+| `*.opuspak` | 1,878 | yes | 300/300 |
+| `*.json` | 73,292 | yes | 300/300 |
+| `*.opusinfo` | 1 | yes | 1/1 |
+| `*.mesh` | 102,657 | ~1 % | 1/1, 199 skipped |
+| `*.xbm` | 55,815 | no | — |
+
+## Oracle 8 — WolvenKit's own extraction, byte for byte
+
+The round-trip this document previously listed as a gap. `WolvenKit.CLI unbundle
+<archive> -o <dir> --hash <decimal>` writes the resource, and **RedFS's main
+segment is an exact byte-for-byte prefix of that file.**
+
+Confirmed on `base\characters\garment\citizen_casual\feet\s1_051_shoe__latino\
+s1_051_wa_shoe__latino.mesh`: WolvenKit produced 300,346 bytes, `redfs_cli
+extract <key> <out> main` produced 142,385, and all 142,385 are identical from
+the `CR2W` magic onward.
+
+The sizes differ because the two tools answer different questions. WolvenKit
+reassembles the on-disk CR2W container, appending the buffers re-embedded in the
+form the CR2W buffer table describes (157,961 bytes here). RedFS hands back
+decompressed segments and does not re-embed anything. So the comparison is
+**prefix, not whole-file** — a naive `fc /b` reports a length mismatch on a file
+that is correct.
+
+This is what covers `.mesh` and `.xbm`, where oracle 7 does not apply.
+
 ## Current results
 
 Run as part of `run-checks.ps1 -GameDir ...` at `VerifyCount` 12000:

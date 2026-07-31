@@ -61,7 +61,9 @@ endif()
 
 if(REDFS_BUILD_CLI)
     add_executable(redfs_cli tools/redfs_cli.cpp)
-    target_link_libraries(redfs_cli PRIVATE redfs_static)
+    # bcrypt for `verify`: the SHA-1 it checks against the archive index has to
+    # come from outside RedFS to be worth anything, so it uses the system one.
+    target_link_libraries(redfs_cli PRIVATE redfs_static bcrypt)
 
     # Cross-checks our DDS output against DirectXTex. Needs a texconv.dll at
     # runtime (WolvenKit ships one under WolvenKit.Common/lib).

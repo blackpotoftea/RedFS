@@ -204,10 +204,14 @@ there yet.
   either, and on a machine without the game nothing does at all. Fix is binding
   the compressor when it happens to be present, or checking in one compressed
   segment as test data.
-- **No round-trip against WolvenKit's own extraction.** A byte-for-byte
-  comparison on a sample would be the strongest available check. Not done because
-  building the WolvenKit CLI was judged not worth the time given the independent
-  oracles already in place.
+- ~~**No round-trip against WolvenKit's own extraction.**~~ Done, and it did not
+  need building anything: WolvenKit ships a CLI, and `unbundle --hash` writes a
+  resource whose leading bytes are exactly RedFS's main segment. Confirmed on a
+  garment mesh, 142,385 bytes identical. The comparison is prefix-only —
+  WolvenKit re-embeds the buffers into the CR2W container and RedFS does not, so
+  the files differ in length while agreeing completely where they overlap. See
+  `done/verification.md`, oracle 8. What is still open is **automating** it
+  across a sample rather than one file at a time.
 - **Pixel content is never decoded.** Headers and payload *size* are verified —
   including `arraySize` and the cubemap `miscFlags` bit against DirectXTex — but
   that the bytes form a correct *image* is inferred. Restoring the DirectXTex PNG
