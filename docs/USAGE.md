@@ -315,7 +315,7 @@ Hand the bytes to a tool built for it: `ww2ogg` or `vgmstream` for wem → ogg,
 build has the codec. What RedFS supplies is the exact bytes and an accurate
 description of them, which is the part that needed the archive.
 
-## 7. Everything else: read the CR2W
+## 7. Everything else: open the resource
 
 There is no format-specific helper for most resource types, and mostly there does
 not need to be. Any cooked resource is a CR2W document, and the generic reader
@@ -324,25 +324,60 @@ carries its own RED type name, so you can act on types this header does not
 model.
 
 ```c
-redfs_blob doc;
-redfs_cr2w* f = NULL;
-if (redfs_read(depot, key, REDFS_PART_MAIN, &doc) != REDFS_OK) return;
-if (redfs_cr2w_open(doc.data, doc.size, &f) != REDFS_OK) {
-    redfs_blob_free(&doc);
-    return;
-}
+redfs_resource* r = NULL;
+if (redfs_open(depot, key, &r) != REDFS_OK) return;
 
-printf("%s\n", redfs_cr2w_root_type(f));
+printf("%s, %u buffers\n", redfs_resource_type(r), redfs_resource_buffer_count(r));
+
+const redfs_cr2w* f = redfs_resource_cr2w(r);
 for (uint32_t i = 0; i < redfs_cr2w_import_count(f); ++i)   /* dependencies */
     printf("  %-24s %s\n", redfs_cr2w_import_type(f, i),
                            redfs_cr2w_import_path(f, i));
 
-redfs_cr2w_close(f);
-redfs_blob_free(&doc);   /* AFTER close -- the parser borrows these bytes */
+redfs_close(r);   /* one close; the handle owns the bytes and the document */
 ```
 
-That free order is not stylistic: every `redfs_value` the handle hands back points
-into the blob or into the handle, so both have to outlive what you read.
+**`redfs_open` works on any file, not only CR2W documents.** For a `.wem` or a
+`.bnk`, `redfs_resource_type` returns `""` and `redfs_resource_cr2w` returns
+`NULL`, while `redfs_resource_data`/`_size` still give you the bytes. So "what is
+this?" is one call rather than a guess about the extension:
+
+```
+base\...\ro_road_a.mesh        CMesh                         doc  6,685 B, 1 buffer
+base\...\hanako_no_coat_r.xbm  CBitmapTexture                doc  2,116 B, 1 buffer
+base\...\q005_arasaka.ent      entEntityTemplate             doc 14,688 B, 1 buffer
+base\...\int_food_001.app      appearanceAppearanceResource  doc  1,158 B, 2 buffers
+base\...\elizabeth_peralez.wem                               doc 58,693 B, 0 buffers
+```
+
+### Why not `redfs_read` plus `redfs_cr2w_open`
+
+That still works and the pieces are still public, but it has two traps the handle
+removes.
+
+**The free order is load-bearing.** Every `redfs_value` points into the blob or
+into the handle, so the blob has to outlive the document — `redfs_cr2w_close`
+first, then `redfs_blob_free`. Getting it backwards reads freed memory.
+
+**And `part` has a wrong value that does not look wrong.** It is one `uint32_t`
+carrying three meanings, and `0` — the value most people reach for to mean "the
+first part" — means *attached buffer 0*. On the mesh above:
+
+```c
+redfs_read(depot, key, 0, &blob);   /* -> REDFS_OK, 6200 bytes of vertex data */
+redfs_cr2w_open(blob.data, blob.size, &f);   /* -> REDFS_E_CORRUPT */
+```
+
+Neither error names the cause. On a file with **no** buffers the same call
+returns `REDFS_E_RANGE` instead, which reads as "the file isn't there". One
+mistake, two unrelated symptoms, and a sweep across a whole install produced
+288,302 of the first and 209,228 of the second.
+
+`redfs_resource_buffer(r, i)` has no such value: `i` is bounds-checked against
+the count on the handle, and the main segment is not reachable through it at all.
+The index numbering matches `redfs_value.as.buffer`,
+`redfs_texture_desc.buffer_index` and `redfs_mesh_desc.render_buffer_index`, so
+an index read out of a document goes straight in.
 
 Properties are addressed by a dotted path that descends through nested structs —
 `"header.sizeInfo.width"`, `"setup.rawFormat"` — and every value arrives tagged

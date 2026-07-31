@@ -180,6 +180,61 @@ private:
     redfs_cr2w* h_ = nullptr;
 };
 
+/// One file: its bytes, its document and its buffers, owned together.
+///
+/// Replaces holding a Blob and a Cr2w in the right order by hand -- the document
+/// borrows the bytes, so the pairing was always a rule the caller had to keep.
+/// Opens any file, not only CR2W documents: for a .wem or .bnk, type() is empty
+/// and cr2w() is null while data()/size() still work.
+class Resource {
+public:
+    Resource() = default;
+    explicit Resource(redfs_resource* h) : h_(h) {}
+    Resource(const Resource&) = delete;
+    Resource& operator=(const Resource&) = delete;
+    Resource(Resource&& o) noexcept : h_(std::exchange(o.h_, nullptr)) {}
+    Resource& operator=(Resource&& o) noexcept {
+        if (this != &o) {
+            if (h_) redfs_close(h_);
+            h_ = std::exchange(o.h_, nullptr);
+        }
+        return *this;
+    }
+    ~Resource() {
+        if (h_) redfs_close(h_);
+    }
+
+    explicit operator bool() const { return h_ != nullptr; }
+
+    /// "CMesh", "CBitmapTexture", or empty when the file is not a CR2W document.
+    std::string_view type() const { return redfs_resource_type(h_); }
+    uint64_t key() const { return redfs_resource_hash(h_); }
+
+    /// The main segment. Borrows this Resource -- do not let it outlive one.
+    std::span<const uint8_t> bytes() const {
+        return {redfs_resource_data(h_), static_cast<size_t>(redfs_resource_size(h_))};
+    }
+
+    /// Null for a non-CR2W file. Borrowed, like bytes().
+    const redfs_cr2w* cr2w() const { return redfs_resource_cr2w(h_); }
+
+    uint32_t buffer_count() const { return redfs_resource_buffer_count(h_); }
+
+    /// 0..buffer_count-1, the same numbering as Value::as.buffer and the
+    /// descriptors' buffer_index. nullopt past the end -- never a different
+    /// segment, and never the document.
+    std::optional<Blob> buffer(uint32_t index) const {
+        redfs_blob b{};
+        if (redfs_resource_buffer(h_, index, &b) != REDFS_OK) return std::nullopt;
+        return Blob{b};
+    }
+
+    redfs_resource* handle() const { return h_; }
+
+private:
+    redfs_resource* h_ = nullptr;
+};
+
 /// A decoded mesh: chunk table, LODs, appearances and per-chunk bounds.
 class Mesh {
 public:
@@ -389,8 +444,11 @@ public:
         return read(hash(path), index);
     }
 
-    /// Returns the Blob as well as the Cr2w because the Cr2w only borrows those
-    /// bytes -- drop the Blob and the document is reading freed memory.
+    /// DEPRECATED in favour of Depot::open. Returns the Blob as well as the Cr2w
+    /// because the Cr2w only borrows those bytes -- drop the Blob and the
+    /// document is reading freed memory. Resource makes that unrepresentable
+    /// rather than making you remember it, and it does not fail on a file that
+    /// has no CR2W at all.
     std::optional<std::pair<Blob, Cr2w>> open_resource(uint64_t key) const {
         auto blob = read(key, REDFS_PART_MAIN);
         if (!blob) return std::nullopt;
@@ -401,6 +459,22 @@ public:
     std::optional<std::pair<Blob, Cr2w>> open_resource(std::string_view path) const {
         return open_resource(hash(path));
     }
+
+    /// One file: its bytes, its document and its buffers, with no part number to
+    /// get wrong. See redfs.h. nullopt if the file is not in the depot or its
+    /// main segment will not read; a file that simply has no CR2W still opens,
+    /// with type() empty and cr2w() null.
+    ///
+    /// Named `resource`, not `open`, because Depot::open is already the static
+    /// factory that mounts an install -- and an instance overload of it resolves
+    /// to the factory for a `const char*` argument, silently, since that matches
+    /// better than string_view.
+    std::optional<Resource> resource(uint64_t key) const {
+        redfs_resource* r = nullptr;
+        if (redfs_open(h_, key, &r) != REDFS_OK) return std::nullopt;
+        return Resource{r};
+    }
+    std::optional<Resource> resource(std::string_view path) const { return resource(hash(path)); }
 
     // --- textures ------------------------------------------------------------
 

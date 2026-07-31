@@ -51,31 +51,26 @@ sweep. For modded content specifically, LXRS footer parsing (below) is cheaper a
 rather than an inferred one. **Do that first.** This item is for the case where
 neither a shipped list nor a footer covers what you need.
 
-### A resource handle that owns its bytes
-**~half a day.** `redfs_read(hash, part)` is the only way to reach a resource that
-has no typed helper — `.ent`, `.app`, `.rig`, `.anims` — and it makes the caller
-name a segment. `part` is a `uint32_t` overloading three meanings, and `0` is
-valid-but-wrong: it selects attached buffer 0 where most callers mean the document.
-Textures, meshes and audio are unaffected; they already have one-call paths that
-take no part number.
+### ~~A resource handle that owns its bytes~~ — done
 
-Be exact about how `0` fails, because it splits by file shape (`resolve_part`,
+`redfs_open` / `redfs_resource_type` / `redfs_resource_cr2w` /
+`redfs_resource_buffer(i)`. Opens any file, CR2W or not; owns the main segment and
+the parsed document together, so the free-order rule they used to require is gone;
+and `i` is bounds-checked against the count on the handle, so no argument is left
+whose wrong value is silent.
+
+Kept for the record, because the reasoning is easy to get backwards. `part`'s `0`
+does not fail one way — it splits by file shape (`resolve_part`,
 `src/archive.cpp:252-264`, computes `seg = start + 1 + part`):
 
-- **Single-segment files — including the `.ent`/`.app`/`.rig` above — return
-  `REDFS_E_RANGE`.** They fail loudly. The reported incident bears this out: 288,302
-  of 662,485 reads came back "out of range".
-- **Files WITH attached buffers return buffer 0's raw payload and `REDFS_OK`.**
-  That is the silent case, and it is what `cr2w_open` then reports as corrupt data
-  — 209,228 of the same run.
+- **Single-segment files return `REDFS_E_RANGE`** and fail loudly. 288,302 of the
+  reported 662,485 came back "out of range".
+- **Files with attached buffers return buffer 0's raw payload and `REDFS_OK`** —
+  the silent case, which `cr2w_open` then calls corrupt data. 209,228 of the same
+  run.
 
-So the argument for the handle is not "it always fails silently"; it is that one
-integer produces two unrelated failures, neither naming the real cause.
-
-`redfs_open` / `redfs_resource_type` / `redfs_resource_buffer(i)` removes the
-argument rather than renaming it, and folds in the blob/CR2W lifetime pairing that
-`USAGE.md` currently warns about in prose. `Depot::open_resource` in `redfs.hpp` is
-the same shape already, minus the ownership.
+So the argument was never "it always fails silently"; it is that one integer
+produces two unrelated failures, neither naming the cause.
 
 Renumbering `part` so 0 means the main segment was considered and **rejected** —
 but not for being a silent ABI break. `REDFS_ABI_VERSION` exists for exactly this
@@ -85,7 +80,8 @@ desynchronises `part` from the three public 0-based buffer fields
 (`redfs_value.as.buffer`, `redfs_texture_desc.buffer_index`,
 `redfs_mesh_desc.render_buffer_index`): shift those too and that is three more
 silent breaks, leave them and the two numbering schemes move out of a comment and
-into the structs.
+into the structs. `redfs_resource_buffer` sidesteps the whole question by matching
+those three rather than competing with them.
 
 ### LXRS footer parsing
 **~2 hours.** WolvenKit-built archives carry a `custom_data` block listing their

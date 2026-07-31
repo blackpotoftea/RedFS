@@ -298,6 +298,17 @@ REDFS_API redfs_status redfs_enumerate(const redfs_depot* depot, redfs_enum_fn f
  * document for cooked resources); segments 1..N-1 are its attached buffers,
  * which hold the bulk payload -- pixel data for a texture, vertex streams for a
  * mesh, and so on.
+ *
+ * PREFER redfs_open (below) for anything with a CR2W document. These calls make
+ * you name a segment through one uint32_t carrying three meanings, and the value
+ * most callers reach for first -- 0 -- is legal but means "attached buffer 0",
+ * not the document. That mistake does not fail one way: on a single-segment file
+ * it returns REDFS_E_RANGE, and on a file WITH buffers it returns buffer 0's raw
+ * payload and REDFS_OK, which whatever parses it then reports as corrupt. Two
+ * unrelated errors, neither naming the cause.
+ *
+ * They remain the right calls for files that have no document at all -- .wem,
+ * .bnk, .opuspak -- where REDFS_PART_ALL is exactly what you want.
  */
 #define REDFS_PART_MAIN      0xFFFFFFFFu  /* segment 0 only: the CR2W document  */
 #define REDFS_PART_ALL       0xFFFFFFFEu  /* every segment, concatenated        */
@@ -465,6 +476,67 @@ REDFS_API redfs_status redfs_cr2w_get_in(const redfs_cr2w* cr2w, const redfs_val
                                          const char* prop_path, redfs_value* out_value);
 REDFS_API redfs_status redfs_cr2w_walk_in(const redfs_cr2w* cr2w, const redfs_value* parent,
                                           const char* prop_path, redfs_prop_fn fn, void* user);
+
+/* ------------------------------------------------------------------------- */
+/* resources                                                                  */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * A file opened as one thing: its bytes, its document, and its buffers.
+ *
+ * This exists because redfs_read's `part` argument has a value that is legal and
+ * almost never what the caller meant, and because a redfs_cr2w borrows the blob
+ * it was parsed from -- so using the two together correctly means holding both
+ * and destroying them in order. Here the handle owns the bytes, the document is
+ * parsed once, and a buffer is addressed by an index bounds-checked against the
+ * count on the handle. There is no argument left whose wrong value is silent.
+ *
+ * Works on any file, not only CR2W documents. redfs_open always reads the main
+ * segment; if it parses as CR2W the type and document are available, and if it
+ * does not -- a .wem, a .bnk -- redfs_resource_type returns "",
+ * redfs_resource_cr2w returns NULL, and the bytes are still there. So "open it
+ * and see what it is" is one call rather than a guess about the extension.
+ *
+ * SINGLE-THREADED, like the redfs_cr2w it holds: decoding a CString caches it on
+ * the document, so two threads must not share one handle. The depot stays
+ * shareable; give each thread its own resource. A resource must not outlive its
+ * depot -- it keeps the pointer in order to fetch buffers later.
+ *
+ * Cost: one main-segment read and one CR2W parse, both at open. Buffers are NOT
+ * read until asked for -- opening a mesh does not touch its geometry.
+ */
+typedef struct redfs_resource redfs_resource;
+
+REDFS_API redfs_status redfs_open(const redfs_depot* depot, uint64_t hash,
+                                  redfs_resource** out_resource);
+REDFS_API redfs_status redfs_open_path(const redfs_depot* depot, const char* depot_path,
+                                       redfs_resource** out_resource);
+REDFS_API void         redfs_close(redfs_resource* resource);
+
+/* The root chunk's RED class -- "CMesh", "CBitmapTexture". "" when the file is
+ * not a CR2W document, which is the cheap way to ask what something is. */
+REDFS_API const char* redfs_resource_type(const redfs_resource* resource);
+
+/* The parsed document, or NULL for a non-CR2W file. Borrowed: it dies with the
+ * resource, and so does every redfs_value obtained through it. */
+REDFS_API const redfs_cr2w* redfs_resource_cr2w(const redfs_resource* resource);
+
+/* The main segment's bytes, borrowed. NUL-terminated one past `size`, as
+ * redfs_read's blobs are. */
+REDFS_API const uint8_t* redfs_resource_data(const redfs_resource* resource);
+REDFS_API uint64_t       redfs_resource_size(const redfs_resource* resource);
+REDFS_API uint64_t       redfs_resource_hash(const redfs_resource* resource);
+
+/* Attached buffers. `index` is 0..count-1 -- the SAME numbering as
+ * redfs_value.as.buffer, redfs_texture_desc.buffer_index and
+ * redfs_mesh_desc.render_buffer_index, so an index read out of a document can be
+ * passed straight here. REDFS_E_RANGE past the end, never a different segment.
+ *
+ * Allocates; release with redfs_blob_free. Reading the same buffer twice reads
+ * it twice -- the handle caches the document, not the payload. */
+REDFS_API uint32_t     redfs_resource_buffer_count(const redfs_resource* resource);
+REDFS_API redfs_status redfs_resource_buffer(const redfs_resource* resource, uint32_t index,
+                                             redfs_blob* out_blob);
 
 /* ------------------------------------------------------------------------- */
 /* textures                                                                   */

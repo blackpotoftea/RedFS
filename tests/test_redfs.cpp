@@ -1528,6 +1528,181 @@ TEST(audio, rejects_malformed_wem) {
 }
 
 // =============================================================================
+// resource handle
+// =============================================================================
+
+TEST(resource, owns_its_bytes_and_its_document) {
+    Cr2wBuilder cb;
+    cb.begin_chunk("CMesh");
+    cb.prop_u32("renderChunkCount", 7);
+    cb.end_chunk();
+
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\res\\thing.mesh");
+    ab.add(key, cb.build(), {{'B', 'U', 'F', '0'}, {'B', 'U', 'F', '1'}});
+
+    TempDepot d("resource.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_resource* r = nullptr;
+    CHECK_OK(redfs_open(d.depot, key, &r));
+    CHECK(r != nullptr);
+    if (!r) return;
+
+    // The type is the question redfs_read could not answer without the caller
+    // assembling a blob and a document by hand in the right order.
+    CHECK_STR(redfs_resource_type(r), "CMesh");
+    CHECK(redfs_resource_cr2w(r) != nullptr);
+    CHECK_EQ(redfs_resource_buffer_count(r), 2u);
+    CHECK_EQ(redfs_resource_hash(r), key);
+
+    // The document is usable through the handle, and its values point into bytes
+    // the handle owns -- which is the pairing this type exists to enforce.
+    redfs_value v{};
+    CHECK_OK(redfs_cr2w_get(redfs_resource_cr2w(r), 0, "renderChunkCount", &v));
+    CHECK_EQ(v.as.u, 7ull);
+
+    // The main segment is the DOCUMENT, not buffer 0. That is the whole point:
+    // redfs_read(..., 0, ...) on this file would have returned "BUF0".
+    CHECK(redfs_resource_size(r) > 4);
+    CHECK(std::memcmp(redfs_resource_data(r), "CR2W", 4) == 0);
+
+    redfs_close(r);
+}
+
+TEST(resource, buffer_index_is_bounds_checked_not_reinterpreted) {
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\res\\two_buffers.mesh");
+    Cr2wBuilder cb;
+    cb.begin_chunk("CMesh");
+    cb.prop_u32("x", 1);
+    cb.end_chunk();
+    ab.add(key, cb.build(), {{'A', 'A', 'A'}, {'B', 'B', 'B', 'B'}});
+
+    TempDepot d("resbuf.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_resource* r = nullptr;
+    CHECK_OK(redfs_open(d.depot, key, &r));
+    if (!r) return;
+
+    redfs_blob b{};
+    CHECK_OK(redfs_resource_buffer(r, 0, &b));
+    CHECK_EQ(b.size, 3ull);
+    CHECK(b.data && std::memcmp(b.data, "AAA", 3) == 0);
+    redfs_blob_free(&b);
+
+    CHECK_OK(redfs_resource_buffer(r, 1, &b));
+    CHECK_EQ(b.size, 4ull);
+    redfs_blob_free(&b);
+
+    // Past the end is REDFS_E_RANGE against the count on the handle, not
+    // arithmetic that could land on another file's segment.
+    CHECK_ERR(redfs_resource_buffer(r, 2, &b), REDFS_E_RANGE);
+    CHECK(b.data == nullptr);
+    CHECK_ERR(redfs_resource_buffer(r, 0xFFFFFFFFu, &b), REDFS_E_RANGE);
+    CHECK_ERR(redfs_resource_buffer(r, REDFS_PART_MAIN, &b), REDFS_E_RANGE);
+    CHECK_ERR(redfs_resource_buffer(r, REDFS_PART_ALL, &b), REDFS_E_RANGE);
+
+    redfs_close(r);
+}
+
+TEST(resource, a_file_with_no_document_still_opens) {
+    // .wem, .bnk and friends have no CR2W. Refusing them would make redfs_open
+    // useless for the cheapest question it should answer -- what is this? --
+    // so it opens, reports an empty type, and still hands over the bytes.
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\res\\sound.wem");
+    ab.add(key, {'R', 'I', 'F', 'F', 1, 2, 3, 4});
+
+    TempDepot d("resraw.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_resource* r = nullptr;
+    CHECK_OK(redfs_open(d.depot, key, &r));
+    if (!r) return;
+
+    CHECK_STR(redfs_resource_type(r), "");
+    CHECK(redfs_resource_cr2w(r) == nullptr);
+    CHECK_EQ(redfs_resource_buffer_count(r), 0u);
+    CHECK_EQ(redfs_resource_size(r), 8ull);
+    CHECK(std::memcmp(redfs_resource_data(r), "RIFF", 4) == 0);
+
+    redfs_close(r);
+}
+
+TEST(resource, missing_and_invalid_arguments) {
+    ArchiveBuilder ab;
+    ab.add(redfs_hash("base\\res\\present.bin"), {'x'});
+    TempDepot d("resmiss.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_resource* r = reinterpret_cast<redfs_resource*>(0x1);
+    CHECK_ERR(redfs_open(d.depot, redfs_hash("base\\res\\absent.bin"), &r), REDFS_E_NOT_FOUND);
+    CHECK(r == nullptr);  // cleared even on the failure path
+
+    CHECK_ERR(redfs_open(nullptr, 1, &r), REDFS_E_INVALID_ARG);
+    CHECK_ERR(redfs_open(d.depot, 1, nullptr), REDFS_E_INVALID_ARG);
+    CHECK_ERR(redfs_open_path(d.depot, nullptr, &r), REDFS_E_INVALID_ARG);
+
+    // Every accessor tolerates a null handle rather than crashing on it.
+    CHECK_STR(redfs_resource_type(nullptr), "");
+    CHECK(redfs_resource_cr2w(nullptr) == nullptr);
+    CHECK(redfs_resource_data(nullptr) == nullptr);
+    CHECK_EQ(redfs_resource_size(nullptr), 0ull);
+    CHECK_EQ(redfs_resource_buffer_count(nullptr), 0u);
+    redfs_close(nullptr);
+
+    // open_path agrees with open on the same file.
+    redfs_resource* a = nullptr;
+    redfs_resource* b = nullptr;
+    CHECK_OK(redfs_open_path(d.depot, "base\\res\\present.bin", &a));
+    CHECK_OK(redfs_open(d.depot, redfs_hash("base\\res\\present.bin"), &b));
+    if (a && b) CHECK_EQ(redfs_resource_hash(a), redfs_resource_hash(b));
+    redfs_close(a);
+    redfs_close(b);
+}
+
+TEST(resource, cpp_facade) {
+    Cr2wBuilder cb;
+    cb.begin_chunk("CBitmapTexture");
+    cb.prop_u32("w", 64);
+    cb.end_chunk();
+
+    ArchiveBuilder ab;
+    const uint64_t key = redfs_hash("base\\res\\tex.xbm");
+    ab.add(key, cb.build(), {{'P', 'I', 'X'}});
+
+    const std::string p = temp_path("resfacade.archive");
+    ArchiveBuilder::write(p, ab.build());
+
+    redfs_depot* h = nullptr;
+    redfs_depot_open_empty(&h);
+    if (h) {
+        CHECK_OK(redfs_depot_mount(h, p.c_str()));
+        redfs::Depot d{h};
+
+        auto res = d.resource("base\\res\\tex.xbm");
+        CHECK(res.has_value());
+        if (res) {
+            CHECK_STR(std::string(res->type()), "CBitmapTexture");
+            CHECK_EQ(res->buffer_count(), 1u);
+            CHECK_EQ(res->key(), key);
+            CHECK(res->cr2w() != nullptr);
+            CHECK(res->bytes().size() > 4);
+
+            auto buf = res->buffer(0);
+            CHECK(buf.has_value());
+            if (buf) CHECK_EQ(buf->size(), 3ull);
+            CHECK(!res->buffer(1).has_value());
+        }
+        // A file that is not there is nullopt, not a half-built handle.
+        CHECK(!d.resource("base\\res\\nope.xbm").has_value());
+    }
+    std::remove(p.c_str());
+}
+
+// =============================================================================
 // path dictionary
 // =============================================================================
 

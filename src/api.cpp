@@ -848,6 +848,107 @@ void redfs_blob_free(redfs_blob* blob) {
     *blob = redfs_blob{};
 }
 
+// --- resources ---------------------------------------------------------------
+//
+// Owns the main segment and the document parsed from it, which is the pairing
+// callers previously had to maintain by hand: a redfs_cr2w borrows the bytes it
+// was parsed from, so dropping the blob first leaves the document reading freed
+// memory. USAGE.md warned about that in prose; this makes it unrepresentable.
+//
+// `depot` and `hash` are kept so buffers can be fetched later. That means a
+// resource must not outlive its depot -- same rule as every other handle here,
+// and redfs_depot_close already documents it.
+
+struct redfs_resource {
+    const redfs_depot* depot = nullptr;
+    uint64_t hash = 0;
+    redfs_blob main{};
+    redfs_cr2w* cr2w = nullptr;  // null when the file is not a CR2W document
+    uint32_t buffer_count = 0;
+
+    ~redfs_resource() {
+        if (cr2w) redfs_cr2w_close(cr2w);
+        redfs_blob_free(&main);
+    }
+};
+
+static redfs_status open_resource_impl(const redfs_depot* depot, uint64_t hash,
+                                       redfs_resource** out) {
+    redfs_file_info info{};
+    const redfs_status st = redfs_stat(depot, hash, &info);
+    if (st != REDFS_OK) return st;
+
+    auto r = std::make_unique<redfs_resource>();
+    r->depot = depot;
+    r->hash = hash;
+    r->buffer_count = info.buffer_count;
+
+    const redfs_status read = redfs_read(depot, hash, REDFS_PART_MAIN, &r->main);
+    if (read != REDFS_OK) return read;
+
+    // A parse failure is NOT an error here. Plenty of files have no CR2W at all
+    // -- .wem, .bnk, .opuspak -- and refusing them would make redfs_open useless
+    // for exactly the question it should answer cheapest: what is this? The
+    // caller distinguishes by redfs_resource_type() returning "".
+    redfs_cr2w_open(r->main.data, r->main.size, &r->cr2w);
+
+    *out = r.release();
+    return REDFS_OK;
+}
+
+redfs_status redfs_open(const redfs_depot* depot, uint64_t hash, redfs_resource** out_resource) {
+    if (!depot || !out_resource) return REDFS_E_INVALID_ARG;
+    *out_resource = nullptr;
+    REDFS_GUARD(open_resource_impl(depot, hash, out_resource));
+}
+
+redfs_status redfs_open_path(const redfs_depot* depot, const char* depot_path,
+                             redfs_resource** out_resource) {
+    if (!depot || !depot_path || !out_resource) return REDFS_E_INVALID_ARG;
+    *out_resource = nullptr;
+    REDFS_GUARD(open_resource_impl(depot, redfs_hash(depot_path), out_resource));
+}
+
+void redfs_close(redfs_resource* resource) { delete resource; }
+
+const char* redfs_resource_type(const redfs_resource* resource) {
+    if (!resource || !resource->cr2w) return "";
+    return redfs_cr2w_root_type(resource->cr2w);
+}
+
+const redfs_cr2w* redfs_resource_cr2w(const redfs_resource* resource) {
+    return resource ? resource->cr2w : nullptr;
+}
+
+const uint8_t* redfs_resource_data(const redfs_resource* resource) {
+    return resource ? resource->main.data : nullptr;
+}
+
+uint64_t redfs_resource_size(const redfs_resource* resource) {
+    return resource ? resource->main.size : 0;
+}
+
+uint64_t redfs_resource_hash(const redfs_resource* resource) {
+    return resource ? resource->hash : 0;
+}
+
+uint32_t redfs_resource_buffer_count(const redfs_resource* resource) {
+    return resource ? resource->buffer_count : 0;
+}
+
+redfs_status redfs_resource_buffer(const redfs_resource* resource, uint32_t index,
+                                   redfs_blob* out_blob) {
+    if (!resource || !out_blob) return REDFS_E_INVALID_ARG;
+    *out_blob = redfs_blob{};
+    // Bounds-checked against the count on the handle rather than left to
+    // resolve_part's arithmetic, so an out-of-range index cannot land on some
+    // other file's segment and cannot be mistaken for the document.
+    if (index >= resource->buffer_count)
+        return fail(REDFS_E_RANGE, "buffer %u of a resource with %u buffers", index,
+                    resource->buffer_count);
+    return redfs_read(resource->depot, resource->hash, index, out_blob);
+}
+
 redfs_status redfs_read_async(const redfs_depot* depot, uint64_t hash, uint32_t part,
                               redfs_read_fn cb, void* user) {
     if (!depot || !cb) return REDFS_E_INVALID_ARG;
