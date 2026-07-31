@@ -265,9 +265,26 @@ int cmd_find(redfs_depot* d, const char* list_file, const char* pattern, uint32_
 // .mesh and .xbm essentially never are. For those, see the WolvenKit round-trip
 // in docs/verification.md.
 
+// The index SHA-1 also stops agreeing with the content above 512 MiB, and that
+// is the ARCHIVE being wrong rather than RedFS. Bracketed on a stock 2.31 + EP1
+// install: every single-segment file at or below 521,465,500 bytes matches, and
+// every one at or above 602,388,444 does not -- eight files, all raw-stored .bk2
+// video, the boundary falling exactly on 536,870,912.
+//
+// RedFS is provably right for those eight. They are stored uncompressed, so the
+// read is a memcpy with no Kraken involved, and WolvenKit's own extraction of
+// ep1\movies\fullscreen\stacked_planes_2halfk_v002.bk2 produces byte-identical
+// output to ours (both d56446df..., neither matching the index's 32331658...).
+// Two independent readers agreeing against the recorded hash means the hash is
+// the outlier -- presumably a fixed buffer in the cook-time hasher.
+//
+// So these are skipped, like multi-segment files, rather than reported as
+// failures. Reporting them would train whoever runs this to ignore red output.
+constexpr uint64_t kSha1MaxSize = 512ull * 1024 * 1024;
+
 struct Verifier {
     redfs_depot* depot;
-    uint32_t checked, matched, skipped_multi, read_failed, limit;
+    uint32_t checked, matched, skipped_multi, skipped_huge, read_failed, limit;
     uint64_t bytes;
 };
 
@@ -276,9 +293,14 @@ int verify_visit(uint64_t key, const char* path, void* user) {
 
     redfs_file_info info{};
     if (redfs_stat(v->depot, key, &info) != REDFS_OK) return 1;
+    const uint32_t seen = v->checked + v->skipped_multi + v->skipped_huge;
     if (info.buffer_count != 0) {
         ++v->skipped_multi;
-        return v->checked + v->skipped_multi < v->limit;
+        return seen + 1 < v->limit;
+    }
+    if (info.size > kSha1MaxSize) {
+        ++v->skipped_huge;
+        return seen + 1 < v->limit;
     }
 
     redfs_blob blob{};
@@ -286,7 +308,7 @@ int verify_visit(uint64_t key, const char* path, void* user) {
     if (st != REDFS_OK) {
         ++v->read_failed;
         std::printf("  READ  %-58.58s %s\n", path, redfs_status_string(st));
-        return v->checked + v->skipped_multi < v->limit;
+        return seen + 1 < v->limit;
     }
 
     ++v->checked;
@@ -302,7 +324,7 @@ int verify_visit(uint64_t key, const char* path, void* user) {
         std::printf("\n");
     }
     redfs_blob_free(&blob);
-    return v->checked + v->skipped_multi < v->limit;
+    return seen + 1 < v->limit;
 }
 
 int cmd_verify(redfs_depot* d, const char* list_file, const char* pattern, uint32_t limit) {
@@ -310,14 +332,14 @@ int cmd_verify(redfs_depot* d, const char* list_file, const char* pattern, uint3
     const redfs_status load = redfs_path_load(d, list_file, &kept);
     if (load != REDFS_OK) return die("path_load", load);
 
-    Verifier v{d, 0, 0, 0, 0, limit, 0};
+    Verifier v{d, 0, 0, 0, 0, 0, limit, 0};
     uint32_t total = 0;
     const auto t0 = Clock::now();
     const redfs_status st = redfs_find(d, pattern, verify_visit, &v, &total);
     if (st != REDFS_OK) return die("find", st);
     const double took = ms_since(t0);
 
-    const uint32_t examined = v.checked + v.skipped_multi;
+    const uint32_t examined = v.checked + v.skipped_multi + v.skipped_huge;
     std::printf("%u match \"%s\"\n", total, pattern);
     if (v.checked)
         std::printf("%u of %u matched the index SHA-1 (%.1f MB in %.1f s, %.0f MB/s)\n", v.matched,
@@ -334,8 +356,9 @@ int cmd_verify(redfs_depot* d, const char* list_file, const char* pattern, uint3
     std::printf("coverage: %u of %u examined were verifiable (%.1f%%)", v.checked, examined,
                 examined ? 100.0 * v.checked / examined : 0.0);
     if (v.skipped_multi)
-        std::printf("; %u skipped as multi-segment, where the index SHA-1 does not apply",
-                    v.skipped_multi);
+        std::printf("; %u multi-segment", v.skipped_multi);
+    if (v.skipped_huge) std::printf("; %u over 512 MiB, where the index SHA-1 is unreliable",
+                                    v.skipped_huge);
     std::printf("\n");
 
     if (!v.checked) {
@@ -347,9 +370,9 @@ int cmd_verify(redfs_depot* d, const char* list_file, const char* pattern, uint3
                     v.read_failed);
         return 1;
     }
-    if (v.skipped_multi) {
+    if (v.skipped_multi || v.skipped_huge) {
         std::printf("INCOMPLETE: everything checked passed, but %u of %u could not be checked\n",
-                    v.skipped_multi, examined);
+                    v.skipped_multi + v.skipped_huge, examined);
         return 2;
     }
     return 0;

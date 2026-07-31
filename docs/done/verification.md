@@ -169,8 +169,34 @@ For multi-segment files the index SHA-1 matches neither the main segment, nor
 every segment concatenated, nor buffer 0 — it covers something this reader cannot
 reconstruct, most likely the pre-cook source.
 
-**Coverage is part of the result, and the exit code says so.** Those files are
-skipped, and a run that skipped anything exits `2` (INCOMPLETE) rather than `0`.
+### The index SHA-1 is also wrong above 512 MiB
+
+Found by running this over all 133 extensions rather than the handful it was
+written for. Bracketed on a stock 2.31 + EP1 install, single-segment files only:
+
+| | |
+|---|---|
+| largest that matches | 521,465,500 B — `ep1\movies\misc\q303\cdp_concert_stacked_planes_v001.bk2` |
+| smallest that does not | 602,388,444 B — `ep1\movies\fullscreen\stacked_planes_2halfk_v002.bk2` |
+
+The boundary falls on **536,870,912 (512 MiB)**. Eight files exceed it, all
+raw-stored `.bk2` video, and all eight disagree with their recorded hash.
+
+**RedFS is right and the archive is wrong.** Those files are stored uncompressed,
+so the read is a `memcpy` with no Kraken anywhere near it, and WolvenKit's own
+extraction of `stacked_planes_2halfk_v002.bk2` is byte-identical to ours — both
+`d56446df…`, against the index's `32331658…`. Two independent readers agreeing
+against the recorded hash puts the hash in the minority; presumably a fixed
+buffer in CDPR's cook-time hasher.
+
+No prefix explains it either: SHA-1 of the first 1, 2, 4 … 512 MB of the content
+matches none of them, so it is not simple truncation.
+
+`verify` therefore skips over-512 MiB files rather than failing them. Reporting
+eight known-good files as red would train whoever runs it to ignore red.
+
+**Coverage is part of the result, and the exit code says so.** Skipped files —
+multi-segment or over 512 MiB — make the run exit `2` (INCOMPLETE) rather than `0`.
 That distinction is the whole value of the command: `verify "*.mesh"` examines
 200 files, can check 1, and passes it — reporting that as success would be a
 green light for having verified 0.5 % of what was asked. Narrow the pattern to

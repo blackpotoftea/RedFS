@@ -96,11 +96,29 @@ position from `kIndexHeaderSize` and the three counts instead.
 | `+0x18` | `u32` | `segments_end` — **exclusive** |
 | `+0x1C` | `u32` | `resource_deps_start` — index into the dependency table |
 | `+0x20` | `u32` | `resource_deps_end` — **exclusive** |
-| `+0x24` | `u8[20]` | `sha1` |
+| `+0x24` | `u8[20]` | `sha1` — see below |
 
 RedFS exposes `name_hash64`, `timestamp`, the segment range and `sha1`
 (`Archive::entry_*` in `internal.hpp`). It never reads the dependency range or
 `num_inline_buffer_segments`.
+
+### What `sha1` covers
+
+Measured, not documented anywhere — see `verification.md` oracle 7 for method.
+
+**For single-segment entries it is the SHA-1 of the decompressed content**, which
+makes it usable as an extraction oracle: 1,777 of 1,778 sampled across all 133
+extensions in the depot.
+
+Two exceptions, both established rather than assumed:
+
+- **Multi-segment entries.** It matches neither the main segment, nor every
+  segment concatenated, nor buffer 0 — 0 of 660 sampled. It covers something this
+  reader cannot reconstruct, most likely the pre-cook source.
+- **Content above 512 MiB (536,870,912).** Eight raw-stored `.bk2` files on a
+  stock 2.31 + EP1 install exceed it and none matches, while everything below
+  does. WolvenKit's extraction agrees with RedFS byte for byte on one of them, so
+  the recorded hash is the outlier, not either reader.
 
 `num_inline_buffer_segments` is the one entry field whose meaning is not
 established. WolvenKit names it that but its writer stores
