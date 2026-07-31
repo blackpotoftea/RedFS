@@ -8,11 +8,13 @@
  * Stable C ABI. Safe to consume from any compiler / language with C FFI.
  *
  * Threading: a redfs_depot is immutable once opened. redfs_read* / redfs_stat /
- * redfs_enumerate / redfs_texture_* / redfs_mesh_* are safe to call
- * concurrently from any number of threads. redfs_depot_mount /
- * redfs_depot_mount_dir / redfs_depot_close / redfs_shutdown / redfs_cache_* /
- * redfs_path_* are NOT (open first, then share) -- mounting rebuilds the depot
- * index in place, and a concurrent read walks it while it is being reallocated.
+ * redfs_enumerate / redfs_find / redfs_path_* / redfs_texture_* / redfs_mesh_*
+ * are safe to call concurrently from any number of threads -- the path
+ * dictionary carries its own lock, which is also what lets import learning run
+ * inside any read. redfs_depot_mount / redfs_depot_mount_dir /
+ * redfs_depot_close / redfs_shutdown / redfs_cache_* are NOT (open first, then
+ * share) -- mounting rebuilds the depot index in place, and a concurrent read
+ * walks it while it is being reallocated.
  *
  * An individual redfs_cr2w handle is SINGLE-THREADED: decoding a CString caches
  * it on the handle, so two threads calling redfs_cr2w_get on the same handle
@@ -60,7 +62,12 @@ typedef enum redfs_status {
     REDFS_E_OOM          = -6,
     REDFS_E_UNSUPPORTED  = -7,  /* known format, not implemented by this build */
     REDFS_E_RANGE        = -8,  /* index / destination buffer out of range */
-    REDFS_E_CANCELLED    = -9   /* async read dropped by shutdown or depot close */
+    REDFS_E_CANCELLED    = -9,  /* async read dropped by shutdown or depot close */
+    /* redfs_find with nothing in the path dictionary to search. Distinct from
+     * NOT_FOUND on purpose: that one means "no such file", and reusing it here
+     * would read as "nothing matched" -- the exact misreading this status
+     * exists to prevent. See redfs_path_load. */
+    REDFS_E_NO_DICTIONARY = -10
 } redfs_status;
 
 REDFS_API uint32_t    redfs_abi_version(void);
@@ -208,6 +215,57 @@ REDFS_API uint32_t     redfs_path_count(void);
  * for the lifetime of the process: later additions from any source cannot
  * invalidate a pointer you already hold. */
 REDFS_API const char* redfs_path_from_hash(uint64_t hash);
+
+/* ------------------------------------------------------------------------- */
+/* find                                                                       */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Files whose path matches a glob -- the way to answer "which of these are
+ * meshes?" without reading anything.
+ *
+ * `pattern` is matched against the NORMALISED path, so it is case-insensitive
+ * and '/' and '\' are the same separator: "Base/Characters/*.MESH" and
+ * "base\characters\*.mesh" behave identically. Two wildcards:
+ *
+ *   *   any run of characters, INCLUDING separators
+ *   ?   exactly one character, which MAY be a separator
+ *
+ * Both crossing separators is deliberate and differs from a shell glob. The
+ * common query is "every mesh anywhere", and under shell rules "*.mesh" would
+ * match nothing at all. Narrow with a prefix instead: "base\characters\*.mesh".
+ * A pattern ending in a separator means everything beneath it, so
+ * "base\characters\" is shorthand for "base\characters\*".
+ *
+ * With `depot` given, only files the depot INDEX HOLDS are reported. That is
+ * presence, not readability -- a read can still fail REDFS_E_OODLE or
+ * REDFS_E_CORRUPT. Pass NULL to search the dictionary unfiltered, which also
+ * reports paths learned from imports or redfs_path_add that no mounted archive
+ * holds at all.
+ *
+ * THIS SEARCHES THE DICTIONARY, NOT THE DEPOT. Archives carry no path table, so
+ * it can only find what redfs_path_load, redfs_path_add or import learning have
+ * taught it. The dictionary is PROCESS-GLOBAL while this filter is not, so
+ * searching one depot with a list loaded against another reports their
+ * intersection. With nothing in it at all you get REDFS_E_NO_DICTIONARY rather
+ * than an empty success, because "there was nothing to search" and "nothing
+ * matched" are different answers.
+ *
+ * out_matched, when given, receives the TOTAL number of matches -- not the
+ * number delivered. Returning 0 from `fn` stops delivery, not the search: the
+ * scan and its allocation have both completed before `fn` is called at all, so
+ * stopping early saves callback work and nothing else. Count deliveries
+ * yourself if you need them.
+ *
+ * The strings handed to `fn` are interned exactly as redfs_path_from_hash's are.
+ *
+ * `fn` is called with no lock held, so it may call back into RedFS -- including
+ * reads, which is the point. Paths those reads learn do not join a walk already
+ * in progress.
+ */
+typedef int (*redfs_find_fn)(uint64_t hash, const char* path, void* user);
+REDFS_API redfs_status redfs_find(const redfs_depot* depot, const char* pattern,
+                                  redfs_find_fn fn, void* user, uint32_t* out_matched);
 
 /* ------------------------------------------------------------------------- */
 /* lookup                                                                     */

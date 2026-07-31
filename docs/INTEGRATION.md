@@ -231,7 +231,8 @@ cmake --build build --target redfs_red4ext_plugin
 5. **`redfs_cache_open(depot, file)`** — optional, nearly free, and what makes
    `redfs_mesh_open` cheap on the second run.
 6. **`redfs_path_load(depot, list, &kept)`** — optional and *not* free; see
-   [cost](#cost). Only needed for `redfs_path_from_hash`.
+   [cost](#cost). Needed for `redfs_path_from_hash` and for `redfs_find`, which
+   searches the dictionary this fills and so matches nothing without it.
 7. **`redfs_cache_warm(depot, hashes, n, &computed)`** — optional. Requires a cache
    opened on *this* depot; without one it returns `REDFS_E_INVALID_ARG` rather than
    computing results it would immediately discard.
@@ -353,6 +354,7 @@ A depot is **immutable once open**, which is what the safe rows rest on.
 | | safe concurrently? |
 |---|---|
 | `redfs_read`, `redfs_read_into`, `redfs_part_size`, `redfs_stat`, `redfs_exists`, `redfs_enumerate` | yes |
+| `redfs_find`, `redfs_path_*` | yes — the dictionary is internally locked, and `redfs_find` delivers its matches after releasing it |
 | `redfs_texture_*`, `redfs_mesh_*`, `redfs_audio_*` | yes |
 | `redfs_read_async`, `redfs_drain`, `redfs_blob_free`, `redfs_set_log` | yes |
 | `redfs_cr2w_*` on **separate** handles | yes |
@@ -538,19 +540,35 @@ files):
 | `redfs_mesh_open`, cold | ~1–2 ms for a body mesh |
 | `redfs_mesh_open`, cached | ~0 ms |
 | `redfs_path_load`, full dictionary | ~135 MB transient, **~40 MB resident**, opt-in |
+| `redfs_find` over 544k entries | **~40–150 ms**, hardware-dependent; ~11 MB transient, all under the dictionary lock; roughly pattern-independent |
 
 The path dictionary is the only large optional cost, and its two figures are
 different things. `usedhashes.kark` is 3.4 MB on disk and decompresses to ~135 MB,
 held only for the duration of the call. What *stays* is the ~40 MB of paths that
 actually resolve in the mounted depot — 544,496 of 544,670 on a stock install — as
 interned strings in a never-freed arena plus a sorted 16-bytes-per-entry index. Load
-it only if you call `redfs_path_from_hash`.
+it only if you call `redfs_path_from_hash` or `redfs_find`.
 
 Only the loaded list is filtered against the depot: paths learned from CR2W import
 tables, and anything passed to `redfs_path_add`, are kept unfiltered, so a hit tells
 you what a file is *called*, not that it is readable. Import learning is also why
 reads stay concurrency-safe with the dictionary on — it runs inside every CR2W parse,
 and the dictionary is internally locked.
+
+That lock is what makes `redfs_find`'s cost worth knowing about in a game process:
+the scan holds it start to finish, because the callback must run *outside* it (a
+read from your callback parses a CR2W, which re-enters import learning on the same
+non-recursive mutex). So a full-dictionary search stalls any concurrent read that
+parses a CR2W for the whole scan.
+
+**Narrowing the pattern does not help.** Every entry is matched regardless of how
+specific the pattern is, so the cost is set by dictionary size, not by how many
+entries hit. Measured over a ~544k dictionary: `*` matching all of them, 149 ms;
+an exact single-file pattern matching one, 104 ms. About 30 %, not an order of
+magnitude. What actually bounds the stall is **doing the search once and keeping
+the result**, or running it off the frame thread.
+
+The figures above were taken on the reference machine against ~77-character paths.
 
 ---
 
@@ -561,6 +579,7 @@ and the dictionary is internally locked.
 | `redfs_depot_open` → `REDFS_E_NOT_FOUND` | auto-detect found no `archive\pc` within five levels above the exe, or the folder holds no archives | pass an explicit `game_dir` |
 | every compressed read → `REDFS_E_OODLE` | `oo2ext_7_win64.dll` not resolved | check `redfs_oodle_available()` at load and warn |
 | `REDFS_E_NOT_FOUND` on a path you expected | most invented paths do not exist | `redfs_exists` first, and fail loudly |
+| `redfs_find` → `REDFS_E_NO_DICTIONARY` | nothing loaded into the path dictionary, or the loaded list resolved no files in this depot | `redfs_path_load` first; check `redfs_path_count()` |
 | mesh bounds recomputed every run | cache discarded, or never written | read the log: wrong fingerprint, bad header, or `cannot write` |
 | callbacks arrive `REDFS_E_CANCELLED` | shutdown, or their depot was closed | expected; treat as "no result", not an error |
 | mod archives invisible in a tool | MO2's VFS exists only in processes MO2 launched | `redfs_depot_mount_dir` on the staging folder |

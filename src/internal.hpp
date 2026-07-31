@@ -353,6 +353,10 @@ void paths_learn_imports(const redfs_cr2w* f);
 // so the pointer never dangles and never has to be freed.
 const char* path_from_hash(uint64_t hash);
 uint32_t paths_count();
+// Dictionary entries matching `pattern`, optionally filtered to files `depot`
+// actually holds. Null depot means no filter.
+redfs_status paths_find(const redfs_depot* depot, const char* pattern, redfs_find_fn fn,
+                        void* user, uint32_t* out_matched);
 
 // --- blobs -------------------------------------------------------------------
 

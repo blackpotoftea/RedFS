@@ -32,6 +32,61 @@ the first exercise of three paths that only exist for the in-game case:
 Every claim RedFS makes about in-game behaviour rests on offline evidence. This is
 the item that replaces inference with observation.
 
+### `redfs_path_learn_all(depot)`
+**Cost dominated by one full sweep; unmeasured.** `redfs_find` can only match what
+the dictionary knows, and today that means shipping a path list. Walking every
+CR2W and harvesting its imports is the other way to fill it — but it decodes the
+main segment of every file in the depot, 544,670 of them on the reference install.
+
+So it is only worth having if it is paid **once**: cancellable, progress-reporting,
+off the calling thread, and persisted with the same archive-set fingerprint the
+mesh cache uses (`redfs_cache_open`), so a restart does not repeat it. Without the
+persistence it is a worse deal than shipping WolvenKit's list.
+
+**It cannot be complete, and that caps its value.** Import harvesting only ever
+learns a path some *other* file references, so every unreferenced root — the
+entry-point `.ent` files most of all — stays invisible no matter how thorough the
+sweep. For modded content specifically, LXRS footer parsing (below) is cheaper at
+~2 hours, reads no file contents at all, and gets the archive's own path list
+rather than an inferred one. **Do that first.** This item is for the case where
+neither a shipped list nor a footer covers what you need.
+
+### A resource handle that owns its bytes
+**~half a day.** `redfs_read(hash, part)` is the only way to reach a resource that
+has no typed helper — `.ent`, `.app`, `.rig`, `.anims` — and it makes the caller
+name a segment. `part` is a `uint32_t` overloading three meanings, and `0` is
+valid-but-wrong: it selects attached buffer 0 where most callers mean the document.
+Textures, meshes and audio are unaffected; they already have one-call paths that
+take no part number.
+
+Be exact about how `0` fails, because it splits by file shape (`resolve_part`,
+`src/archive.cpp:252-264`, computes `seg = start + 1 + part`):
+
+- **Single-segment files — including the `.ent`/`.app`/`.rig` above — return
+  `REDFS_E_RANGE`.** They fail loudly. The reported incident bears this out: 288,302
+  of 662,485 reads came back "out of range".
+- **Files WITH attached buffers return buffer 0's raw payload and `REDFS_OK`.**
+  That is the silent case, and it is what `cr2w_open` then reports as corrupt data
+  — 209,228 of the same run.
+
+So the argument for the handle is not "it always fails silently"; it is that one
+integer produces two unrelated failures, neither naming the real cause.
+
+`redfs_open` / `redfs_resource_type` / `redfs_resource_buffer(i)` removes the
+argument rather than renaming it, and folds in the blob/CR2W lifetime pairing that
+`USAGE.md` currently warns about in prose. `Depot::open_resource` in `redfs.hpp` is
+the same shape already, minus the ownership.
+
+Renumbering `part` so 0 means the main segment was considered and **rejected** —
+but not for being a silent ABI break. `REDFS_ABI_VERSION` exists for exactly this
+("the meaning of a call", `redfs.h:44`) and `abi_ok()` makes a mismatch a hard
+refusal, so it would be the loudest break available. The real objection is that it
+desynchronises `part` from the three public 0-based buffer fields
+(`redfs_value.as.buffer`, `redfs_texture_desc.buffer_index`,
+`redfs_mesh_desc.render_buffer_index`): shift those too and that is three more
+silent breaks, leave them and the two numbering schemes move out of a comment and
+into the structs.
+
 ### LXRS footer parsing
 **~2 hours.** WolvenKit-built archives carry a `custom_data` block listing their
 own file paths. Parsing it seeds the path dictionary for **modded** content

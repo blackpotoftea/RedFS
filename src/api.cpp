@@ -544,6 +544,7 @@ const char* redfs_status_string(redfs_status status) {
         case REDFS_E_UNSUPPORTED: return "unsupported";
         case REDFS_E_RANGE: return "out of range";
         case REDFS_E_CANCELLED: return "cancelled by shutdown";
+        case REDFS_E_NO_DICTIONARY: return "no path dictionary loaded";
     }
     return "unknown";
 }
@@ -761,6 +762,18 @@ const char* redfs_path_from_hash(uint64_t hash) {
     } catch (...) {
         return nullptr;
     }
+}
+
+// --- find --------------------------------------------------------------------
+
+// Guarded: the match set is accumulated in a vector sized by how many entries
+// the pattern happens to hit, which for "*" is the whole dictionary.
+//
+// A null depot is meaningful here -- "do not filter" -- unlike redfs_path_load,
+// where it would defeat the call. paths_find validates the rest.
+redfs_status redfs_find(const redfs_depot* depot, const char* pattern, redfs_find_fn fn,
+                        void* user, uint32_t* out_matched) {
+    REDFS_GUARD(paths_find(depot, pattern, fn, user, out_matched));
 }
 
 // --- lookup ------------------------------------------------------------------

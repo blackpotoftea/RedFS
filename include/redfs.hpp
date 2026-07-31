@@ -161,12 +161,17 @@ public:
         // remove_reference_t: with a forwarding reference and an lvalue callable
         // Fn deduces to L&, and `L&*` is not a type -- MSVC C2528. Without it,
         // an inline lambda compiles and a named one does not.
+        //
+        // remove_cv_t on top of that: a CONST named callable (or a const
+        // std::function) deduces Fn to `const L&`, making `&fn` a `const L*`
+        // that will not convert to the void* the C ABI takes. Same symptom --
+        // inline compiles, named does not -- one step further along.
+        using Callable = std::remove_cv_t<std::remove_reference_t<Fn>>;
         auto trampoline = [](const char* name, const Value* v, void* user) -> int {
-            return (*static_cast<std::remove_reference_t<Fn>*>(user))(std::string_view{name}, *v)
-                       ? 1
-                       : 0;
+            return (*static_cast<Callable*>(user))(std::string_view{name}, *v) ? 1 : 0;
         };
-        redfs_cr2w_walk(h_, chunk, prop_path, trampoline, &fn);
+        redfs_cr2w_walk(h_, chunk, prop_path, trampoline,
+                        const_cast<void*>(static_cast<const void*>(&fn)));
     }
 
     redfs_cr2w* handle() const { return h_; }
@@ -295,6 +300,88 @@ public:
         return read(hash(path), part);
     }
 
+    /// One entry per file whose path matches `pattern`. Reads nothing.
+    ///
+    /// nullopt on failure rather than an empty vector, so "nothing was ever
+    /// loaded" (REDFS_E_NO_DICTIONARY) and "nothing matched" stay
+    /// distinguishable. last_error() says which -- except the null-handle case
+    /// below, which never reaches the DLL.
+    ///
+    /// The views borrow nothing you own -- redfs.h interns dictionary strings for
+    /// the life of the process -- so the vector is safe to keep and to outlive
+    /// this Depot.
+    struct Match {
+        uint64_t key;
+        std::string_view path;
+    };
+    std::optional<std::vector<Match>> find(std::string_view pattern) const {
+        // A null handle would reach redfs_find as "no depot", which is a real
+        // mode meaning "search unfiltered" -- so a moved-from or default Depot
+        // would silently widen the query instead of failing like every other
+        // method here does. find_unfiltered below is how you ask for it.
+        if (!h_) return std::nullopt;
+        return collect_in(h_, pattern);
+    }
+
+    /// Callback form, for when you do not want the vector materialised on your
+    /// side. `fn` returns false to stop DELIVERY -- the search itself has already
+    /// finished, see redfs.h -- and the result is the total match count, which is
+    /// what it would have been either way. nullopt on failure.
+    template <typename Fn>
+    std::optional<uint32_t> find(std::string_view pattern, Fn&& fn) const {
+        if (!h_) return std::nullopt;  // see the overload above
+        return find_in(h_, pattern, std::forward<Fn>(fn));
+    }
+
+    /// Search the dictionary WITHOUT filtering to this depot -- the C API's
+    /// null-depot mode. Reports paths learned from CR2W imports or added by hand
+    /// that no mounted archive holds, which is how you see what a mod calls
+    /// things before deciding whether to mount it.
+    ///
+    /// Static because it needs no depot; the filtered overloads above refuse a
+    /// null handle rather than silently widening into this.
+    static std::optional<std::vector<Match>> find_unfiltered(std::string_view pattern) {
+        return collect_in(nullptr, pattern);
+    }
+
+    template <typename Fn>
+    static std::optional<uint32_t> find_unfiltered(std::string_view pattern, Fn&& fn) {
+        return find_in(nullptr, pattern, std::forward<Fn>(fn));
+    }
+
+private:
+    /// Shared body of the collecting searches; `depot` null means unfiltered.
+    static std::optional<std::vector<Match>> collect_in(const redfs_depot* depot,
+                                                        std::string_view pattern) {
+        const std::string pat{pattern};
+        std::vector<Match> out;
+        auto sink = [](uint64_t key, const char* path, void* user) -> int {
+            static_cast<std::vector<Match>*>(user)->push_back({key, std::string_view{path}});
+            return 1;
+        };
+        if (redfs_find(depot, pat.c_str(), sink, &out, nullptr) != REDFS_OK) return std::nullopt;
+        return out;
+    }
+
+    /// Shared body of the callback-form searches. See Cr2w::walk for why
+    /// remove_cv_t/remove_reference_t and the const_cast are all required.
+    template <typename Fn>
+    static std::optional<uint32_t> find_in(const redfs_depot* depot, std::string_view pattern,
+                                           Fn&& fn) {
+        const std::string pat{pattern};
+        using Callable = std::remove_cv_t<std::remove_reference_t<Fn>>;
+        auto trampoline = [](uint64_t key, const char* path, void* user) -> int {
+            return (*static_cast<Callable*>(user))(key, std::string_view{path}) ? 1 : 0;
+        };
+        uint32_t matched = 0;
+        if (redfs_find(depot, pat.c_str(), trampoline,
+                       const_cast<void*>(static_cast<const void*>(&fn)), &matched) != REDFS_OK)
+            return std::nullopt;
+        return matched;
+    }
+
+public:
+
     std::optional<Blob> read_main(std::string_view path) const {
         return read(hash(path), REDFS_PART_MAIN);
     }
@@ -398,11 +485,13 @@ public:
     /// `fn` returns false to stop early.
     template <typename Fn>
     void for_each(Fn&& fn) const {
-        // See Cr2w::walk for why remove_reference_t is required here.
+        // See Cr2w::walk for why remove_reference_t and the const_cast are both
+        // required here.
+        using Callable = std::remove_cv_t<std::remove_reference_t<Fn>>;
         auto trampoline = [](const FileInfo* info, void* user) -> int {
-            return (*static_cast<std::remove_reference_t<Fn>*>(user))(*info) ? 1 : 0;
+            return (*static_cast<Callable*>(user))(*info) ? 1 : 0;
         };
-        redfs_enumerate(h_, trampoline, &fn);
+        redfs_enumerate(h_, trampoline, const_cast<void*>(static_cast<const void*>(&fn)));
     }
 
     // --- async ---------------------------------------------------------------

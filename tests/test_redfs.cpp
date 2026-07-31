@@ -8,8 +8,10 @@
 #include "framework.hpp"
 #include "fixtures.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <chrono>
 #include <thread>
@@ -53,6 +55,10 @@ struct TempDepot {
 };
 
 }  // namespace
+
+// redfs_find's empty-dictionary contract cannot be tested here: the dictionary
+// is a never-destroyed global, and under _DEBUG this binary runs the whole suite
+// three times. See lifecycle_test.cpp's virgin-dictionary scenario.
 
 // =============================================================================
 // hashing
@@ -1552,6 +1558,541 @@ TEST(paths, reverse_lookup) {
     CHECK(redfs_path_from_hash(redfs_hash("base\\test\\absent.mesh")) == nullptr);
     CHECK(redfs_path_from_hash(0xFFFFFFFFFFFFFFFFull) == nullptr);
 
+    std::remove(list.c_str());
+}
+
+// =============================================================================
+// find
+// =============================================================================
+//
+// The dictionary is process-global and every case in this file adds to it, so
+// each test below anchors its pattern on a prefix of its own. That is also what
+// keeps them order-independent.
+
+namespace {
+
+struct Hits {
+    std::vector<std::string> paths;
+    std::vector<uint64_t> keys;
+    uint32_t stop_after = 0;  // 0 = never stop
+};
+
+int collect(uint64_t hash, const char* path, void* user) {
+    auto* h = static_cast<Hits*>(user);
+    h->paths.push_back(path);
+    h->keys.push_back(hash);
+    return h->stop_after && h->paths.size() >= h->stop_after ? 0 : 1;
+}
+
+// Sorted, because the dictionary walks in hash order and nothing about the
+// result set should depend on that.
+std::vector<std::string> find_sorted(const redfs_depot* depot, const char* pattern) {
+    Hits h;
+    redfs_find(depot, pattern, collect, &h, nullptr);
+    std::sort(h.paths.begin(), h.paths.end());
+    return h.paths;
+}
+
+}  // namespace
+
+TEST(find, literal_star_in_an_entry) {
+    // Entries can hold a literal '*' -- sanitize_path strips neither wildcard --
+    // and matching one against a '*' in the pattern is what breaks if
+    // glob_match's branch order is reversed. See src/paths.cpp.
+    redfs_path_enable();
+    redfs_path_add("base\\globstar\\*weird.mesh");
+    redfs_path_add("base\\globstar\\a*b\\thing.mesh");
+
+    CHECK_EQ(find_sorted(nullptr, "base\\globstar\\*").size(), 2u);
+    CHECK_EQ(find_sorted(nullptr, "base\\globstar\\*weird.mesh").size(), 1u);
+    CHECK_EQ(find_sorted(nullptr, "base\\globstar\\*.mesh").size(), 2u);
+    CHECK_EQ(find_sorted(nullptr, "base\\globstar\\a*b\\*").size(), 1u);
+    // The minimal reported form, anchored so other cases cannot contribute.
+    CHECK_EQ(find_sorted(nullptr, "base\\globstar\\*d.mesh").size(), 1u);
+}
+
+TEST(find, wildcards) {
+    redfs_path_enable();
+    redfs_path_add("base\\globtest\\a\\one.mesh");
+    redfs_path_add("base\\globtest\\a\\two.mesh");
+    redfs_path_add("base\\globtest\\b\\deep\\three.mesh");
+    redfs_path_add("base\\globtest\\a\\one.xbm");
+    // Lengths 2 and 4 under a\, so a '?' count actually discriminates -- with
+    // only 3-character names present, "???" and "*" returned the same 2 and the
+    // assertion below held for an implementation where '?' behaved as '*'.
+    redfs_path_add("base\\globtest\\a\\ab.mesh");
+    redfs_path_add("base\\globtest\\a\\abcd.mesh");
+
+    // '*' crosses separators -- the documented departure from shell globbing,
+    // and the reason "every mesh anywhere" is expressible at all.
+    const auto meshes = find_sorted(nullptr, "base\\globtest\\*.mesh");
+    CHECK_EQ(meshes.size(), 5u);
+    if (meshes.size() == 5) {
+        CHECK_STR(meshes[0], "base\\globtest\\a\\ab.mesh");
+        CHECK_STR(meshes[1], "base\\globtest\\a\\abcd.mesh");
+        CHECK_STR(meshes[2], "base\\globtest\\a\\one.mesh");
+        CHECK_STR(meshes[3], "base\\globtest\\a\\two.mesh");
+        // The one under a deeper directory: this is what proves '*' spans them.
+        CHECK_STR(meshes[4], "base\\globtest\\b\\deep\\three.mesh");
+    }
+
+    // A prefix narrows it back down: one, two, ab, abcd.
+    CHECK_EQ(find_sorted(nullptr, "base\\globtest\\a\\*.mesh").size(), 4u);
+
+    // '?' is exactly one character, so the count discriminates by name length.
+    CHECK_EQ(find_sorted(nullptr, "base\\globtest\\a\\??.mesh").size(), 1u);    // ab
+    CHECK_EQ(find_sorted(nullptr, "base\\globtest\\a\\???.mesh").size(), 2u);   // one, two
+    CHECK_EQ(find_sorted(nullptr, "base\\globtest\\a\\????.mesh").size(), 1u);  // abcd
+
+    // '?' matches a separator too -- the header says so, so pin it.
+    CHECK_EQ(find_sorted(nullptr, "base\\globtest\\b?deep\\three.mesh").size(), 1u);
+
+    // A trailing separator means everything beneath, not an exact directory match.
+    CHECK_EQ(find_sorted(nullptr, "base\\globtest\\a\\").size(), 5u);
+    CHECK_EQ(find_sorted(nullptr, "base/globtest/").size(), 6u);
+
+    // ...and it has to survive whatever follows the separator: sanitize_path
+    // trims quotes, spaces, CR and LF, and tab is trimmed by paths_find alone.
+    // Get that order wrong and each of these degrades to an exact match on a
+    // directory name -- a silent 0 with REDFS_OK.
+    CHECK_EQ(find_sorted(nullptr, "base\\globtest\\a\\ ").size(), 5u);      // space
+    CHECK_EQ(find_sorted(nullptr, "base\\globtest\\a\\\t").size(), 5u);     // tab
+    CHECK_EQ(find_sorted(nullptr, "base\\globtest\\a\\\r\n").size(), 5u);   // CRLF, e.g. from a file
+    CHECK_EQ(find_sorted(nullptr, "\"base\\globtest\\a\\\"").size(), 5u);   // quoted
+    CHECK_EQ(find_sorted(nullptr, "  base/globtest/a/  ").size(), 5u);      // both ends
+
+    // Separators only means everything.
+    const size_t all = find_sorted(nullptr, "*").size();
+    CHECK(all > 0);
+    CHECK_EQ(find_sorted(nullptr, "\\").size(), all);
+    CHECK_EQ(find_sorted(nullptr, "/").size(), all);
+    // But genuinely empty is still an error.
+    CHECK_ERR(redfs_find(nullptr, "   ", collect, nullptr, nullptr), REDFS_E_INVALID_ARG);
+
+    // A pattern with no wildcard is an exact match, not a substring.
+    CHECK_EQ(find_sorted(nullptr, "base\\globtest\\a\\one.mesh").size(), 1u);
+    CHECK_EQ(find_sorted(nullptr, "globtest").size(), 0u);
+
+    // Anchoring is real at both ends: no implicit leading or trailing '*'.
+    CHECK_EQ(find_sorted(nullptr, "globtest\\*.mesh").size(), 0u);
+    CHECK_EQ(find_sorted(nullptr, "base\\globtest\\*.me").size(), 0u);
+}
+
+TEST(find, pattern_is_normalised_like_a_path) {
+    redfs_path_enable();
+    redfs_path_add("base\\globcase\\Mixed\\Thing.MESH");
+
+    // The entry was canonicalised on the way in, so a pattern typed in the
+    // original casing with forward slashes has to find it -- otherwise a path
+    // pasted out of WolvenKit would silently match nothing.
+    CHECK_EQ(find_sorted(nullptr, "Base/GlobCase/*.MESH").size(), 1u);
+    CHECK_EQ(find_sorted(nullptr, "base\\globcase\\*.mesh").size(), 1u);
+    // Leading separators and stray quotes are trimmed, exactly as redfs_hash does.
+    CHECK_EQ(find_sorted(nullptr, "\"/base/globcase/*.mesh\"").size(), 1u);
+
+    CHECK_ERR(redfs_find(nullptr, "", collect, nullptr, nullptr), REDFS_E_INVALID_ARG);
+    CHECK_ERR(redfs_find(nullptr, nullptr, collect, nullptr, nullptr), REDFS_E_INVALID_ARG);
+    CHECK_ERR(redfs_find(nullptr, "*", nullptr, nullptr, nullptr), REDFS_E_INVALID_ARG);
+}
+
+TEST(find, depot_filters_out_what_is_not_mounted) {
+    ArchiveBuilder ab;
+    const char* present = "base\\globdepot\\here.mesh";
+    ab.add(redfs_hash(present), {'m'});
+
+    TempDepot d("globdepot.archive", ab.build());
+    if (!d.depot) return;
+
+    // Both land in the dictionary; only one is in the depot. paths_add is not
+    // filtered at insert -- redfs.h says a hit means "this is what the file is
+    // called", not "this file is readable" -- so redfs_find has to filter.
+    redfs_path_enable();
+    redfs_path_add(present);
+    redfs_path_add("base\\globdepot\\absent.mesh");
+
+    const auto filtered = find_sorted(d.depot, "base\\globdepot\\*.mesh");
+    CHECK_EQ(filtered.size(), 1u);
+    if (filtered.size() == 1) CHECK_STR(filtered[0], present);
+
+    // A null depot means no filter, and reports both.
+    CHECK_EQ(find_sorted(nullptr, "base\\globdepot\\*.mesh").size(), 2u);
+
+    // Every hash handed back must be the one that opens the file.
+    Hits h;
+    CHECK_OK(redfs_find(d.depot, "base\\globdepot\\*.mesh", collect, &h, nullptr));
+    CHECK_EQ(h.keys.size(), 1u);
+    if (h.keys.size() == 1) {
+        CHECK_EQ(h.keys[0], redfs_hash(present));
+        CHECK_EQ(redfs_exists(d.depot, h.keys[0]), 1);
+    }
+}
+
+TEST(find, callback_can_stop_early) {
+    redfs_path_enable();
+    for (int i = 0; i < 8; ++i) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "base\\globstop\\f%d.mesh", i);
+        redfs_path_add(buf);
+    }
+
+    Hits h;
+    h.stop_after = 3;
+    uint32_t matched = 0;
+    CHECK_OK(redfs_find(nullptr, "base\\globstop\\*.mesh", collect, &h, &matched));
+    CHECK_EQ(h.paths.size(), 3u);
+    // out_matched is the TOTAL, not the number delivered: the scan finishes
+    // before the first callback, so stopping early cannot change it.
+    CHECK_EQ(matched, 8u);
+
+    h = Hits{};
+    CHECK_OK(redfs_find(nullptr, "base\\globstop\\*.mesh", collect, &h, &matched));
+    CHECK_EQ(matched, 8u);
+    CHECK_EQ(h.paths.size(), 8u);
+}
+
+TEST(find, a_loaded_dictionary_that_matches_nothing_is_a_success) {
+    // The other half of find/empty_dictionary_is_not_an_empty_result: once
+    // anything IS loaded, a pattern hitting nothing is a plain REDFS_OK with a
+    // count of zero. Only "you never loaded a list" is an error.
+    redfs_path_enable();
+    redfs_path_add("base\\globnone\\x.mesh");
+
+    uint32_t matched = 123;
+    CHECK_OK(redfs_find(nullptr, "base\\globnone\\nothing*.xbm", collect, nullptr, &matched));
+    CHECK_EQ(matched, 0u);
+}
+
+TEST(find, callback_may_read_and_learn_more_paths) {
+    // The documented use is "find files, then read them". A read parses a CR2W,
+    // which calls paths_learn_imports, which takes the dictionary mutex -- so
+    // dispatching matches while still holding it deadlocks the first caller who
+    // uses the API for its purpose. This test hangs rather than fails if the
+    // callback is ever moved back inside the lock.
+    Cr2wBuilder cb;
+    cb.import("base\\globread\\learned.mt", "IMaterial");
+    cb.begin_chunk("CMesh");
+    cb.prop_u32("x", 1);
+    cb.end_chunk();
+
+    ArchiveBuilder ab;
+    const char* doc = "base\\globread\\doc.mesh";
+    ab.add(redfs_hash(doc), cb.build());
+
+    TempDepot d("globread.archive", ab.build());
+    if (!d.depot) return;
+
+    redfs_path_enable();
+    redfs_path_add(doc);
+
+    struct Ctx {
+        redfs_depot* depot;
+        uint32_t read_ok;
+    } ctx{d.depot, 0};
+
+    CHECK_OK(redfs_find(
+        d.depot, "base\\globread\\*.mesh",
+        [](uint64_t hash, const char*, void* user) -> int {
+            auto* c = static_cast<Ctx*>(user);
+            redfs_blob blob{};
+            if (redfs_read(c->depot, hash, REDFS_PART_MAIN, &blob) == REDFS_OK) {
+                redfs_cr2w* f = nullptr;
+                // Parsing is what learns the imports and re-enters the lock.
+                if (redfs_cr2w_open(blob.data, blob.size, &f) == REDFS_OK) {
+                    ++c->read_ok;
+                    redfs_cr2w_close(f);
+                }
+                redfs_blob_free(&blob);
+            }
+            return 1;
+        },
+        &ctx, nullptr));
+
+    CHECK_EQ(ctx.read_ok, 1u);
+    // And the path the read learned is now findable itself.
+    CHECK_EQ(find_sorted(nullptr, "base\\globread\\learned.mt").size(), 1u);
+}
+
+TEST(find, pathological_inputs_terminate) {
+    // Backtracking globs are the classic blow-up shape. Two facts about it:
+    //
+    //   - A regression to the RECURSIVE form is a HANG, not a stack overflow.
+    //     Measured against a naive recursive matcher on these inputs: the
+    //     positive case completes in 8,021 calls at depth 4,221 -- well inside
+    //     MSVC's 1 MiB -- while the negative case exceeded 200,000,000 calls
+    //     without finishing. So ASan catches nothing here; the failure mode is
+    //     the suite never returning.
+    //   - Pattern length alone is not the cost driver. Measured: 2-character and
+    //     200,000-character all-star patterns both cost 103 iterations against a
+    //     real 94-char path, because the matcher only ever tracks the most recent
+    //     star. The bound is O(min(|pattern|,|entry|) x |entry|), which is why
+    //     add_locked bounds the ENTRY.
+    //
+    // The expensive shape is "*" + a long literal run + a character the entry
+    // cannot supply, and it needs the run in the ENTRY. 900 characters keeps it
+    // under add_locked's 1024 limit while still costing ~800k advances.
+    redfs_path_enable();
+    const std::string run(900, 'a');
+    redfs_path_add(("base\\globevil\\" + run + ".mesh").c_str());
+
+    std::string evil = "base\\globevil\\";
+    for (int i = 0; i < 200; ++i) evil += "*a";
+    CHECK_EQ(find_sorted(nullptr, (evil + "*.mesh").c_str()).size(), 1u);
+    // Ending in a character the entry cannot supply: the match must fail after
+    // exhausting the backtracks rather than running away.
+    CHECK_EQ(find_sorted(nullptr, (evil + "*z.mesh").c_str()).size(), 0u);
+    // The quadratic shape itself, both ways.
+    CHECK_EQ(find_sorted(nullptr, ("base\\globevil\\*" + run + ".mesh").c_str()).size(), 1u);
+    CHECK_EQ(find_sorted(nullptr, ("base\\globevil\\*" + run + "z.mesh").c_str()).size(), 0u);
+}
+
+TEST(find, an_absurdly_long_path_is_refused_not_interned) {
+    // The dictionary is process-global, so one 100k-character entry would tax
+    // every later redfs_find for the life of the process.
+    //
+    // Each half uses its OWN prefix: under _DEBUG the runner executes every case
+    // three times in one process, so a case that asserts against a dictionary
+    // its own earlier run populated passes on pass one and fails on pass two.
+    redfs_path_enable();
+
+    const std::string huge = "base\\globlong\\huge\\" + std::string(100000, 'a') + ".mesh";
+    redfs_path_add(huge.c_str());
+    CHECK_EQ(find_sorted(nullptr, "base\\globlong\\huge\\*").size(), 0u);
+
+    // Just inside the limit still lands.
+    const std::string ok = "base\\globlong\\ok\\" + std::string(900, 'b') + ".mesh";
+    redfs_path_add(ok.c_str());
+    CHECK_EQ(find_sorted(nullptr, "base\\globlong\\ok\\*").size(), 1u);
+}
+
+TEST(find, cpp_facade_both_overloads) {
+    // Instantiates the templated overload with a NAMED callable, which is the
+    // shape that trips MSVC C2528 if the trampoline forgets remove_reference_t
+    // -- an inline lambda compiles either way, so only this catches it.
+    ArchiveBuilder ab;
+    const char* one = "base\\globfacade\\one.mesh";
+    const char* two = "base\\globfacade\\two.mesh";
+    ab.add(redfs_hash(one), {'1'});
+    ab.add(redfs_hash(two), {'2'});
+
+    const std::string p = temp_path("globfacade.archive");
+    ArchiveBuilder::write(p, ab.build());
+
+    redfs_depot* h = nullptr;
+    redfs_depot_open_empty(&h);
+    if (h) {
+        CHECK_OK(redfs_depot_mount(h, p.c_str()));
+        redfs::Depot d{h};  // takes ownership; ~Depot closes it
+
+        redfs_path_enable();
+        redfs_path_add(one);
+        redfs_path_add(two);
+
+        const auto all = d.find("base\\globfacade\\*.mesh");
+        CHECK(all.has_value());
+        if (all) CHECK_EQ(all->size(), 2u);
+
+        int seen = 0;
+        auto count = [&seen](uint64_t, std::string_view) {
+            ++seen;
+            return true;
+        };
+        const auto n = d.find("base\\globfacade\\*.mesh", count);
+        CHECK(n.has_value());
+        if (n) CHECK_EQ(*n, 2u);
+        CHECK_EQ(seen, 2);
+
+        // Returning false stops DELIVERY; the count is the total either way.
+        auto stop_at_once = [](uint64_t, std::string_view) { return false; };
+        const auto stopped = d.find("base\\globfacade\\*.mesh", stop_at_once);
+        CHECK(stopped.has_value());
+        if (stopped) CHECK_EQ(*stopped, 2u);
+
+        // A std::string works without .c_str() now, and a failure is nullopt
+        // rather than an empty vector that looks like "nothing matched".
+        const std::string built = "base\\globfacade\\*.mesh";
+        CHECK(d.find(built).has_value());
+        CHECK(!d.find("").has_value());
+    }
+
+    // A moved-from Depot must not silently widen the query: a null handle is a
+    // real mode in the C API ("search unfiltered"), so passing it through would
+    // return MORE than the caller asked for rather than failing.
+    redfs::Depot empty;
+    CHECK(!empty.find("base\\globfacade\\*.mesh").has_value());
+    auto never = [](uint64_t, std::string_view) { return true; };
+    CHECK(!empty.find("base\\globfacade\\*.mesh", never).has_value());
+
+    // That mode is still reachable, just not by accident. Both entries are in
+    // the dictionary whether or not any depot holds them.
+    const auto unfiltered = redfs::Depot::find_unfiltered("base\\globfacade\\*.mesh");
+    CHECK(unfiltered.has_value());
+    if (unfiltered) CHECK_EQ(unfiltered->size(), 2u);
+
+    int seen_unfiltered = 0;
+    auto tally = [&seen_unfiltered](uint64_t, std::string_view) {
+        ++seen_unfiltered;
+        return true;
+    };
+    CHECK(redfs::Depot::find_unfiltered("base\\globfacade\\*.mesh", tally).has_value());
+    CHECK_EQ(seen_unfiltered, 2);
+
+    // A CONST callable: `&fn` is a `const L*`, which will not convert to the
+    // void* the C ABI takes without the const_cast in find_in. An inline lambda
+    // compiles without it, so only a const named one catches its removal.
+    const auto const_counter = [](uint64_t, std::string_view) { return true; };
+    CHECK(redfs::Depot::find_unfiltered("base\\globfacade\\*.mesh", const_counter).has_value());
+    const std::function<bool(uint64_t, std::string_view)> const_fn = const_counter;
+    CHECK(redfs::Depot::find_unfiltered("base\\globfacade\\*.mesh", const_fn).has_value());
+    std::remove(p.c_str());
+}
+
+// --- KARK path lists ---------------------------------------------------------
+//
+// These bound the header BEFORE Oodle is consulted, so they run on a machine
+// with no oo2ext_7_win64.dll -- which is what makes them worth having, since
+// nothing else in the suite covers read_list's compressed branch at all.
+
+namespace {
+
+// A KARK header claiming `declared` decompressed bytes over `payload_len` bytes
+// of (garbage) compressed data. Never decodes; every case here is rejected, or
+// expected to reach Oodle and fail there, before the payload is looked at.
+std::string write_kark(const char* name, uint32_t declared, size_t payload_len) {
+    const std::string path = temp_path(name);
+    FILE* f = std::fopen(path.c_str(), "wb");
+    const uint8_t header[8] = {'K',
+                               'A',
+                               'R',
+                               'K',
+                               static_cast<uint8_t>(declared),
+                               static_cast<uint8_t>(declared >> 8),
+                               static_cast<uint8_t>(declared >> 16),
+                               static_cast<uint8_t>(declared >> 24)};
+    std::fwrite(header, 1, sizeof header, f);
+    const std::vector<uint8_t> payload(payload_len, 0xAB);
+    std::fwrite(payload.data(), 1, payload.size(), f);
+    std::fclose(f);
+    return path;
+}
+
+}  // namespace
+
+TEST(paths, oversized_kark_is_unsupported_not_corrupt) {
+    ArchiveBuilder ab;
+    ab.add(redfs_hash("base\\kark\\x.bin"), {'x'});
+    TempDepot d("kark.archive", ab.build());
+    if (!d.depot) return;
+
+    // A 1 KB file claiming 2 GiB. The old absolute cap called this REDFS_E_CORRUPT
+    // -- "corrupt data" for a header that is merely bigger than a constant, which
+    // sends the caller to inspect the file instead of the limit.
+    const std::string huge = write_kark("kark_huge.kark", 0x80000000u, 1024);
+    CHECK_ERR(redfs_path_load(d.depot, huge.c_str(), nullptr), REDFS_E_UNSUPPORTED);
+    std::remove(huge.c_str());
+
+    // The ratio bound is what actually stops the cheap attack: nine bytes of
+    // input may not commit a gigabyte of zero-filled allocation.
+    const std::string bomb = write_kark("kark_bomb.kark", 1u << 30, 1);
+    CHECK_ERR(redfs_path_load(d.depot, bomb.c_str(), nullptr), REDFS_E_UNSUPPORTED);
+    std::remove(bomb.c_str());
+
+    // Zero stays REDFS_E_CORRUPT: a KARK header naming no output is malformed,
+    // not merely large.
+    const std::string zero = write_kark("kark_zero.kark", 0, 64);
+    CHECK_ERR(redfs_path_load(d.depot, zero.c_str(), nullptr), REDFS_E_CORRUPT);
+    std::remove(zero.c_str());
+}
+
+TEST(paths, real_world_kark_ratios_are_accepted) {
+    ArchiveBuilder ab;
+    ab.add(redfs_hash("base\\kark\\y.bin"), {'y'});
+    TempDepot d("kark_ok.archive", ab.build());
+    if (!d.depot) return;
+
+    // Every ratio WolvenKit actually ships, scaled down. The payload is garbage,
+    // so passing the bound means reaching Oodle -- REDFS_E_OODLE either because
+    // it is absent or because the junk does not decode. What must NOT come back
+    // is REDFS_E_UNSUPPORTED, which would mean the header was refused unread.
+    //
+    // 87x is red.kark's real shape (417 MiB from 86 MB is 4.9x, and 178 MiB,
+    // 204 MiB and 129 MiB lists run 26x, 54x and 40x) with margin to spare;
+    // 200x is past anything real and still inside the bound.
+    for (const uint32_t ratio : {5u, 27u, 54u, 87u, 200u}) {
+        const size_t payload = 4096;
+        const std::string p = write_kark("kark_ratio.kark",
+                                         static_cast<uint32_t>(payload * ratio), payload);
+        const redfs_status st = redfs_path_load(d.depot, p.c_str(), nullptr);
+        CHECK(st == REDFS_E_OODLE);
+        if (st != REDFS_E_OODLE)
+            std::printf("         ratio %ux got %s\n", ratio, redfs_status_string(st));
+        std::remove(p.c_str());
+    }
+
+    // And the far side of the bound is still refused.
+    const std::string over = write_kark("kark_over.kark", 4096 * 257, 4096);
+    CHECK_ERR(redfs_path_load(d.depot, over.c_str(), nullptr), REDFS_E_UNSUPPORTED);
+    std::remove(over.c_str());
+
+    // THE CASE THAT ACTUALLY DISCRIMINATES. Everything above declares under a
+    // megabyte, three orders of magnitude below the 256 MB cap this fix
+    // replaced -- so the old code would have accepted all of it and the test
+    // could not catch a revert. red.kark's real shape is 417 MiB at 4.9x: a
+    // ratio nothing would blink at, and a size the old cap rejected outright.
+    // 300 MB at 4.9x reproduces that in a 61 MB file.
+    const size_t payload = 62914560;  // 60 MiB
+    const std::string big = write_kark("kark_redshape.kark", 300u * 1024 * 1024, payload);
+    const redfs_status st = redfs_path_load(d.depot, big.c_str(), nullptr);
+    CHECK(st == REDFS_E_OODLE);  // past the size bound, dies on the garbage payload
+    if (st != REDFS_E_OODLE) std::printf("         got %s\n", redfs_status_string(st));
+    std::remove(big.c_str());
+
+    // Above the 512 MiB ceiling, refused whatever the ratio -- and the ceiling
+    // is what bounds how much gets committed and zero-filled before Oodle is
+    // consulted, so it is the number that matters.
+    const std::string huge = write_kark("kark_ceiling.kark", 600u * 1024 * 1024, payload);
+    CHECK_ERR(redfs_path_load(d.depot, huge.c_str(), nullptr), REDFS_E_UNSUPPORTED);
+    std::remove(huge.c_str());
+}
+
+TEST(paths, the_length_bound_covers_every_intern_route) {
+    // The bound started on paths_add alone -- the one route fed by host code --
+    // while paths_load and paths_learn_imports, both fed by file content a mod
+    // ships, interned without any check. It belongs in add_locked, where all
+    // three meet.
+    redfs_path_enable();
+    const std::string run(4000, 'q');
+
+    // Route 1: paths_add.
+    redfs_path_add(("base\\lenbound\\add\\" + run + ".mesh").c_str());
+    CHECK_EQ(find_sorted(nullptr, "base\\lenbound\\add\\*").size(), 0u);
+
+    // Route 2: import learning, i.e. bytes out of an archive.
+    Cr2wBuilder b;
+    b.import(("base\\lenbound\\import\\" + run + ".mt").c_str(), "IMaterial");
+    b.begin_chunk("Root");
+    b.prop_u32("x", 1);
+    b.end_chunk();
+    with_cr2w(b.build(), [](redfs_cr2w*) {});
+    CHECK_EQ(find_sorted(nullptr, "base\\lenbound\\import\\*").size(), 0u);
+
+    // Route 3: a path list on disk.
+    ArchiveBuilder ab;
+    const std::string listed = "base\\lenbound\\list\\" + run + ".mesh";
+    ab.add(redfs_hash(listed.c_str()), {'z'});
+    TempDepot d("lenbound.archive", ab.build());
+    if (!d.depot) return;
+
+    const std::string list = temp_path("lenbound.txt");
+    {
+        FILE* f = std::fopen(list.c_str(), "wb");
+        std::fprintf(f, "%s\n", listed.c_str());
+        std::fclose(f);
+    }
+    uint32_t kept = 0;
+    CHECK_OK(redfs_path_load(d.depot, list.c_str(), &kept));
+    // It resolves in the depot -- so `kept` counts it -- but it must not be
+    // interned, because the cost of holding it is paid by every later search.
+    CHECK(redfs_path_from_hash(redfs_hash(listed.c_str())) == nullptr);
     std::remove(list.c_str());
 }
 

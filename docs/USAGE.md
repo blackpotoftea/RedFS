@@ -431,7 +431,65 @@ Cost, on the reference install: `usedhashes.kark` is 3.4 MB on disk and
 decompresses to ~135 MB, held only for the duration of the call. Roughly a
 quarter of its lines resolve in a stock depot, and what stays resident is those
 ~40 MB of interned strings — 544,496 paths, which is 99.97 % of the depot's
-544,670 files. Load it only if you call `redfs_path_from_hash`.
+544,670 files. Load it only if you call `redfs_path_from_hash` or `redfs_find`.
+
+### Finding files
+
+The dictionary is also what makes "which of these are meshes?" answerable.
+`redfs_find` globs over it and **reads nothing** — no segment is decoded, so the
+cost is one pattern match per known path:
+
+```c
+static int on_mesh(uint64_t key, const char* path, void* user) {
+    redfs_depot* depot = (redfs_depot*)user;   /* that is what `user` is for */
+    redfs_mesh* mesh = NULL;
+    if (redfs_mesh_open(depot, key, &mesh) == REDFS_OK) {
+        ...
+        redfs_mesh_close(mesh);
+    }
+    return 1;   /* 0 stops delivery -- see below */
+}
+
+uint32_t total = 0;
+redfs_find(depot, "base\\characters\\*.mesh", on_mesh, depot, &total);
+```
+
+`*` matches any run of characters **including separators**, and `?` matches
+exactly one character, **which may also be a separator**. Spanning separators is
+deliberately unlike a shell glob: the common query is "every mesh anywhere",
+which under shell rules would match nothing. Narrow with a prefix instead. A
+pattern ending in a separator means everything beneath it, so
+`base\characters\` is shorthand for `base\characters\*`.
+
+The pattern is normalised exactly like a path, so `Base/Characters/*.MESH` and
+`base\characters\*.mesh` are the same query, and a path pasted out of WolvenKit
+works with a component replaced by `*`.
+
+Passing the depot restricts hits to files **the depot index holds** — worth it
+because sources 1 and 3 above are unfiltered. That is presence, not readability:
+a read can still fail `REDFS_E_OODLE` or `REDFS_E_CORRUPT`. Pass `NULL` to search
+the dictionary as-is.
+
+**It searches the dictionary, not the depot.** The archives carry no path table,
+so `redfs_find` can only see what the three sources above have taught it. With
+nothing in it at all you get `REDFS_E_NO_DICTIONARY`, not an empty success —
+"there was nothing to search" and "nothing matched" are different answers, and
+conflating them is how you end up inspecting a glob that was never the problem.
+That status is distinct from `REDFS_E_NOT_FOUND` for the same reason: that one
+means "no such file", which reads here as exactly the wrong thing. Note also
+that the dictionary is **process-global** while the depot filter is not, so
+loading a list against one depot and searching another reports their
+intersection.
+
+`total` receives the **total** match count, not the number delivered. Returning 0
+from the callback stops delivery, not the search: the scan and its allocation
+have both finished before your callback runs at all. Count deliveries yourself if
+you need them.
+
+The callback runs with no lock held, so reading a file from inside it is fine and
+is the intended shape. Paths those reads learn do not join a walk already running.
+The strings it hands you are interned for the life of the process, so they are
+safe to keep.
 
 ### Crossing into Lua
 
@@ -582,7 +640,8 @@ redfs_cli [--game DIR] [--cache FILE] <command>
   info                          list mounted archives
   hash <path>...                depot path -> 64-bit key
   paths <list> [key...]         load a dictionary, resolve hashes to paths
-  find <list> <substr> [n]      files whose path contains substr
+  find <list> <pattern> [n]     files matching a glob (* ?); a bare word
+                                is taken as a substring
   stat <key>                    where a file lives and how big it is
   extract <key> <out> [part]    part = main | all | <buffer index>
   cr2w <key> [chunk] [path]     chunks, imports and properties

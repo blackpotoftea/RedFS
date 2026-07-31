@@ -167,29 +167,51 @@ int cmd_paths(redfs_depot* d, const char* list_file, int argc, char** argv) {
     return 0;
 }
 
-// Finds files whose resolved path contains a substring -- the practical way to
-// locate a mesh when you only half-remember where it lives.
+// Finds files by path pattern -- the practical way to locate a mesh when you
+// only half-remember where it lives.
 struct Finder {
-    const char* needle;
+    redfs_depot* depot;
     uint32_t found;
     uint32_t limit;
 };
 
-int find_visit(const redfs_file_info* info, void* user) {
+int find_visit(uint64_t hash, const char* path, void* user) {
     auto* f = static_cast<Finder*>(user);
-    const char* path = redfs_path_from_hash(info->hash);
-    if (!path || !std::strstr(path, f->needle)) return 1;
-    std::printf("  0x%016" PRIX64 "  %9" PRIu64 "  %s\n", info->hash, info->size, path);
+    // redfs_find reads nothing, so the size costs a stat we would not otherwise
+    // pay. Worth it here: it is the number that tells you whether the file you
+    // half-remember is the one you meant.
+    redfs_file_info info{};
+    const uint64_t size = redfs_stat(f->depot, hash, &info) == REDFS_OK ? info.size : 0;
+    std::printf("  0x%016" PRIX64 "  %9" PRIu64 "  %s\n", hash, size, path);
     return ++f->found < f->limit;
 }
 
-int cmd_find(redfs_depot* d, const char* list_file, const char* needle, uint32_t limit) {
+int cmd_find(redfs_depot* d, const char* list_file, const char* pattern, uint32_t limit) {
     uint32_t kept = 0;
-    if (redfs_path_load(d, list_file, &kept) != REDFS_OK) return 1;
-    std::printf("searching %u known paths for \"%s\"\n", kept, needle);
-    Finder f{needle, 0, limit};
-    redfs_enumerate(d, find_visit, &f);
-    std::printf("%u matches\n", f.found);
+    // Reported rather than swallowed: the usual failure here is a .kark list with
+    // no Oodle to decompress it, and a bare exit code sends you looking at the
+    // pattern instead of at the DLL.
+    const redfs_status load = redfs_path_load(d, list_file, &kept);
+    if (load != REDFS_OK) return die("path_load", load);
+
+    // A bare word stays a substring search, which is what this command has
+    // always done and what you want when half-remembering a name. Anything
+    // carrying a wildcard is passed through as the glob it plainly is.
+    std::string glob = pattern;
+    if (glob.find('*') == std::string::npos && glob.find('?') == std::string::npos)
+        glob = "*" + glob + "*";
+
+    std::printf("searching %u known paths for \"%s\"\n", kept, glob.c_str());
+    Finder f{d, 0, limit};
+    uint32_t matched = 0;
+    const redfs_status st = redfs_find(d, glob.c_str(), find_visit, &f, &matched);
+    if (st != REDFS_OK) return die("find", st);
+    // matched is the true total, so truncation is `total > shown`; a run of
+    // exactly `limit` matches has dropped nothing.
+    if (matched > f.found)
+        std::printf("%u matches (showing %u -- raise the limit for the rest)\n", matched, f.found);
+    else
+        std::printf("%u matches\n", matched);
     return 0;
 }
 
@@ -946,7 +968,8 @@ void usage() {
         "  info                          list mounted archives\n"
         "  hash <path>...                depot path -> 64-bit key\n"
         "  paths <list> [key...]         load a dictionary, resolve hashes to paths\n"
-        "  find <list> <substr> [n]      files whose path contains substr\n"
+        "  find <list> <pattern> [n]     files matching a glob (* ?); a bare word\n"
+        "                                is taken as a substring\n"
         "  stat <key>                    where a file lives and how big it is\n"
         "  extract <key> <out> [part]    part = main | all | <buffer index>\n"
         "  cr2w <key> [chunk] [path]     chunks, imports and properties\n"

@@ -95,6 +95,73 @@ int scenario_exit_without_shutdown() {
     return 0;
 }
 
+// redfs_find must refuse a dictionary that has never been populated, rather than
+// reporting an empty success -- "you never loaded a path list" and "nothing
+// matched" are different answers.
+//
+// This lives here rather than in redfs_test because the dictionary is a
+// process-global singleton that is deliberately never destroyed, so it only
+// reaches the empty state once per process. redfs_test cannot host that: under
+// _DEBUG its runner executes the whole suite three times (two warm-up passes to
+// populate the leaked singletons, then the measured pass), so any assertion
+// about virgin global state is true on pass one and false forever after. A
+// freshly spawned child is the only place the precondition holds.
+int scenario_virgin_dictionary() {
+    fixture::ArchiveBuilder ab;
+    ab.add(redfs_hash("base\\virgin\\x.mesh"), std::vector<uint8_t>(16, 0x5A));
+    const std::string path = temp_path("virgin.archive");
+    fixture::ArchiveBuilder::write(path, ab.build());
+
+    redfs_depot* depot = nullptr;
+    if (redfs_depot_open_empty(&depot) != REDFS_OK) return 1;
+    if (redfs_depot_mount(depot, path.c_str()) != REDFS_OK) return 1;
+
+    int rc = 0;
+    if (redfs_path_count() != 0) {
+        std::printf("child: dictionary was not empty at startup (%u entries)\n",
+                    redfs_path_count());
+        rc = 1;
+    }
+
+    // The file IS mounted and IS findable by hash -- only its NAME is unknown.
+    // That is the case a caller misreads as "my pattern is wrong".
+    if (!redfs_exists(depot, redfs_hash("base\\virgin\\x.mesh"))) {
+        std::printf("child: fixture did not mount\n");
+        rc = 1;
+    }
+
+    uint32_t matched = 123;
+    auto sink = [](uint64_t, const char*, void*) -> int { return 1; };
+    const redfs_status st = redfs_find(depot, "*.mesh", sink, nullptr, &matched);
+    // NO_DICTIONARY, specifically -- not NOT_FOUND, which is what redfs_read
+    // returns for "no such file" and would read here as "nothing matched".
+    if (st != REDFS_E_NO_DICTIONARY) {
+        std::printf("child: empty dictionary gave %s, wanted no path dictionary loaded\n",
+                    redfs_status_string(st));
+        rc = 1;
+    }
+    if (matched != 0) {
+        std::printf("child: out_matched was %u, wanted 0 on the failure path\n", matched);
+        rc = 1;
+    }
+
+    // And once something IS loaded, a pattern that matches nothing is a success.
+    redfs_path_enable();
+    redfs_path_add("base\\virgin\\x.mesh");
+    matched = 123;
+    if (redfs_find(depot, "base\\virgin\\nothing*.xbm", sink, nullptr, &matched) != REDFS_OK ||
+        matched != 0) {
+        std::printf("child: a loaded dictionary matching nothing should be OK with 0\n");
+        rc = 1;
+    }
+
+    redfs_depot_close(depot);
+    std::remove(path.c_str());
+    if (!rc) std::printf("child: empty dictionary refused, loaded-but-no-match accepted\n");
+    std::fflush(stdout);
+    return rc;
+}
+
 // The same, but through ExitProcess -- a harder abort than returning from main,
 // because no C++ cleanup runs at all.
 int scenario_abrupt_exit_process() {
@@ -344,6 +411,7 @@ int main(int argc, char** argv) {
     if (argc >= 2) {
         const char* s = argv[1];
         if (std::strcmp(s, "exit-without-shutdown") == 0) return scenario_exit_without_shutdown();
+        if (std::strcmp(s, "virgin-dictionary") == 0) return scenario_virgin_dictionary();
         if (std::strcmp(s, "abrupt-exit") == 0) return scenario_abrupt_exit_process();
         if (std::strcmp(s, "shutdown-latency") == 0) return scenario_shutdown_latency();
         if (std::strcmp(s, "dll-unload") == 0) {
@@ -361,6 +429,9 @@ int main(int argc, char** argv) {
 
     // Each budget is generous next to the expected cost; the point is to catch a
     // hang, not to benchmark.
+    // Not about teardown, but it needs the same thing the teardown scenarios do:
+    // a process whose global singletons have never been touched.
+    check("virgin path dictionary", run_child(self_path, "virgin-dictionary", 15000), 15000);
     check("exit without shutdown", run_child(self_path, "exit-without-shutdown", 15000), 15000);
     check("abrupt ExitProcess", run_child(self_path, "abrupt-exit", 15000), 15000);
     check("shutdown under load", run_child(self_path, "shutdown-latency", 20000), 20000);

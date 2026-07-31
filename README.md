@@ -104,6 +104,24 @@ process; later additions from any source cannot invalidate a pointer you hold.
 On the reference install WolvenKit's list resolves **544,496 of the depot's
 544,670 files — 99.97 % coverage.**
 
+The dictionary also runs in the forward direction. `redfs_find` globs over it and
+**reads nothing**, which is how you get a list of files to work on without
+touching a byte of any of them:
+
+```c
+redfs_find(depot, "base\\characters\\*.mesh", on_mesh, depot, &total);
+```
+
+`*` and `?` both span separators (so `*.mesh` means *any* mesh, anywhere), and a
+trailing separator means everything beneath it. The pattern is normalised like a
+path, so casing and `/` versus `\` do not matter. With a depot passed, every hit
+is a file the index holds — presence, not readability; the read can still fail.
+
+Because this searches the dictionary rather than the depot, it finds only what
+the sources above have taught it — archives carry no path table for anything to
+enumerate. With nothing in it, it returns `REDFS_E_NO_DICTIONARY` rather than an
+empty success, so a missing path list cannot be mistaken for a bad pattern.
+
 For hosts that cannot hold a `uint64` exactly (Lua numbers are doubles and lose
 precision above 2⁵³), keys cross as decimal strings:
 
@@ -323,6 +341,13 @@ Windows x64. No external dependencies — Oodle is bound by name at runtime.
 `REDFS_ABI_VERSION` is **2**. Check `redfs_abi_version()` against it at startup if
 you link `RedFS.dll`; version 2 added `redfs_mesh_chunk::bounds_valid`, so
 anything built against 1 needs a recompile.
+
+Know what that check does *not* cover. It bumps for struct layout and for the
+meaning of a call, not for additions — `redfs_find` was added without a bump,
+correctly. So a new header against an older DLL reports 2 on both sides and passes,
+then fails at load with *entry point redfs_find could not be found*. That is loud
+and immediate rather than silent, but it is the loader telling you, not the check:
+one integer compared with `==` cannot express "has `redfs_find`".
 
 ## Verifying
 
