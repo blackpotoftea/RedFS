@@ -684,8 +684,8 @@ LoadReport load_from_disk(PathCache& c) {
 
 }  // namespace
 
-redfs_status path_cache_open(const redfs_depot* depot, const char* file) {
-    if (!depot || !file) return REDFS_E_INVALID_ARG;
+redfs_status path_cache_open(const char* file) {
+    if (!file) return REDFS_E_INVALID_ARG;
     PathCache& c = path_cache();
 
     // Before the lock, since flush takes the same one. Everything the previous

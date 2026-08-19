@@ -788,9 +788,9 @@ const char* redfs_path_from_hash(uint64_t hash) {
 // open sizes its loops from counts in a file and flush builds the whole image in
 // memory, so both allocate from data the caller does not control and need the
 // ABI's exception barrier. pending and mark are guarded for consistency.
-redfs_status redfs_path_cache_open(const redfs_depot* depot, const char* cache_file) {
+redfs_status redfs_path_cache_open(const char* cache_file) {
     clear_error();
-    REDFS_GUARD(path_cache_open(depot, cache_file));
+    REDFS_GUARD(path_cache_open(cache_file));
 }
 
 redfs_status redfs_path_cache_flush(void) {

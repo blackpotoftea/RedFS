@@ -53,7 +53,7 @@ and you must call one of them yourself, or nothing is ever learned. With it,
 coverage grows as you read rather than being exhaustive up front.
 
 Growing it that way costs minutes on a modded install, because it means reading
-every file with an import table. `redfs_path_cache_open(depot, file)` persists
+every file with an import table. `redfs_path_cache_open(file)` persists
 the result and restores it next run, and tracks which archives it already read so
 that installing a mod costs harvesting *that mod*. Unlike the mesh cache it is
 never discarded — a hash → name mapping cannot go stale — so restored entries

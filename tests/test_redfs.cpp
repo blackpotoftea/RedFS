@@ -2465,7 +2465,7 @@ TEST(path_cache, restore_does_not_filter_against_the_depot) {
     const std::string cache_file = temp_path("pc_nofilter.cache");
     CHECK(write_bytes(cache_file, make_path_cache({}, {absent})));
 
-    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
 
     // The depot does NOT hold it -- that is the point of the case.
     CHECK_EQ(redfs_exists(d.depot, absent_hash), 0);
@@ -2487,7 +2487,7 @@ TEST(path_cache, the_written_file_keeps_unfiltered_entries) {
     const std::string cache_file = temp_path("pc_dump.cache");
     std::remove(cache_file.c_str());
 
-    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
     redfs_path_add(absent);
     CHECK_OK(redfs_path_cache_flush());
     redfs_path_cache_close();
@@ -2516,7 +2516,7 @@ TEST(path_cache, hashes_are_recovered_from_the_stored_string) {
     const std::string cache_file = temp_path("pc_hash.cache");
     std::remove(cache_file.c_str());
 
-    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
     redfs_path_add(messy);
     CHECK_OK(redfs_path_cache_flush());
     redfs_path_cache_close();
@@ -2545,7 +2545,7 @@ TEST(path_cache, only_the_new_archive_is_pending) {
     redfs_depot_open_empty(&d);
     if (d) {
         CHECK_OK(redfs_depot_mount(d, p1.c_str()));
-        CHECK_OK(redfs_path_cache_open(d, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
 
         uint32_t idx[4] = {99, 99, 99, 99};
         uint32_t n = 0;
@@ -2570,7 +2570,7 @@ TEST(path_cache, only_the_new_archive_is_pending) {
 
         // Reopening on the same depot must find nothing left to do -- that is
         // the whole saving.
-        CHECK_OK(redfs_path_cache_open(d, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
         CHECK_OK(redfs_path_cache_pending(d, idx, 4, &n));
         CHECK_EQ(n, 0u);
         redfs_path_cache_close();
@@ -2599,7 +2599,7 @@ TEST(path_cache, mount_order_does_not_force_a_reharvest) {
     if (a) {
         CHECK_OK(redfs_depot_mount(a, p1.c_str()));
         CHECK_OK(redfs_depot_mount(a, p2.c_str()));
-        CHECK_OK(redfs_path_cache_open(a, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
         CHECK_OK(redfs_path_cache_mark(a, 0));
         CHECK_OK(redfs_path_cache_mark(a, 1));
         CHECK_OK(redfs_path_cache_flush());
@@ -2612,7 +2612,7 @@ TEST(path_cache, mount_order_does_not_force_a_reharvest) {
     if (b) {
         CHECK_OK(redfs_depot_mount(b, p2.c_str()));  // reversed
         CHECK_OK(redfs_depot_mount(b, p1.c_str()));
-        CHECK_OK(redfs_path_cache_open(b, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
         uint32_t n = 123;
         CHECK_OK(redfs_path_cache_pending(b, nullptr, 0, &n));
         CHECK_EQ(n, 0u);
@@ -2644,7 +2644,7 @@ TEST(path_cache, an_archive_replaced_in_place_becomes_pending_again) {
     redfs_depot_open_empty(&d);
     if (d) {
         CHECK_OK(redfs_depot_mount(d, p.c_str()));
-        CHECK_OK(redfs_path_cache_open(d, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
         CHECK_OK(redfs_path_cache_mark(d, 0));
         CHECK_OK(redfs_path_cache_flush());
         redfs_path_cache_close();
@@ -2657,7 +2657,7 @@ TEST(path_cache, an_archive_replaced_in_place_becomes_pending_again) {
     redfs_depot_open_empty(&d2);
     if (d2) {
         CHECK_OK(redfs_depot_mount(d2, p.c_str()));
-        CHECK_OK(redfs_path_cache_open(d2, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
         uint32_t n = 0;
         CHECK_OK(redfs_path_cache_pending(d2, nullptr, 0, &n));
         CHECK_EQ(n, 1u);
@@ -2683,14 +2683,14 @@ TEST(path_cache, flush_writes_nothing_when_nothing_was_learned) {
     const std::string cache_file = temp_path("pc_noop.cache");
     std::remove(cache_file.c_str());
 
-    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
     redfs_path_add("base\\pathcache\\noop_entry_b2f4.mesh");
     CHECK_OK(redfs_path_cache_mark(d.depot, 0));
     CHECK_OK(redfs_path_cache_flush());
     redfs_path_cache_close();
 
     // Reopen: restores exactly what it wrote, so there is nothing new to say.
-    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
     std::remove(cache_file.c_str());
     CHECK_OK(redfs_path_cache_flush());
     std::vector<uint8_t> b;
@@ -2732,7 +2732,7 @@ TEST(path_cache, a_truncated_file_restores_what_survived_and_is_rewritten) {
     bytes.resize(bytes.size() - 12);  // cut into the middle of the last record
     CHECK(write_bytes(cache_file, bytes));
 
-    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
     CHECK_STR(redfs_path_from_hash(redfs_hash(survives)), survives);
 
     // Nothing new was learned, yet the file must still be rewritten: what is on
@@ -2768,7 +2768,7 @@ TEST(path_cache, a_partial_restore_does_not_keep_its_coverage) {
     redfs_depot_open_empty(&d);
     if (d) {
         CHECK_OK(redfs_depot_mount(d, p.c_str()));
-        CHECK_OK(redfs_path_cache_open(d, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
         redfs_path_add("base\\pathcache\\partial_a_8801.mesh");
         redfs_path_add("base\\pathcache\\partial_b_8802.mesh");
         CHECK_OK(redfs_path_cache_mark(d, 0));
@@ -2785,7 +2785,7 @@ TEST(path_cache, a_partial_restore_does_not_keep_its_coverage) {
         bytes.resize(bytes.size() - 12);
         CHECK(write_bytes(cache_file, bytes));
 
-        CHECK_OK(redfs_path_cache_open(d, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
         uint32_t n = 0;
         CHECK_OK(redfs_path_cache_pending(d, nullptr, 0, &n));
         CHECK_EQ(n, 1u);  // NOT 0 -- the archive must be read again
@@ -2816,14 +2816,14 @@ TEST(path_cache, opening_a_second_cache_flushes_the_first) {
     std::remove(first.c_str());
     std::remove(second.c_str());
 
-    CHECK_OK(redfs_path_cache_open(d.depot, first.c_str()));
+    CHECK_OK(redfs_path_cache_open(first.c_str()));
     static int pass = 0;  // new on every pass; see the no-op test above
     char fresh[96];
     std::snprintf(fresh, sizeof fresh, "base\\pathcache\\reopen_%d.mesh", ++pass);
     redfs_path_add(fresh);
 
     // No close, no flush -- straight into another cache.
-    CHECK_OK(redfs_path_cache_open(d.depot, second.c_str()));
+    CHECK_OK(redfs_path_cache_open(second.c_str()));
 
     ParsedCache pc;
     CHECK(parse_path_cache(first, &pc));
@@ -2844,7 +2844,7 @@ TEST(path_cache, a_write_that_cannot_land_is_reported_and_still_closes) {
     if (!d.depot) return;
 
     const std::string bad = temp_path("pc_no_such_dir\\nested.cache");
-    CHECK_OK(redfs_path_cache_open(d.depot, bad.c_str()));  // absent file, not an error
+    CHECK_OK(redfs_path_cache_open(bad.c_str()));  // absent file, not an error
     redfs_path_add("base\\pathcache\\unwritable_9f03.mesh");
     CHECK_ERR(redfs_path_cache_flush(), REDFS_E_IO);
 
@@ -2870,7 +2870,7 @@ TEST(path_cache, an_unusable_record_is_refused_and_the_file_repaired) {
     const char* good = "base\\pathcache\\refuse_good_5e12.mesh";
     CHECK(write_bytes(cache_file, make_path_cache({}, {good, huge})));
 
-    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
     CHECK_STR(redfs_path_from_hash(redfs_hash(good)), good);
     CHECK(redfs_path_from_hash(redfs_hash(huge.c_str())) == nullptr);
 
@@ -2893,7 +2893,7 @@ TEST(path_cache, a_bad_header_starts_fresh_rather_than_failing) {
     const std::string cache_file = temp_path("pc_bad.cache");
     CHECK(write_bytes(cache_file, std::vector<uint8_t>(64, 0xEE)));
 
-    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
     redfs_path_add("base\\pathcache\\after_bad_header_1f88.mesh");
     CHECK_OK(redfs_path_cache_flush());
 
@@ -2923,7 +2923,7 @@ TEST(path_cache, declared_counts_cannot_outrun_the_file) {
         b.u32(0xFFFFFFFFu);
         b.u32(0);
         CHECK(write_bytes(cache_file, b.bytes));
-        CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
         redfs_path_cache_close();
     }
     // A huge path count with two real records behind it: the walk must stop at
@@ -2933,7 +2933,7 @@ TEST(path_cache, declared_counts_cannot_outrun_the_file) {
             make_path_cache({}, {"base\\pathcache\\liar_a_3c50.mesh"});
         std::memset(bytes.data() + 12, 0xFF, 4);  // declared_paths = 0xFFFFFFFF
         CHECK(write_bytes(cache_file, bytes));
-        CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
         CHECK_STR(redfs_path_from_hash(redfs_hash("base\\pathcache\\liar_a_3c50.mesh")),
                   "base\\pathcache\\liar_a_3c50.mesh");
         redfs_path_cache_close();
@@ -2948,7 +2948,7 @@ TEST(path_cache, declared_counts_cannot_outrun_the_file) {
         b.u32(0xFFFFFF00u);  // length, with four bytes of payload behind it
         b.u32(0x41414141u);
         CHECK(write_bytes(cache_file, b.bytes));
-        CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
         redfs_path_cache_close();
     }
     std::remove(cache_file.c_str());
@@ -2972,7 +2972,7 @@ TEST(path_cache, pending_reports_the_total_not_the_delivered) {
         CHECK_OK(redfs_depot_mount(d, p1.c_str()));
         CHECK_OK(redfs_depot_mount(d, p2.c_str()));
         CHECK_OK(redfs_depot_mount(d, p3.c_str()));
-        CHECK_OK(redfs_path_cache_open(d, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
 
         uint32_t n = 0;
         CHECK_OK(redfs_path_cache_pending(d, nullptr, 0, &n));  // count-only probe
@@ -3009,14 +3009,13 @@ TEST(path_cache, coverage_queries_refuse_to_answer_without_a_cache) {
     CHECK_ERR(redfs_path_cache_mark(d.depot, 0), REDFS_E_INVALID_ARG);
 
     // Nulls and an out-of-range archive index.
-    CHECK_ERR(redfs_path_cache_open(nullptr, "x"), REDFS_E_INVALID_ARG);
-    CHECK_ERR(redfs_path_cache_open(d.depot, nullptr), REDFS_E_INVALID_ARG);
+    CHECK_ERR(redfs_path_cache_open(nullptr), REDFS_E_INVALID_ARG);
     CHECK_ERR(redfs_path_cache_pending(nullptr, nullptr, 0, &n), REDFS_E_INVALID_ARG);
     CHECK_ERR(redfs_path_cache_mark(nullptr, 0), REDFS_E_INVALID_ARG);
 
     const std::string cache_file = temp_path("pc_closed.cache");
     std::remove(cache_file.c_str());
-    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
     CHECK_ERR(redfs_path_cache_mark(d.depot, 7), REDFS_E_INVALID_ARG);  // only one mounted
     // A capacity with nowhere to put the answer.
     CHECK_ERR(redfs_path_cache_pending(d.depot, nullptr, 4, &n), REDFS_E_INVALID_ARG);
@@ -3043,7 +3042,7 @@ TEST(path_cache, the_cpp_facade_sizes_its_own_buffer) {
         CHECK_OK(redfs_depot_mount(h, p2.c_str()));
         redfs::Depot d{h};  // takes ownership
 
-        CHECK(d.enable_path_cache(cache_file.c_str()) == REDFS_OK);
+        CHECK(redfs::Depot::enable_path_cache(cache_file.c_str()) == REDFS_OK);
         std::vector<uint32_t> todo = d.unharvested_archives();
         CHECK_EQ(todo.size(), 2u);
 
@@ -3068,7 +3067,7 @@ TEST(path_cache, closing_keeps_the_dictionary_and_its_pointers) {
     const std::string cache_file = temp_path("pc_close.cache");
     std::remove(cache_file.c_str());
 
-    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
     redfs_path_add("base\\pathcache\\survives_close_6b12.mesh");
     const char* p = redfs_path_from_hash(redfs_hash("base\\pathcache\\survives_close_6b12.mesh"));
     CHECK(p != nullptr);
@@ -3092,7 +3091,7 @@ TEST(path_cache, shutdown_flushes_what_was_learned) {
     const std::string cache_file = temp_path("pc_shutdown.cache");
     std::remove(cache_file.c_str());
 
-    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_OK(redfs_path_cache_open(cache_file.c_str()));
     static int pass = 0;  // new on every pass; see the no-op test above
     char fresh[96];
     std::snprintf(fresh, sizeof fresh, "base\\pathcache\\shutdown_%d.mesh", ++pass);

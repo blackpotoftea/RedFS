@@ -239,7 +239,7 @@ REDFS_API const char* redfs_path_from_hash(uint64_t hash);
  *
  * The usual shape:
  *
- *     redfs_path_cache_open(depot, "paths.cache");
+ *     redfs_path_cache_open("paths.cache");
  *     uint32_t n = 0;
  *     redfs_path_cache_pending(depot, NULL, 0, &n);
  *     uint32_t* idx = malloc(n * sizeof *idx);
@@ -259,7 +259,7 @@ REDFS_API const char* redfs_path_from_hash(uint64_t hash);
  * they also already share the dictionary itself, so two separate cache files
  * would hold the same paths anyway. One of them should own it.
  */
-REDFS_API redfs_status redfs_path_cache_open(const redfs_depot* depot, const char* cache_file);
+REDFS_API redfs_status redfs_path_cache_open(const char* cache_file);
 /* Writes only when something was learned since the last write. Also happens on
  * redfs_path_cache_close. */
 REDFS_API redfs_status redfs_path_cache_flush(void);

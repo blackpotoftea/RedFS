@@ -51,6 +51,8 @@ break RedFS the way it breaks tools that hook `ResourceDepot`.
 | Read one 40 KB file from the middle of a 24 GB archive | **0.16 ms** |
 | `redfs_mesh_open`, uncached (computes chunk bounds) | median **0.72 ms**, p90 2.27 ms |
 | `redfs_mesh_open`, cached | ~0 ms |
+| Path dictionary: learn 652,594 paths from import tables | ~180 s |
+| Path dictionary: restore the same from cache | **658 ms** |
 
 The mesh figure is 200 meshes sampled by stride across a stock install, with no
 RedFS mesh cache and a warm OS page cache: min 0.05, median 0.72, mean 0.98,
@@ -241,7 +243,7 @@ Filling the dictionary from import tables means reading every file that has them
 — minutes on a modded install. Write it once instead:
 
 ```c
-redfs_path_cache_open(depot, "redfs_paths.cache");
+redfs_path_cache_open("redfs_paths.cache");
 
 uint32_t n = 0;
 redfs_path_cache_pending(depot, NULL, 0, &n);       /* how many need reading */
@@ -276,8 +278,12 @@ design:
 `redfs_path_cache_mark` is per archive on purpose: call it as each one finishes,
 so a teach interrupted halfway loses only what it had not got to.
 
+Measured on 652,594 paths: **restore 658 ms** against the ~180 s teach it
+replaces, a 41.1 MB file written in 88 ms, and 0.006 ms at shutdown when nothing
+new was learned.
+
 See [docs/done/path-cache.md](docs/done/path-cache.md) for the file format and
-the three ways this fails silently if built the obvious way.
+the four ways this fails silently if built the obvious way.
 
 ### Textures
 

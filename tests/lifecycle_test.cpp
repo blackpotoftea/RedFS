@@ -215,7 +215,7 @@ int scenario_path_cache_teach() {
         std::printf("child: dictionary was not empty at startup (%u)\n", redfs_path_count());
         rc = 1;
     }
-    if (redfs_path_cache_open(depot, pc_cache_file()) != REDFS_OK) {
+    if (redfs_path_cache_open(pc_cache_file()) != REDFS_OK) {
         std::printf("child: path cache would not open\n");
         return 1;
     }
@@ -280,7 +280,7 @@ int scenario_path_cache_restore() {
     }
     std::fclose(f);
 
-    if (redfs_path_cache_open(depot, pc_cache_file()) != REDFS_OK) {
+    if (redfs_path_cache_open(pc_cache_file()) != REDFS_OK) {
         std::printf("child: path cache would not open\n");
         return 1;
     }

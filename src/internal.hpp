@@ -368,7 +368,8 @@ redfs_status paths_find(const redfs_depot* depot, const char* pattern, redfs_fin
 // Never discarded, only merged into -- a hash -> name mapping cannot go stale.
 // Restores through paths_add's route, so restored entries keep the unfiltered
 // semantics redfs.h promises. See the header comment in paths.cpp.
-redfs_status path_cache_open(const redfs_depot* depot, const char* file);
+// No depot: the dictionary this persists is process-global, and so is this.
+redfs_status path_cache_open(const char* file);
 redfs_status path_cache_flush();
 void path_cache_close();
 // Archives not yet harvested, as indices into depot->archives. `out_count` is

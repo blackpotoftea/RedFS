@@ -561,7 +561,7 @@ means reading every file that has them — minutes on a modded install — so pe
 it:
 
 ```c
-redfs_path_cache_open(depot, "redfs_paths.cache");   /* after everything is mounted */
+redfs_path_cache_open("redfs_paths.cache");   /* after everything is mounted */
 
 uint32_t n = 0;
 redfs_path_cache_pending(depot, NULL, 0, &n);        /* archives not yet read */

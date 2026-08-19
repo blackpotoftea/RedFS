@@ -141,10 +141,12 @@ directly and bypasses the insert path entirely.
   it, and `redfs.h` says so.
 - **An `owner` depot.** The mesh cache tracks one and bypasses for any other,
   because a hash means different bytes in a different depot. The dictionary is
-  process-global, already merges across depots, and `redfs.h` says so. Adding an
-  owner here would be new semantics, not a mirror. It also works out correctly:
-  an archive fingerprint identifies a physical file, so an archive harvested
-  through one depot is harvested for any depot that mounts it.
+  process-global and already merges across depots, so an owner here would be new
+  semantics, not a mirror. This is why `redfs_path_cache_open` takes no depot at
+  all while `pending` and `mark` do: those genuinely need one, and a parameter
+  that went unused would imply a scoping that does not exist. It works out
+  correctly too — an archive fingerprint identifies a physical file, so an
+  archive harvested through one depot is harvested for any depot that mounts it.
 - **Automatic marking at flush.** `redfs_path_cache_mark` is per archive, called
   as the host finishes each one. Stamping the whole mounted set at flush would
   record coverage the host does not have whenever a teach dies halfway — and
@@ -155,9 +157,26 @@ directly and bypasses the insert path entirely.
   the existing dictionary contract, and the read returns `REDFS_E_NOT_FOUND` as
   it always did.
 
-## Cost
+## Measured
 
-Restore runs the same `add_locked` route `redfs_path_load` does, so it costs what
-loading a path list of the same size costs — seconds, against the ~180 it
-replaces. The 40 MB is read in one `fread`, and the ~40 MB of interned strings is
-the same arena the teach would have produced anyway.
+652,594 paths averaging ~60 bytes, on the reference machine, in two processes so
+the restore starts from a dictionary that has never held anything:
+
+| | |
+|---|---|
+| **Restore** | **658 ms** — against the ~180 s teach it replaces, **~270×** |
+| Flush (`fwrite` + `_commit` + rename) | 88 ms, **41.1 MB** |
+| Shutdown, nothing new learned | **0.006 ms** |
+| Filling the same dictionary in memory, for reference | 971 ms |
+
+Restore is not free, but it is the same work `redfs_path_load` already does for a
+list of that size: it goes through `add_locked` like every other source, so it
+pays the same intern and dedupe, and the arena it fills is the one the teach
+would have produced anyway.
+
+The last row is the one that matters for `redfs_shutdown`, which flushes and runs
+in RED4ext's `Main(Unload)`. The 88 ms only lands on a session that actually
+learned something — a first run, or one where a mod was installed — and that
+session has just spent minutes harvesting, so it is not the cost anyone notices.
+Every other shutdown short-circuits on the dirty check and writes nothing. On a
+mechanical disk or a synced folder the 88 ms will grow; it is still one-time.

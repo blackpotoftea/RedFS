@@ -559,7 +559,10 @@ public:
     /// Restores the hash -> path dictionary from disk instead of relearning it,
     /// and records which archives it has already read. Unlike the mesh cache it
     /// is never discarded, only merged into -- see redfs.h.
-    Status enable_path_cache(const char* file) const { return redfs_path_cache_open(h_, file); }
+    /// All three are static, unlike enable_cache above: the mesh cache belongs
+    /// to a depot, this one does not -- it persists the process-global
+    /// dictionary. Only the coverage calls below need a depot.
+    static Status enable_path_cache(const char* file) { return redfs_path_cache_open(file); }
     static Status flush_path_cache() { return redfs_path_cache_flush(); }
     static void close_path_cache() { redfs_path_cache_close(); }
 
