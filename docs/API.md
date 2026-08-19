@@ -47,10 +47,18 @@ string. So a hit tells you what a file is *called*, not that it is readable —
 call `redfs_exists` if you need that, or just handle `REDFS_E_NOT_FOUND` from the
 read.
 
-**Import learning stays off until the dictionary is switched on**, by either
-`redfs_path_load` or `redfs_path_enable`. Ship no list and you must call
-`redfs_path_enable()` yourself, or nothing is ever learned. With it, coverage
-grows as you read rather than being exhaustive up front.
+**Import learning stays off until the dictionary is switched on**, by
+`redfs_path_load`, `redfs_path_enable` or `redfs_path_cache_open`. Ship no list
+and you must call one of them yourself, or nothing is ever learned. With it,
+coverage grows as you read rather than being exhaustive up front.
+
+Growing it that way costs minutes on a modded install, because it means reading
+every file with an import table. `redfs_path_cache_open(depot, file)` persists
+the result and restores it next run, and tracks which archives it already read so
+that installing a mod costs harvesting *that mod*. Unlike the mesh cache it is
+never discarded — a hash → name mapping cannot go stale — so restored entries
+keep the unfiltered semantics above. See
+[done/path-cache.md](done/path-cache.md).
 
 The full list costs ~135 MB transient while it decompresses and **~40 MB
 resident** afterwards. Strings are interned, so a pointer from

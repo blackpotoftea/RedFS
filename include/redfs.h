@@ -216,6 +216,71 @@ REDFS_API uint32_t     redfs_path_count(void);
  * invalidate a pointer you already hold. */
 REDFS_API const char* redfs_path_from_hash(uint64_t hash);
 
+/* --- path cache -------------------------------------------------------------
+ *
+ * Filling the dictionary from import tables means reading every file that has
+ * them -- minutes over a modded install. Point RedFS at a file and it is written
+ * once and restored at start-up instead.
+ *
+ * NOT the mesh cache's kind of cache: IT IS NEVER DISCARDED. A hash -> name
+ * mapping is a fact about the string, so removing a mod, patching the game or
+ * re-cooking an archive cannot make a restored entry wrong. Restore only ADDS.
+ * A name for a file no longer installed keeps resolving -- that is the existing
+ * dictionary contract, not a stale answer, and the read still returns
+ * REDFS_E_NOT_FOUND.
+ *
+ * What the file DOES track is which archives it already read, one fingerprint
+ * each, so installing a mod costs harvesting that mod. Mount order does not
+ * affect it, and neither does mounting more after opening: pending is computed
+ * against the depot as it is when you ask.
+ *
+ * Opening also switches the dictionary on, as redfs_path_enable does -- names
+ * restored into a dictionary that never grew again would be a trap.
+ *
+ * The usual shape:
+ *
+ *     redfs_path_cache_open(depot, "paths.cache");
+ *     uint32_t n = 0;
+ *     redfs_path_cache_pending(depot, NULL, 0, &n);
+ *     uint32_t* idx = malloc(n * sizeof *idx);
+ *     redfs_path_cache_pending(depot, idx, n, &n);
+ *     for (uint32_t i = 0; i < n; ++i) {
+ *         ... read the files whose redfs_file_info.archive_index == idx[i],
+ *             which is what teaches the dictionary their imports ...
+ *         redfs_path_cache_mark(depot, idx[i]);
+ *     }
+ *     redfs_path_cache_close();
+ *
+ * Not concurrency-safe with respect to each other, like the mesh cache calls.
+ *
+ * ONE path cache per process, and it has no owner. Opening a second one flushes
+ * the first and takes over; redfs_shutdown closes whichever is open. If two
+ * plugins share one RedFS.dll they share this, and the second to open wins --
+ * they also already share the dictionary itself, so two separate cache files
+ * would hold the same paths anyway. One of them should own it.
+ */
+REDFS_API redfs_status redfs_path_cache_open(const redfs_depot* depot, const char* cache_file);
+/* Writes only when something was learned since the last write. Also happens on
+ * redfs_path_cache_close. */
+REDFS_API redfs_status redfs_path_cache_flush(void);
+/* Stops persisting. Does NOT clear the dictionary, and pointers you hold from
+ * redfs_path_from_hash stay valid. */
+REDFS_API void         redfs_path_cache_close(void);
+
+/* Which mounted archives have not been harvested yet, as indices into
+ * redfs_depot_archive_path(). Pass NULL/0 to ask only how many; out_count is the
+ * TOTAL, not the number written (as redfs_find), so a first call sizes a second.
+ *
+ * Requires an open path cache -- without one the answer is always "all of them"
+ * from a call that computed nothing, so it returns REDFS_E_INVALID_ARG. */
+REDFS_API redfs_status redfs_path_cache_pending(const redfs_depot* depot, uint32_t* out_indices,
+                                                uint32_t capacity, uint32_t* out_count);
+
+/* Records one archive as harvested. Call it after finishing THAT archive, not
+ * after the whole sweep, so a teach interrupted halfway loses only the rest
+ * rather than recording coverage it does not have. */
+REDFS_API redfs_status redfs_path_cache_mark(const redfs_depot* depot, uint32_t archive_index);
+
 /* ------------------------------------------------------------------------- */
 /* find                                                                       */
 /* ------------------------------------------------------------------------- */

@@ -764,6 +764,28 @@ const char* redfs_path_from_hash(uint64_t hash) {
     }
 }
 
+// --- path cache --------------------------------------------------------------
+//
+// open sizes its loops from counts in a file and flush builds the whole image in
+// memory, so both allocate from data the caller does not control and need the
+// ABI's exception barrier. pending and mark are guarded for consistency.
+redfs_status redfs_path_cache_open(const redfs_depot* depot, const char* cache_file) {
+    REDFS_GUARD(path_cache_open(depot, cache_file));
+}
+
+redfs_status redfs_path_cache_flush(void) { REDFS_GUARD(path_cache_flush()); }
+
+void redfs_path_cache_close(void) { REDFS_GUARD_VOID(path_cache_close()); }
+
+redfs_status redfs_path_cache_pending(const redfs_depot* depot, uint32_t* out_indices,
+                                      uint32_t capacity, uint32_t* out_count) {
+    REDFS_GUARD(path_cache_pending(depot, out_indices, capacity, out_count));
+}
+
+redfs_status redfs_path_cache_mark(const redfs_depot* depot, uint32_t archive_index) {
+    REDFS_GUARD(path_cache_mark(depot, archive_index));
+}
+
 // --- find --------------------------------------------------------------------
 
 // Guarded: the match set is accumulated in a vector sized by how many entries
@@ -981,6 +1003,10 @@ void redfs_shutdown(void) {
     // Every host is required to make this call, so an allocation failure here
     // must not take the game down on the way out.
     REDFS_GUARD_VOID(cache_close());
+    // Same reasoning, same guard. Without it a host that shuts down the
+    // documented way but never calls redfs_path_cache_close loses the whole
+    // session's learning and re-pays the teach next start-up.
+    REDFS_GUARD_VOID(path_cache_close());
     // After the join, so no decode is still holding a block. Without this the
     // scratch pool -- up to ~450 KB per concurrent decode -- outlives an
     // unload/reload cycle and shows up as a leak under ASan.

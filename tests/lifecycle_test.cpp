@@ -162,6 +162,182 @@ int scenario_virgin_dictionary() {
     return rc;
 }
 
+// --- path cache round trip ---------------------------------------------------
+//
+// The claim the whole design rests on: the run that RESTORES the dictionary
+// knows everything the run that built it knew. It cannot be tested in
+// redfs_test -- the dictionary is a never-destroyed global, so by the time a
+// second "boot" ran in-process the entries would still be there from the first
+// and a restore that dropped every one of them would still pass.
+//
+// Two children over one file. The first teaches and writes; the second starts
+// from nothing and must come back whole.
+
+const char* pc_cache_file() {
+    static const std::string s = temp_path("pathcache.bin");
+    return s.c_str();
+}
+const char* pc_archive_file() {
+    static const std::string s = temp_path("pathcache.archive");
+    return s.c_str();
+}
+const char* pc_count_file() {
+    static const std::string s = temp_path("pathcache.count");
+    return s.c_str();
+}
+
+// Paths reachable only through sources redfs_path_load would have filtered out:
+// nothing mounted holds either, so a restore that filtered would drop both.
+const char* kPcImported = "base\\pathcache\\life_import.mt";
+const char* kPcAdded = "base\\pathcache\\life_added.mesh";
+
+std::vector<uint8_t> pc_cr2w_with_import(const char* import_path) {
+    fixture::Cr2wBuilder b;
+    b.import(import_path, "IMaterial");
+    b.begin_chunk("Root");
+    b.prop_u32("x", 1);
+    b.end_chunk();
+    return b.build();
+}
+
+int scenario_path_cache_teach() {
+    fixture::ArchiveBuilder ab;
+    ab.add(redfs_hash("base\\pathcache\\life.bin"), std::vector<uint8_t>(32, 0x7E));
+    fixture::ArchiveBuilder::write(pc_archive_file(), ab.build());
+    std::remove(pc_cache_file());
+
+    redfs_depot* depot = nullptr;
+    if (redfs_depot_open_empty(&depot) != REDFS_OK) return 1;
+    if (redfs_depot_mount(depot, pc_archive_file()) != REDFS_OK) return 1;
+
+    int rc = 0;
+    if (redfs_path_count() != 0) {
+        std::printf("child: dictionary was not empty at startup (%u)\n", redfs_path_count());
+        rc = 1;
+    }
+    if (redfs_path_cache_open(depot, pc_cache_file()) != REDFS_OK) {
+        std::printf("child: path cache would not open\n");
+        return 1;
+    }
+
+    // Learned, not loaded: opening the cache is the ONLY thing that switched the
+    // dictionary on here -- no redfs_path_enable, no redfs_path_load -- so an
+    // import that fails to land means open forgot to enable it.
+    const std::vector<uint8_t> doc = pc_cr2w_with_import(kPcImported);
+    redfs_cr2w* cr2w = nullptr;
+    if (redfs_cr2w_open(doc.data(), doc.size(), &cr2w) != REDFS_OK) {
+        std::printf("child: fixture cr2w would not parse\n");
+        rc = 1;
+    }
+    redfs_cr2w_close(cr2w);
+    if (!redfs_path_from_hash(redfs_hash(kPcImported))) {
+        std::printf("child: opening a path cache did not enable import learning\n");
+        rc = 1;
+    }
+    redfs_path_add(kPcAdded);
+
+    uint32_t pending = 99;
+    if (redfs_path_cache_pending(depot, nullptr, 0, &pending) != REDFS_OK || pending != 1) {
+        std::printf("child: expected 1 unharvested archive, got %u\n", pending);
+        rc = 1;
+    }
+    if (redfs_path_cache_mark(depot, 0) != REDFS_OK) {
+        std::printf("child: mark failed\n");
+        rc = 1;
+    }
+
+    const uint32_t total = redfs_path_count();
+    redfs_path_cache_close();  // flushes
+    redfs_depot_close(depot);
+
+    FILE* f = std::fopen(pc_count_file(), "wb");
+    if (!f) return 1;
+    std::fprintf(f, "%u", total);
+    std::fclose(f);
+
+    if (!rc) std::printf("child: taught and wrote %u paths\n", total);
+    std::fflush(stdout);
+    return rc;
+}
+
+int scenario_path_cache_restore() {
+    redfs_depot* depot = nullptr;
+    if (redfs_depot_open_empty(&depot) != REDFS_OK) return 1;
+    if (redfs_depot_mount(depot, pc_archive_file()) != REDFS_OK) return 1;
+
+    int rc = 0;
+    if (redfs_path_count() != 0) {
+        std::printf("child: dictionary was not empty at startup (%u)\n", redfs_path_count());
+        rc = 1;
+    }
+
+    uint32_t expected = 0;
+    FILE* f = std::fopen(pc_count_file(), "rb");
+    if (!f || std::fscanf(f, "%u", &expected) != 1) {
+        std::printf("child: no count from the teaching run\n");
+        if (f) std::fclose(f);
+        return 1;
+    }
+    std::fclose(f);
+
+    if (redfs_path_cache_open(depot, pc_cache_file()) != REDFS_OK) {
+        std::printf("child: path cache would not open\n");
+        return 1;
+    }
+
+    // THE assertion. Not ">= 1", not "the one I looked up": the count. A restore
+    // that ran its entries through the depot filter comes back smaller here
+    // while every individual lookup a test happened to try still worked.
+    if (redfs_path_count() != expected) {
+        std::printf("child: restored %u paths, the run that wrote them knew %u\n",
+                    redfs_path_count(), expected);
+        rc = 1;
+    }
+    // Both of these are names NO mounted archive holds. That is exactly what the
+    // filter would have removed.
+    if (!redfs_path_from_hash(redfs_hash(kPcImported))) {
+        std::printf("child: the import-learned path did not survive the round trip\n");
+        rc = 1;
+    }
+    if (!redfs_path_from_hash(redfs_hash(kPcAdded))) {
+        std::printf("child: the added path did not survive the round trip\n");
+        rc = 1;
+    }
+    // And they are still only NAMES -- restoring must not imply presence.
+    if (redfs_exists(depot, redfs_hash(kPcAdded))) {
+        std::printf("child: a restored name reported as present in the depot\n");
+        rc = 1;
+    }
+
+    uint32_t pending = 99;
+    if (redfs_path_cache_pending(depot, nullptr, 0, &pending) != REDFS_OK || pending != 0) {
+        std::printf("child: archive was harvested last run but reads as %u pending\n", pending);
+        rc = 1;
+    }
+
+    // Learning still works on the restored dictionary. A restore that filled the
+    // dictionary without enabling it looks perfect until the first new mod.
+    const char* fresh = "base\\pathcache\\life_after_restore.mt";
+    const std::vector<uint8_t> doc = pc_cr2w_with_import(fresh);
+    redfs_cr2w* cr2w = nullptr;
+    if (redfs_cr2w_open(doc.data(), doc.size(), &cr2w) != REDFS_OK) rc = 1;
+    redfs_cr2w_close(cr2w);
+    if (!redfs_path_from_hash(redfs_hash(fresh))) {
+        std::printf("child: a restored dictionary stopped learning new imports\n");
+        rc = 1;
+    }
+
+    redfs_path_cache_close();
+    redfs_depot_close(depot);
+    std::remove(pc_cache_file());
+    std::remove(pc_archive_file());
+    std::remove(pc_count_file());
+
+    if (!rc) std::printf("child: %u paths restored intact, nothing left to harvest\n", expected);
+    std::fflush(stdout);
+    return rc;
+}
+
 // The same, but through ExitProcess -- a harder abort than returning from main,
 // because no C++ cleanup runs at all.
 int scenario_abrupt_exit_process() {
@@ -412,6 +588,8 @@ int main(int argc, char** argv) {
         const char* s = argv[1];
         if (std::strcmp(s, "exit-without-shutdown") == 0) return scenario_exit_without_shutdown();
         if (std::strcmp(s, "virgin-dictionary") == 0) return scenario_virgin_dictionary();
+        if (std::strcmp(s, "path-cache-teach") == 0) return scenario_path_cache_teach();
+        if (std::strcmp(s, "path-cache-restore") == 0) return scenario_path_cache_restore();
         if (std::strcmp(s, "abrupt-exit") == 0) return scenario_abrupt_exit_process();
         if (std::strcmp(s, "shutdown-latency") == 0) return scenario_shutdown_latency();
         if (std::strcmp(s, "dll-unload") == 0) {
@@ -432,6 +610,11 @@ int main(int argc, char** argv) {
     // Not about teardown, but it needs the same thing the teardown scenarios do:
     // a process whose global singletons have never been touched.
     check("virgin path dictionary", run_child(self_path, "virgin-dictionary", 15000), 15000);
+    // Ordered, and the pair IS the test: the second child restores what the
+    // first wrote, from a dictionary that has never held anything.
+    check("path cache: teach and write", run_child(self_path, "path-cache-teach", 15000), 15000);
+    check("path cache: restore into a virgin dictionary",
+          run_child(self_path, "path-cache-restore", 15000), 15000);
     check("exit without shutdown", run_child(self_path, "exit-without-shutdown", 15000), 15000);
     check("abrupt ExitProcess", run_child(self_path, "abrupt-exit", 15000), 15000);
     check("shutdown under load", run_child(self_path, "shutdown-latency", 20000), 20000);

@@ -343,6 +343,11 @@ bool cache_is_open(const redfs_depot* depot);
 // A fingerprint of the mounted archive set; the cache is discarded when it moves.
 uint64_t depot_fingerprint(const redfs_depot* depot);
 
+// The same five fields over ONE archive. The path cache records these per
+// archive instead of one digest over the set, so installing a mod costs
+// harvesting that mod rather than everything.
+uint64_t archive_fingerprint(const Archive* a);
+
 // --- path dictionary ---------------------------------------------------------
 
 redfs_status paths_load(const redfs_depot* depot, const char* file, uint32_t* out_kept);
@@ -357,6 +362,21 @@ uint32_t paths_count();
 // actually holds. Null depot means no filter.
 redfs_status paths_find(const redfs_depot* depot, const char* pattern, redfs_find_fn fn,
                         void* user, uint32_t* out_matched);
+
+// --- path cache --------------------------------------------------------------
+//
+// Never discarded, only merged into -- a hash -> name mapping cannot go stale.
+// Restores through paths_add's route, so restored entries keep the unfiltered
+// semantics redfs.h promises. See the header comment in paths.cpp.
+redfs_status path_cache_open(const redfs_depot* depot, const char* file);
+redfs_status path_cache_flush();
+void path_cache_close();
+// Archives not yet harvested, as indices into depot->archives. `out_count` is
+// the TOTAL, not the number written, so capacity 0 sizes a buffer.
+redfs_status path_cache_pending(const redfs_depot* depot, uint32_t* out_indices,
+                                uint32_t capacity, uint32_t* out_count);
+// Per archive, not per sweep: a teach that dies halfway loses only the rest.
+redfs_status path_cache_mark(const redfs_depot* depot, uint32_t archive_index);
 
 // --- blobs -------------------------------------------------------------------
 

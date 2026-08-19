@@ -256,7 +256,8 @@ makes reads concurrency-safe.
    **cancels** it, every callback firing with `REDFS_E_CANCELLED` and none dropped;
    **joins** the worker, which is gone before the call returns; then calls
    `redfs_cache_close()`, which flushes pending mesh entries and clears the cache's
-   owner pointer.
+   owner pointer, and `redfs_path_cache_close()`, which writes anything the
+   dictionary learned this session.
 3. **`redfs_depot_close(depot)`** unmaps every archive index, closes the file and
    mapping handles, frees the index.
 4. RED4ext `FreeLibrary`s your plugin. Nothing of yours is running.

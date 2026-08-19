@@ -2335,6 +2335,785 @@ TEST(paths, returned_pointer_survives_later_additions) {
 }
 
 // =============================================================================
+// path cache
+// =============================================================================
+//
+// The dictionary is a never-destroyed global and under _DEBUG this binary runs
+// the whole suite three times, so nothing here may assume an empty dictionary or
+// assert an exact total. Every case below asserts presence, or a delta it
+// creates itself. The genuine second-boot round trip -- "the dictionary is not
+// SMALLER on the run that restored it" -- needs a virgin process and lives in
+// lifecycle_test.cpp.
+
+namespace {
+
+// An 'RFPC' file built by the test rather than by RedFS.
+//
+// Independent of src/paths.cpp on purpose, the same way fixtures.cpp is
+// independent of the archive reader: if the writer and this disagree about the
+// format, one of them has it wrong, and a test that round-tripped through the
+// library's own writer could not tell which.
+std::vector<uint8_t> make_path_cache(const std::vector<uint64_t>& archives,
+                                     const std::vector<std::string>& paths) {
+    fixture::Buf b;
+    b.u32(0x43504652);  // 'RFPC'
+    b.u32(1);           // version
+    b.u32(static_cast<uint32_t>(archives.size()));
+    b.u32(static_cast<uint32_t>(paths.size()));
+    for (uint64_t a : archives) b.u64(a);
+    for (const auto& p : paths) {
+        b.u32(static_cast<uint32_t>(p.size()));
+        b.raw(p.data(), p.size());
+    }
+    return b.bytes;
+}
+
+bool write_bytes(const std::string& path, const std::vector<uint8_t>& bytes) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+    std::fclose(f);
+    return ok;
+}
+
+bool read_bytes(const std::string& path, std::vector<uint8_t>* out) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long len = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (len < 0) {
+        std::fclose(f);
+        return false;
+    }
+    out->resize(static_cast<size_t>(len));
+    const bool ok = std::fread(out->data(), 1, out->size(), f) == out->size();
+    std::fclose(f);
+    return ok;
+}
+
+// Parses an 'RFPC' file the library wrote. Returns false if it does not parse.
+struct ParsedCache {
+    uint32_t declared_archives = 0;
+    uint32_t declared_paths = 0;
+    std::vector<uint64_t> archives;
+    std::vector<std::string> paths;
+
+    bool holds(const std::string& want) const {
+        return std::find(paths.begin(), paths.end(), want) != paths.end();
+    }
+};
+
+bool parse_path_cache(const std::string& file, ParsedCache* out) {
+    std::vector<uint8_t> b;
+    if (!read_bytes(file, &b) || b.size() < 16) return false;
+    auto u32 = [&b](size_t at) {
+        uint32_t v;
+        std::memcpy(&v, b.data() + at, 4);
+        return v;
+    };
+    if (u32(0) != 0x43504652 || u32(4) != 1) return false;
+    out->declared_archives = u32(8);
+    out->declared_paths = u32(12);
+
+    size_t p = 16;
+    for (uint32_t i = 0; i < out->declared_archives; ++i) {
+        if (p + 8 > b.size()) return false;
+        uint64_t v;
+        std::memcpy(&v, b.data() + p, 8);
+        out->archives.push_back(v);
+        p += 8;
+    }
+    for (uint32_t i = 0; i < out->declared_paths; ++i) {
+        if (p + 4 > b.size()) return false;
+        const uint32_t n = u32(p);
+        p += 4;
+        if (p + n > b.size()) return false;
+        out->paths.emplace_back(reinterpret_cast<const char*>(b.data() + p), n);
+        p += n;
+    }
+    return true;
+}
+
+// A one-file archive whose content is `fill`, so two of them differ in bytes
+// while agreeing on every shape field the fingerprint could have used instead.
+std::vector<uint8_t> one_file_archive(const char* depot_path, uint8_t fill) {
+    ArchiveBuilder ab;
+    ab.add(redfs_hash(depot_path), std::vector<uint8_t>(64, fill));
+    return ab.build();
+}
+
+}  // namespace
+
+TEST(path_cache, restore_does_not_filter_against_the_depot) {
+    // The regression this whole design turns on. redfs_path_load filters its
+    // list against the mounted depot; import learning and redfs_path_add
+    // deliberately do not, because redfs.h says a hit tells you what a file is
+    // CALLED, not that it is readable.
+    //
+    // Restoring through the filtering route would hand back a SMALLER dictionary
+    // on the second run than the first: a name learned yesterday from a mod's
+    // import table quietly stops resolving once that name is restored instead of
+    // relearned -- with nothing in the log, because dropping unresolvable lines
+    // is what redfs_path_load is supposed to do.
+    const char* absent = "base\\pathcache\\never_mounted_9c31.mesh";
+    const uint64_t absent_hash = redfs_hash(absent);
+
+    TempDepot d("pc_nofilter.archive", one_file_archive("base\\pathcache\\present.bin", 0x11));
+    if (!d.depot) return;
+
+    const std::string cache_file = temp_path("pc_nofilter.cache");
+    CHECK(write_bytes(cache_file, make_path_cache({}, {absent})));
+
+    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+
+    // The depot does NOT hold it -- that is the point of the case.
+    CHECK_EQ(redfs_exists(d.depot, absent_hash), 0);
+    // ...and it still resolves.
+    CHECK_STR(redfs_path_from_hash(absent_hash), absent);
+
+    redfs_path_cache_close();
+    std::remove(cache_file.c_str());
+}
+
+TEST(path_cache, the_written_file_keeps_unfiltered_entries) {
+    // The other half of the same contract: the DUMP has to include entries no
+    // mounted archive holds, or the restore above never gets the chance.
+    const char* absent = "base\\pathcache\\dump_unfiltered_4e77.mesh";
+
+    TempDepot d("pc_dump.archive", one_file_archive("base\\pathcache\\dump.bin", 0x22));
+    if (!d.depot) return;
+
+    const std::string cache_file = temp_path("pc_dump.cache");
+    std::remove(cache_file.c_str());
+
+    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    redfs_path_add(absent);
+    CHECK_OK(redfs_path_cache_flush());
+    redfs_path_cache_close();
+
+    ParsedCache pc;
+    CHECK(parse_path_cache(cache_file, &pc));
+    CHECK(pc.holds(absent));
+    // The header must agree with what follows it, or the next open reports a
+    // truncation that did not happen.
+    CHECK_EQ(pc.declared_paths, (uint32_t)pc.paths.size());
+    std::remove(cache_file.c_str());
+}
+
+TEST(path_cache, hashes_are_recovered_from_the_stored_string) {
+    // Nothing in the file records a hash: it is recomputed on restore. That only
+    // works because every intern route stores the string in the form it hashed.
+    // A path that needs sanitizing is where the two could diverge -- store the
+    // raw text and the entry files under a key redfs_hash can never produce, so
+    // it is permanently dead and the name never resolves again.
+    const char* messy = "Base/PathCache/Mixed Case_5A1D.MESH";
+    const uint64_t canonical = redfs_hash(messy);
+
+    TempDepot d("pc_hash.archive", one_file_archive("base\\pathcache\\h.bin", 0x33));
+    if (!d.depot) return;
+
+    const std::string cache_file = temp_path("pc_hash.cache");
+    std::remove(cache_file.c_str());
+
+    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    redfs_path_add(messy);
+    CHECK_OK(redfs_path_cache_flush());
+    redfs_path_cache_close();
+
+    ParsedCache pc;
+    CHECK(parse_path_cache(cache_file, &pc));
+    // Stored normalised, not as typed.
+    CHECK(pc.holds("base\\pathcache\\mixed case_5a1d.mesh"));
+    // And it still resolves under the hash redfs_hash produces for the original.
+    CHECK_STR(redfs_path_from_hash(canonical), "base\\pathcache\\mixed case_5a1d.mesh");
+    std::remove(cache_file.c_str());
+}
+
+TEST(path_cache, only_the_new_archive_is_pending) {
+    // Installing a mod must cost harvesting that mod. With one digest over the
+    // whole archive set this is where the cache would be discarded outright and
+    // the caller would re-read every archive it had already read.
+    const std::string p1 = temp_path("pc_new1.archive");
+    const std::string p2 = temp_path("pc_new2.archive");
+    write_bytes(p1, one_file_archive("base\\pathcache\\n1.bin", 0x44));
+    write_bytes(p2, one_file_archive("base\\pathcache\\n2.bin", 0x55));
+    const std::string cache_file = temp_path("pc_new.cache");
+    std::remove(cache_file.c_str());
+
+    redfs_depot* d = nullptr;
+    redfs_depot_open_empty(&d);
+    if (d) {
+        CHECK_OK(redfs_depot_mount(d, p1.c_str()));
+        CHECK_OK(redfs_path_cache_open(d, cache_file.c_str()));
+
+        uint32_t idx[4] = {99, 99, 99, 99};
+        uint32_t n = 0;
+        CHECK_OK(redfs_path_cache_pending(d, idx, 4, &n));
+        CHECK_EQ(n, 1u);
+        CHECK_EQ(idx[0], 0u);
+
+        CHECK_OK(redfs_path_cache_mark(d, 0));
+        CHECK_OK(redfs_path_cache_pending(d, idx, 4, &n));
+        CHECK_EQ(n, 0u);
+
+        // Mounting AFTER the cache was opened needs no wiring: pending is
+        // computed against the depot as it is when asked.
+        CHECK_OK(redfs_depot_mount(d, p2.c_str()));
+        CHECK_OK(redfs_path_cache_pending(d, idx, 4, &n));
+        CHECK_EQ(n, 1u);
+        CHECK_EQ(idx[0], 1u);  // the new one, not the one already harvested
+
+        CHECK_OK(redfs_path_cache_mark(d, 1));
+        CHECK_OK(redfs_path_cache_flush());
+        redfs_path_cache_close();
+
+        // Reopening on the same depot must find nothing left to do -- that is
+        // the whole saving.
+        CHECK_OK(redfs_path_cache_open(d, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_pending(d, idx, 4, &n));
+        CHECK_EQ(n, 0u);
+        redfs_path_cache_close();
+        redfs_depot_close(d);
+    }
+    std::remove(cache_file.c_str());
+    std::remove(p1.c_str());
+    std::remove(p2.c_str());
+}
+
+TEST(path_cache, mount_order_does_not_force_a_reharvest) {
+    // depot_fingerprint mixes archives in MOUNT order, so the same archives
+    // mounted the other way round give a different u64. For the mesh cache that
+    // costs a re-warm in milliseconds; here it would cost the entire teach, over
+    // a depot that did not change at all. Recording a digest per archive and
+    // comparing sets rather than one ordered value is what makes it a non-issue.
+    const std::string p1 = temp_path("pc_ord1.archive");
+    const std::string p2 = temp_path("pc_ord2.archive");
+    write_bytes(p1, one_file_archive("base\\pathcache\\o1.bin", 0x66));
+    write_bytes(p2, one_file_archive("base\\pathcache\\o2.bin", 0x77));
+    const std::string cache_file = temp_path("pc_order.cache");
+    std::remove(cache_file.c_str());
+
+    redfs_depot* a = nullptr;
+    redfs_depot_open_empty(&a);
+    if (a) {
+        CHECK_OK(redfs_depot_mount(a, p1.c_str()));
+        CHECK_OK(redfs_depot_mount(a, p2.c_str()));
+        CHECK_OK(redfs_path_cache_open(a, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_mark(a, 0));
+        CHECK_OK(redfs_path_cache_mark(a, 1));
+        CHECK_OK(redfs_path_cache_flush());
+        redfs_path_cache_close();
+        redfs_depot_close(a);
+    }
+
+    redfs_depot* b = nullptr;
+    redfs_depot_open_empty(&b);
+    if (b) {
+        CHECK_OK(redfs_depot_mount(b, p2.c_str()));  // reversed
+        CHECK_OK(redfs_depot_mount(b, p1.c_str()));
+        CHECK_OK(redfs_path_cache_open(b, cache_file.c_str()));
+        uint32_t n = 123;
+        CHECK_OK(redfs_path_cache_pending(b, nullptr, 0, &n));
+        CHECK_EQ(n, 0u);
+        redfs_path_cache_close();
+        redfs_depot_close(b);
+    }
+    std::remove(cache_file.c_str());
+    std::remove(p1.c_str());
+    std::remove(p2.c_str());
+}
+
+TEST(path_cache, an_archive_replaced_in_place_becomes_pending_again) {
+    // The case path, entry count and index size are all blind to: re-cook a file
+    // and repack, and as long as the shape is unchanged those three are
+    // byte-identical. A mod updated in place adds paths, and without the index
+    // CRC in the per-archive digest they would never be harvested.
+    const std::string p = temp_path("pc_recook.archive");
+    const std::vector<uint8_t> v1 = one_file_archive("base\\pathcache\\r.bin", 0x01);
+    const std::vector<uint8_t> v2 = one_file_archive("base\\pathcache\\r.bin", 0x02);
+    // The premise. If these ever diverge in length the test has stopped
+    // exercising what it was written for.
+    CHECK_EQ(v1.size(), v2.size());
+
+    const std::string cache_file = temp_path("pc_recook.cache");
+    std::remove(cache_file.c_str());
+    write_bytes(p, v1);
+
+    redfs_depot* d = nullptr;
+    redfs_depot_open_empty(&d);
+    if (d) {
+        CHECK_OK(redfs_depot_mount(d, p.c_str()));
+        CHECK_OK(redfs_path_cache_open(d, cache_file.c_str()));
+        CHECK_OK(redfs_path_cache_mark(d, 0));
+        CHECK_OK(redfs_path_cache_flush());
+        redfs_path_cache_close();
+        redfs_depot_close(d);
+    }
+
+    write_bytes(p, v2);  // same path, same shape, different content
+
+    redfs_depot* d2 = nullptr;
+    redfs_depot_open_empty(&d2);
+    if (d2) {
+        CHECK_OK(redfs_depot_mount(d2, p.c_str()));
+        CHECK_OK(redfs_path_cache_open(d2, cache_file.c_str()));
+        uint32_t n = 0;
+        CHECK_OK(redfs_path_cache_pending(d2, nullptr, 0, &n));
+        CHECK_EQ(n, 1u);
+        redfs_path_cache_close();
+        redfs_depot_close(d2);
+    }
+    std::remove(cache_file.c_str());
+    std::remove(p.c_str());
+}
+
+TEST(path_cache, flush_writes_nothing_when_nothing_was_learned) {
+    // Restore goes through add_locked, the same insert path everything else
+    // uses. A plain dirty FLAG would therefore be set by the restore itself and
+    // rewrite a byte-identical file -- 40 MB on a real dictionary -- at every
+    // single start-up.
+    //
+    // Deleting the file and flushing is the crisp observable: if the flush is
+    // genuinely a no-op the file stays gone, with no dependence on timestamp
+    // granularity.
+    TempDepot d("pc_noop.archive", one_file_archive("base\\pathcache\\noop.bin", 0x88));
+    if (!d.depot) return;
+
+    const std::string cache_file = temp_path("pc_noop.cache");
+    std::remove(cache_file.c_str());
+
+    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    redfs_path_add("base\\pathcache\\noop_entry_b2f4.mesh");
+    CHECK_OK(redfs_path_cache_mark(d.depot, 0));
+    CHECK_OK(redfs_path_cache_flush());
+    redfs_path_cache_close();
+
+    // Reopen: restores exactly what it wrote, so there is nothing new to say.
+    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    std::remove(cache_file.c_str());
+    CHECK_OK(redfs_path_cache_flush());
+    std::vector<uint8_t> b;
+    CHECK(!read_bytes(cache_file, &b));  // still absent -- nothing was written
+
+    // But one new path must bring it straight back.
+    //
+    // New on EVERY pass, which is why this is generated rather than a literal.
+    // The dictionary is a never-destroyed global and this binary runs the whole
+    // suite three times under _DEBUG, so re-adding a name pass one already
+    // learned adds nothing -- the flush below stays a correct no-op, and the
+    // test would be asserting against a file nothing wrote.
+    static int pass = 0;
+    char fresh[96];
+    std::snprintf(fresh, sizeof fresh, "base\\pathcache\\noop_entry_c3a9_%d.mesh", ++pass);
+    redfs_path_add(fresh);
+    CHECK_OK(redfs_path_cache_flush());
+    ParsedCache pc;
+    CHECK(parse_path_cache(cache_file, &pc));
+    CHECK(pc.holds(fresh));
+    CHECK(pc.holds("base\\pathcache\\noop_entry_b2f4.mesh"));  // and kept the old one
+
+    redfs_path_cache_close();
+    std::remove(cache_file.c_str());
+}
+
+TEST(path_cache, a_truncated_file_restores_what_survived_and_is_rewritten) {
+    // A file that lost its tail still DECLARES whatever it declared, so a load
+    // that only compared counts would report the truncation at every start-up
+    // forever while never repairing it.
+    TempDepot d("pc_trunc.archive", one_file_archive("base\\pathcache\\t.bin", 0x99));
+    if (!d.depot) return;
+
+    const std::string cache_file = temp_path("pc_trunc.cache");
+    const char* survives = "base\\pathcache\\trunc_head_7d20.mesh";
+    const char* lost = "base\\pathcache\\trunc_tail_7d21.mesh";
+
+    std::vector<uint8_t> bytes = make_path_cache({}, {survives, lost});
+    bytes.resize(bytes.size() - 12);  // cut into the middle of the last record
+    CHECK(write_bytes(cache_file, bytes));
+
+    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_STR(redfs_path_from_hash(redfs_hash(survives)), survives);
+
+    // Nothing new was learned, yet the file must still be rewritten: what is on
+    // disk is not what a flush would write.
+    CHECK_OK(redfs_path_cache_flush());
+    ParsedCache pc;
+    CHECK(parse_path_cache(cache_file, &pc));
+    CHECK_EQ(pc.declared_paths, (uint32_t)pc.paths.size());
+    CHECK(pc.holds(survives));
+
+    redfs_path_cache_close();
+    std::remove(cache_file.c_str());
+}
+
+TEST(path_cache, a_partial_restore_does_not_keep_its_coverage) {
+    // The coverage digests sit at the FRONT of the file and the paths at the
+    // BACK, so a tail truncation restores EVERY digest and only some paths.
+    // Keeping them publishes full coverage over a partial dictionary: pending
+    // answers "nothing to do", the host reads nothing, the lost paths never come
+    // back -- and the rewrite writes that lie down, so it survives every later
+    // run too.
+    //
+    // The sibling truncation test cannot see this: it builds its file with ZERO
+    // archive digests, so the one interaction that matters is absent from it.
+    // The file here is written by the LIBRARY, so the digest inside really is
+    // the mounted archive's and a kept one really would read as harvested.
+    const std::string p = temp_path("pc_partial.archive");
+    write_bytes(p, one_file_archive("base\\pathcache\\pt.bin", 0x3C));
+    const std::string cache_file = temp_path("pc_partial.cache");
+    std::remove(cache_file.c_str());
+
+    redfs_depot* d = nullptr;
+    redfs_depot_open_empty(&d);
+    if (d) {
+        CHECK_OK(redfs_depot_mount(d, p.c_str()));
+        CHECK_OK(redfs_path_cache_open(d, cache_file.c_str()));
+        redfs_path_add("base\\pathcache\\partial_a_8801.mesh");
+        redfs_path_add("base\\pathcache\\partial_b_8802.mesh");
+        CHECK_OK(redfs_path_cache_mark(d, 0));
+        CHECK_OK(redfs_path_cache_flush());
+        redfs_path_cache_close();
+
+        ParsedCache full;
+        CHECK(parse_path_cache(cache_file, &full));
+        CHECK_EQ(full.declared_archives, 1u);  // the premise: coverage was recorded
+
+        // Cut into the path records at the back, leaving every digest intact.
+        std::vector<uint8_t> bytes;
+        CHECK(read_bytes(cache_file, &bytes));
+        bytes.resize(bytes.size() - 12);
+        CHECK(write_bytes(cache_file, bytes));
+
+        CHECK_OK(redfs_path_cache_open(d, cache_file.c_str()));
+        uint32_t n = 0;
+        CHECK_OK(redfs_path_cache_pending(d, nullptr, 0, &n));
+        CHECK_EQ(n, 1u);  // NOT 0 -- the archive must be read again
+
+        // And the rewrite must not put the coverage back.
+        CHECK_OK(redfs_path_cache_flush());
+        ParsedCache after;
+        CHECK(parse_path_cache(cache_file, &after));
+        CHECK_EQ(after.declared_archives, 0u);
+        CHECK_EQ(after.declared_paths, (uint32_t)after.paths.size());
+
+        redfs_path_cache_close();
+        redfs_depot_close(d);
+    }
+    std::remove(cache_file.c_str());
+    std::remove(p.c_str());
+}
+
+TEST(path_cache, opening_a_second_cache_flushes_the_first) {
+    // c.file, c.harvested and the write bookkeeping are all overwritten by an
+    // open. Without a flush first, everything the previous cache had learned but
+    // not yet written is discarded -- silently, since open returns REDFS_OK.
+    TempDepot d("pc_reopen.archive", one_file_archive("base\\pathcache\\ro.bin", 0x4B));
+    if (!d.depot) return;
+
+    const std::string first = temp_path("pc_reopen_a.cache");
+    const std::string second = temp_path("pc_reopen_b.cache");
+    std::remove(first.c_str());
+    std::remove(second.c_str());
+
+    CHECK_OK(redfs_path_cache_open(d.depot, first.c_str()));
+    static int pass = 0;  // new on every pass; see the no-op test above
+    char fresh[96];
+    std::snprintf(fresh, sizeof fresh, "base\\pathcache\\reopen_%d.mesh", ++pass);
+    redfs_path_add(fresh);
+
+    // No close, no flush -- straight into another cache.
+    CHECK_OK(redfs_path_cache_open(d.depot, second.c_str()));
+
+    ParsedCache pc;
+    CHECK(parse_path_cache(first, &pc));
+    CHECK(pc.holds(fresh));
+
+    redfs_path_cache_close();
+    std::remove(first.c_str());
+    std::remove(second.c_str());
+}
+
+TEST(path_cache, a_write_that_cannot_land_is_reported_and_still_closes) {
+    // redfs_path_cache_close is void and redfs_shutdown discards its status, so
+    // an unwritable target is the one failure a host cannot see. It must at
+    // least surface through flush, and close must reset regardless -- otherwise
+    // the cache still reports itself open and shutdown retries the same doomed
+    // write.
+    TempDepot d("pc_nowrite.archive", one_file_archive("base\\pathcache\\nw.bin", 0x6C));
+    if (!d.depot) return;
+
+    const std::string bad = temp_path("pc_no_such_dir\\nested.cache");
+    CHECK_OK(redfs_path_cache_open(d.depot, bad.c_str()));  // absent file, not an error
+    redfs_path_add("base\\pathcache\\unwritable_9f03.mesh");
+    CHECK_ERR(redfs_path_cache_flush(), REDFS_E_IO);
+
+    redfs_path_cache_close();
+    // Reset happened: the coverage queries refuse again.
+    uint32_t n = 0;
+    CHECK_ERR(redfs_path_cache_pending(d.depot, nullptr, 0, &n), REDFS_E_INVALID_ARG);
+}
+
+TEST(path_cache, an_unusable_record_is_refused_and_the_file_repaired) {
+    // add_locked logs its own rejection of an over-long path, and the restore
+    // holds BOTH the path cache's mutex and the dictionary's -- a host sink that
+    // calls back into RedFS would re-enter a mutex this thread already holds. So
+    // the restore has to refuse the record itself and report after unlocking.
+    //
+    // Observable half: the record is not interned, and the file is rewritten
+    // without it rather than being carried forever.
+    TempDepot d("pc_refuse.archive", one_file_archive("base\\pathcache\\rf.bin", 0x7D));
+    if (!d.depot) return;
+
+    const std::string cache_file = temp_path("pc_refuse.cache");
+    const std::string huge = "base\\pathcache\\" + std::string(2000, 'z') + ".mesh";
+    const char* good = "base\\pathcache\\refuse_good_5e12.mesh";
+    CHECK(write_bytes(cache_file, make_path_cache({}, {good, huge})));
+
+    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_STR(redfs_path_from_hash(redfs_hash(good)), good);
+    CHECK(redfs_path_from_hash(redfs_hash(huge.c_str())) == nullptr);
+
+    CHECK_OK(redfs_path_cache_flush());  // refused record makes the file stale
+    ParsedCache pc;
+    CHECK(parse_path_cache(cache_file, &pc));
+    CHECK(pc.holds(good));
+    CHECK(!pc.holds(huge));
+
+    redfs_path_cache_close();
+    std::remove(cache_file.c_str());
+}
+
+TEST(path_cache, a_bad_header_starts_fresh_rather_than_failing) {
+    // Same stance as the mesh cache: an unreadable cache is a cache, not an
+    // error the caller has to handle. It must not stop the depot from working.
+    TempDepot d("pc_bad.archive", one_file_archive("base\\pathcache\\b.bin", 0xAA));
+    if (!d.depot) return;
+
+    const std::string cache_file = temp_path("pc_bad.cache");
+    CHECK(write_bytes(cache_file, std::vector<uint8_t>(64, 0xEE)));
+
+    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    redfs_path_add("base\\pathcache\\after_bad_header_1f88.mesh");
+    CHECK_OK(redfs_path_cache_flush());
+
+    ParsedCache pc;
+    CHECK(parse_path_cache(cache_file, &pc));  // overwritten with a good one
+    CHECK(pc.holds("base\\pathcache\\after_bad_header_1f88.mesh"));
+
+    redfs_path_cache_close();
+    std::remove(cache_file.c_str());
+}
+
+TEST(path_cache, declared_counts_cannot_outrun_the_file) {
+    // Both counts are attacker-controlled in the sense that matters: the file
+    // lives on disk under a name the host chose, and a 16-byte one claiming four
+    // billion of either must not be believed. Under ASan this is the case that
+    // catches a read past the buffer.
+    TempDepot d("pc_liar.archive", one_file_archive("base\\pathcache\\l.bin", 0xBB));
+    if (!d.depot) return;
+
+    const std::string cache_file = temp_path("pc_liar.cache");
+
+    // Header only, claiming a huge archive count.
+    {
+        fixture::Buf b;
+        b.u32(0x43504652);
+        b.u32(1);
+        b.u32(0xFFFFFFFFu);
+        b.u32(0);
+        CHECK(write_bytes(cache_file, b.bytes));
+        CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+        redfs_path_cache_close();
+    }
+    // A huge path count with two real records behind it: the walk must stop at
+    // the end of the buffer, not at the declared count.
+    {
+        std::vector<uint8_t> bytes =
+            make_path_cache({}, {"base\\pathcache\\liar_a_3c50.mesh"});
+        std::memset(bytes.data() + 12, 0xFF, 4);  // declared_paths = 0xFFFFFFFF
+        CHECK(write_bytes(cache_file, bytes));
+        CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+        CHECK_STR(redfs_path_from_hash(redfs_hash("base\\pathcache\\liar_a_3c50.mesh")),
+                  "base\\pathcache\\liar_a_3c50.mesh");
+        redfs_path_cache_close();
+    }
+    // A single record whose length runs off the end.
+    {
+        fixture::Buf b;
+        b.u32(0x43504652);
+        b.u32(1);
+        b.u32(0);
+        b.u32(1);
+        b.u32(0xFFFFFF00u);  // length, with four bytes of payload behind it
+        b.u32(0x41414141u);
+        CHECK(write_bytes(cache_file, b.bytes));
+        CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+        redfs_path_cache_close();
+    }
+    std::remove(cache_file.c_str());
+}
+
+TEST(path_cache, pending_reports_the_total_not_the_delivered) {
+    // Same convention as redfs_find's out_matched, and the reason a caller can
+    // size a buffer from a first call with capacity 0.
+    const std::string p1 = temp_path("pc_cap1.archive");
+    const std::string p2 = temp_path("pc_cap2.archive");
+    const std::string p3 = temp_path("pc_cap3.archive");
+    write_bytes(p1, one_file_archive("base\\pathcache\\c1.bin", 0xC1));
+    write_bytes(p2, one_file_archive("base\\pathcache\\c2.bin", 0xC2));
+    write_bytes(p3, one_file_archive("base\\pathcache\\c3.bin", 0xC3));
+    const std::string cache_file = temp_path("pc_cap.cache");
+    std::remove(cache_file.c_str());
+
+    redfs_depot* d = nullptr;
+    redfs_depot_open_empty(&d);
+    if (d) {
+        CHECK_OK(redfs_depot_mount(d, p1.c_str()));
+        CHECK_OK(redfs_depot_mount(d, p2.c_str()));
+        CHECK_OK(redfs_depot_mount(d, p3.c_str()));
+        CHECK_OK(redfs_path_cache_open(d, cache_file.c_str()));
+
+        uint32_t n = 0;
+        CHECK_OK(redfs_path_cache_pending(d, nullptr, 0, &n));  // count-only probe
+        CHECK_EQ(n, 3u);
+
+        uint32_t one[1] = {99};
+        n = 0;
+        CHECK_OK(redfs_path_cache_pending(d, one, 1, &n));
+        CHECK_EQ(n, 3u);    // the total
+        CHECK_EQ(one[0], 0u);  // and it filled what it could
+
+        redfs_path_cache_close();
+        redfs_depot_close(d);
+    }
+    std::remove(cache_file.c_str());
+    std::remove(p1.c_str());
+    std::remove(p2.c_str());
+    std::remove(p3.c_str());
+}
+
+TEST(path_cache, coverage_queries_refuse_to_answer_without_a_cache) {
+    // "Nothing has been harvested" is a true answer that says nothing, and a
+    // caller who acts on it re-teaches the whole depot every run having asked a
+    // question that computed nothing. redfs_cache_warm refuses the structurally
+    // identical call for the same reason.
+    TempDepot d("pc_closed.archive", one_file_archive("base\\pathcache\\cl.bin", 0xDD));
+    if (!d.depot) return;
+
+    redfs_path_cache_close();  // make sure none is open
+
+    uint32_t n = 123;
+    CHECK_ERR(redfs_path_cache_pending(d.depot, nullptr, 0, &n), REDFS_E_INVALID_ARG);
+    CHECK_EQ(n, 0u);  // and it did not leave a stale count behind
+    CHECK_ERR(redfs_path_cache_mark(d.depot, 0), REDFS_E_INVALID_ARG);
+
+    // Nulls and an out-of-range archive index.
+    CHECK_ERR(redfs_path_cache_open(nullptr, "x"), REDFS_E_INVALID_ARG);
+    CHECK_ERR(redfs_path_cache_open(d.depot, nullptr), REDFS_E_INVALID_ARG);
+    CHECK_ERR(redfs_path_cache_pending(nullptr, nullptr, 0, &n), REDFS_E_INVALID_ARG);
+    CHECK_ERR(redfs_path_cache_mark(nullptr, 0), REDFS_E_INVALID_ARG);
+
+    const std::string cache_file = temp_path("pc_closed.cache");
+    std::remove(cache_file.c_str());
+    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    CHECK_ERR(redfs_path_cache_mark(d.depot, 7), REDFS_E_INVALID_ARG);  // only one mounted
+    // A capacity with nowhere to put the answer.
+    CHECK_ERR(redfs_path_cache_pending(d.depot, nullptr, 4, &n), REDFS_E_INVALID_ARG);
+    redfs_path_cache_close();
+    std::remove(cache_file.c_str());
+}
+
+TEST(path_cache, the_cpp_facade_sizes_its_own_buffer) {
+    // unharvested_archives() is the one facade wrapper with logic rather than a
+    // straight forward: it calls pending twice, sizing from the first call's
+    // TOTAL. If that convention ever changed to "the number delivered" the
+    // second call would return a short list and this is where it shows.
+    const std::string p1 = temp_path("pc_facade1.archive");
+    const std::string p2 = temp_path("pc_facade2.archive");
+    write_bytes(p1, one_file_archive("base\\pathcache\\f1.bin", 0xF1));
+    write_bytes(p2, one_file_archive("base\\pathcache\\f2.bin", 0xF2));
+    const std::string cache_file = temp_path("pc_facade.cache");
+    std::remove(cache_file.c_str());
+
+    redfs_depot* h = nullptr;
+    redfs_depot_open_empty(&h);
+    if (h) {
+        CHECK_OK(redfs_depot_mount(h, p1.c_str()));
+        CHECK_OK(redfs_depot_mount(h, p2.c_str()));
+        redfs::Depot d{h};  // takes ownership
+
+        CHECK(d.enable_path_cache(cache_file.c_str()) == REDFS_OK);
+        std::vector<uint32_t> todo = d.unharvested_archives();
+        CHECK_EQ(todo.size(), 2u);
+
+        for (uint32_t i : todo) CHECK(d.mark_archive_harvested(i) == REDFS_OK);
+        CHECK_EQ(d.unharvested_archives().size(), 0u);
+
+        CHECK(redfs::Depot::flush_path_cache() == REDFS_OK);
+        redfs::Depot::close_path_cache();
+    }
+    std::remove(cache_file.c_str());
+    std::remove(p1.c_str());
+    std::remove(p2.c_str());
+}
+
+TEST(path_cache, closing_keeps_the_dictionary_and_its_pointers) {
+    // Closing says "stop persisting", not "forget". A caller holding a pointer
+    // from redfs_path_from_hash was promised it stays valid for the life of the
+    // process, and nothing about a cache handle changes that.
+    TempDepot d("pc_close.archive", one_file_archive("base\\pathcache\\k.bin", 0xEF));
+    if (!d.depot) return;
+
+    const std::string cache_file = temp_path("pc_close.cache");
+    std::remove(cache_file.c_str());
+
+    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    redfs_path_add("base\\pathcache\\survives_close_6b12.mesh");
+    const char* p = redfs_path_from_hash(redfs_hash("base\\pathcache\\survives_close_6b12.mesh"));
+    CHECK(p != nullptr);
+
+    const uint32_t before = redfs_path_count();
+    redfs_path_cache_close();
+    CHECK_EQ(redfs_path_count(), before);
+    if (p) CHECK_STR(p, "base\\pathcache\\survives_close_6b12.mesh");
+
+    std::remove(cache_file.c_str());
+}
+
+TEST(path_cache, shutdown_flushes_what_was_learned) {
+    // redfs_shutdown already flushes the mesh cache. Without the same for this
+    // one, a host that shuts down exactly as documented but never calls
+    // redfs_path_cache_close loses the whole session's teaching -- and pays the
+    // full re-teach at the next start-up, with nothing to indicate why.
+    TempDepot d("pc_shutdown.archive", one_file_archive("base\\pathcache\\sd.bin", 0x5D));
+    if (!d.depot) return;
+
+    const std::string cache_file = temp_path("pc_shutdown.cache");
+    std::remove(cache_file.c_str());
+
+    CHECK_OK(redfs_path_cache_open(d.depot, cache_file.c_str()));
+    static int pass = 0;  // new on every pass; see the no-op test above
+    char fresh[96];
+    std::snprintf(fresh, sizeof fresh, "base\\pathcache\\shutdown_%d.mesh", ++pass);
+    redfs_path_add(fresh);
+    CHECK_OK(redfs_path_cache_mark(d.depot, 0));
+
+    redfs_shutdown();  // and NO redfs_path_cache_close
+
+    ParsedCache pc;
+    CHECK(parse_path_cache(cache_file, &pc));
+    CHECK(pc.holds(fresh));
+    CHECK_EQ(pc.declared_archives, 1u);
+
+    // It closed as well as flushed, so the coverage queries refuse again.
+    uint32_t n = 0;
+    CHECK_ERR(redfs_path_cache_pending(d.depot, nullptr, 0, &n), REDFS_E_INVALID_ARG);
+
+    std::remove(cache_file.c_str());
+}
+
+// =============================================================================
 // API contracts
 // =============================================================================
 

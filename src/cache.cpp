@@ -291,6 +291,36 @@ uint64_t depot_fingerprint(const redfs_depot* depot) {
     return h;
 }
 
+uint64_t archive_fingerprint(const Archive* a) {
+    // The same five fields depot_fingerprint mixes, scoped to one archive.
+    //
+    // NOT factored out with depot_fingerprint rebuilt as a fold over this: a
+    // fold gives a different u64 than the single running chain there, so every
+    // 'RFMC' file on disk would be discarded once for nothing.
+    //
+    // The path is lowercased, which depot_fingerprint does not do. Windows paths
+    // are case-insensitive, so two spellings are one archive -- and treating
+    // them as two costs a re-harvest, which is minutes rather than a re-warm.
+    uint64_t h = 0xCBF29CE484222325ull;
+    auto mix = [&h](const void* data, size_t len) {
+        const uint8_t* p = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < len; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+    };
+    for (char ch : a->path()) {
+        const char lower = (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+        mix(&lower, 1);
+    }
+    const uint32_t n = a->entry_count();
+    const uint64_t bytes = a->index_bytes();
+    const uint64_t crc = a->index_crc();
+    const uint64_t fsize = a->file_size();
+    mix(&n, sizeof(n));
+    mix(&bytes, sizeof(bytes));
+    mix(&crc, sizeof(crc));
+    mix(&fsize, sizeof(fsize));
+    return h;
+}
+
 redfs_status cache_open(const redfs_depot* depot, const char* file) {
     if (!depot || !file) return REDFS_E_INVALID_ARG;
     Cache& c = cache();

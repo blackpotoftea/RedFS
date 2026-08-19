@@ -554,6 +554,32 @@ restarts. On the reference body mesh: 0.72 ms cold, 0.00 ms warm; a cold open of
 a typical body mesh is 1–2 ms. `redfs_cache_entry_count()` reports how many
 meshes are held.
 
+### And the path cache
+
+Same shape, different guarantees. Learning the dictionary from import tables
+means reading every file that has them — minutes on a modded install — so persist
+it:
+
+```c
+redfs_path_cache_open(depot, "redfs_paths.cache");   /* after everything is mounted */
+
+uint32_t n = 0;
+redfs_path_cache_pending(depot, NULL, 0, &n);        /* archives not yet read */
+uint32_t* todo = malloc(n * sizeof *todo);
+redfs_path_cache_pending(depot, todo, n, &n);
+for (uint32_t i = 0; i < n; ++i) {
+    /* read the files whose redfs_file_info.archive_index == todo[i] */
+    redfs_path_cache_mark(depot, todo[i]);           /* per archive, as it finishes */
+}
+
+redfs_path_cache_close();                            /* or let redfs_shutdown do it */
+```
+
+Unlike the mesh cache it is **never discarded** — a hash → name mapping cannot go
+stale — so it merges rather than invalidating, and installing a mod costs
+harvesting that mod instead of the whole depot. It also switches the dictionary
+on, so you do not need a separate `redfs_path_enable()`.
+
 Four things to know:
 
 - **The cache belongs to the depot you pass here.** There is one per process,

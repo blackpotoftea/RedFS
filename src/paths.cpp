@@ -18,6 +18,10 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
+
+#include <io.h>
+#include <windows.h>
 
 namespace redfs {
 namespace {
@@ -498,6 +502,431 @@ void paths_enable() {
     Dictionary& d = dict();
     std::lock_guard<std::mutex> lock(d.mutex);
     d.enabled.store(true, std::memory_order_relaxed);
+}
+
+// --- path cache --------------------------------------------------------------
+//
+// The dictionary costs minutes to fill from import tables and nothing to keep,
+// so it is persisted. Unlike the mesh cache it is NEVER discarded: a hash ->
+// name mapping is a fact about the string, so nothing a user installs can make a
+// restored entry wrong, and redfs.h already says a hit means "what this is
+// called", not "this is readable".
+//
+// The fingerprints answer a different question -- "which archives have I already
+// read" -- one per archive, so installing a mod costs harvesting that mod. Per
+// archive also makes mount ORDER irrelevant, which depot_fingerprint is not.
+//
+// Format (little-endian):
+//   'RFPC' u32 | version u32 | archive_count u32 | path_count u32
+//   archive_count x u64 archive fingerprint
+//   path_count    x { u32 len, bytes }   -- no trailing NUL
+//
+// Hashes are not stored: every intern route stores the string in the form it
+// hashed, so fnv1a64(stored) recovers the key. See docs/done/path-cache.md.
+
+namespace {
+
+constexpr uint32_t kPathMagic = 0x43504652;  // 'RFPC'
+constexpr uint32_t kPathVersion = 1;
+constexpr long kPathHeaderBytes = 16;
+
+struct PathCache {
+    std::mutex mutex;  // lock order: this one, THEN Dictionary::mutex
+    std::string file;
+    bool enabled = false;
+    // Archive fingerprints already harvested into the dictionary. Only grows.
+    std::unordered_set<uint64_t> harvested;
+    // What the last successful write held. Both it and the dictionary only ever
+    // grow, so matching sizes mean the file is current -- and a restore, which
+    // goes through the same insert path as everything else, leaves them matching
+    // rather than tripping a dirty flag and rewriting 40 MB on every run.
+    uint32_t written_paths = 0;
+    uint32_t written_archives = 0;
+    // For when the counts agree but the file is still not what a flush would
+    // write: a truncated file declares whatever it declares.
+    bool stale_file = false;
+};
+
+PathCache& path_cache() {
+    static PathCache* c = new PathCache();  // never destroyed; see api.cpp
+    return *c;
+}
+
+void put_u32(std::vector<uint8_t>& out, uint32_t v) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+    out.insert(out.end(), p, p + 4);
+}
+void put_u64(std::vector<uint8_t>& out, uint64_t v) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+    out.insert(out.end(), p, p + 8);
+}
+
+// Bounds-checked cursor over the loaded file. Every read either fits or clears
+// `ok`, so a truncated file stops the walk instead of reading past the buffer.
+struct Reader {
+    const uint8_t* p;
+    const uint8_t* end;
+    bool ok = true;
+
+    bool need(size_t n) {
+        if (!ok || static_cast<size_t>(end - p) < n) {
+            ok = false;
+            return false;
+        }
+        return true;
+    }
+    uint32_t u32() {
+        if (!need(4)) return 0;
+        const uint32_t v = rd32(p);
+        p += 4;
+        return v;
+    }
+    uint64_t u64() {
+        if (!need(8)) return 0;
+        const uint64_t v = rd64(p);
+        p += 8;
+        return v;
+    }
+};
+
+// What a load attempt did, reported after the locks are released. The log sink
+// is host code running on this thread and is free to call back into RedFS.
+struct LoadReport {
+    enum class Result { kNoFile, kBadHeader, kUnreadable, kLoaded };
+    Result result = Result::kNoFile;
+    uint32_t loaded = 0;    // records read
+    uint32_t declared = 0;  // records the header promised
+    uint32_t refused = 0;   // read, but empty or past kMaxPathLength
+    uint32_t inserted = 0;  // by how much the dictionary actually grew
+    uint32_t archives = 0;  // coverage digests kept
+    bool dictionary_was_empty = false;
+    bool dropped_coverage = false;
+};
+
+LoadReport load_from_disk(PathCache& c) {
+    LoadReport rep;
+    FILE* f = std::fopen(c.file.c_str(), "rb");
+    if (!f) return rep;
+
+    std::fseek(f, 0, SEEK_END);
+    const long len = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    // Also the >2 GB guard: ftell returns -1 there, and a cache file that large
+    // is not one this wrote. Either way it is not a header.
+    if (len < kPathHeaderBytes) {
+        std::fclose(f);
+        rep.result = len < 0 ? LoadReport::Result::kBadHeader : LoadReport::Result::kNoFile;
+        return rep;
+    }
+    std::vector<uint8_t> buf(static_cast<size_t>(len));
+    const size_t got = std::fread(buf.data(), 1, buf.size(), f);
+    std::fclose(f);
+    // NOT "no file": reporting an I/O failure as absence makes it look like a
+    // first run, and the next flush then overwrites the file that failed to read.
+    if (got != buf.size()) {
+        rep.result = LoadReport::Result::kUnreadable;
+        return rep;
+    }
+
+    Reader r{buf.data(), buf.data() + buf.size()};
+    if (r.u32() != kPathMagic || r.u32() != kPathVersion) {
+        rep.result = LoadReport::Result::kBadHeader;
+        return rep;
+    }
+    const uint32_t archive_count = r.u32();
+    rep.declared = r.u32();
+
+    // Bounded by what the file pays for, not by a fixed cap the writer would not
+    // respect: a digest costs 8 bytes, so a 16-byte file cannot ask for a billion.
+    const size_t left = static_cast<size_t>(r.end - r.p);
+    if (archive_count > left / 8) {
+        rep.result = LoadReport::Result::kBadHeader;
+        return rep;
+    }
+    rep.result = LoadReport::Result::kLoaded;
+    for (uint32_t i = 0; i < archive_count && r.ok; ++i) {
+        c.harvested.insert(r.u64());
+        ++rep.archives;
+    }
+
+    // One lock for the whole restore, and NOT paths_load's route: that one
+    // filters against the depot, and these entries are documented unfiltered.
+    // Filtering here returns a SMALLER dictionary on the second run than the
+    // first, with nothing in the log.
+    Dictionary& d = dict();
+    std::lock_guard<std::mutex> lock(d.mutex);
+    merge_pending(d);  // so the before/after counts below are true counts
+    const size_t before = d.sorted.size();
+    rep.dictionary_was_empty = before == 0;
+
+    for (uint32_t i = 0; i < rep.declared && r.ok; ++i) {
+        const uint32_t n = r.u32();
+        if (!r.need(n)) break;
+        const char* s = reinterpret_cast<const char*>(r.p);
+        r.p += n;
+        ++rep.loaded;
+        // Refused here, not in add_locked, which logs -- and this thread holds
+        // BOTH mutexes. The sink is host code and may call back in. Counted
+        // instead, and reported once the locks drop.
+        //
+        // An empty record is corruption: nothing in the dictionary is empty.
+        if (!n || n > kMaxPathLength) {
+            ++rep.refused;
+            continue;
+        }
+        // intern() copies and NUL-terminates, so un-terminated bytes are fine.
+        add_locked(d, s, n, fnv1a64(s, n));
+    }
+    merge_pending(d);
+    rep.inserted = static_cast<uint32_t>(d.sorted.size() - before);
+    return rep;
+}
+
+}  // namespace
+
+redfs_status path_cache_open(const redfs_depot* depot, const char* file) {
+    if (!depot || !file) return REDFS_E_INVALID_ARG;
+    PathCache& c = path_cache();
+
+    // Before the lock, since flush takes the same one. Everything the previous
+    // cache learned but did not write would otherwise be discarded: c.file,
+    // c.harvested and the bookkeeping are all about to be overwritten.
+    path_cache_flush();
+
+    LoadReport rep;
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(c.mutex);
+        c.file = file;
+        c.harvested.clear();
+        c.enabled = true;
+        c.written_paths = 0;
+        c.written_archives = 0;
+        c.stale_file = false;
+
+        // Import learning comes on with the cache. HERE, not in the restore:
+        // the first run has no file and returns early, so learning stayed off
+        // for exactly the run that had everything to learn.
+        {
+            Dictionary& d = dict();  // lock order: PathCache, then Dictionary
+            std::lock_guard<std::mutex> dlock(d.mutex);
+            d.enabled.store(true, std::memory_order_relaxed);
+        }
+
+        rep = load_from_disk(c);
+        path = c.file;
+
+        if (rep.result == LoadReport::Result::kLoaded) {
+            // Is the file exactly what a flush would write? Every record read,
+            // none refused, and -- when the dictionary started empty, the only
+            // case where the arithmetic is exact -- each one produced an entry,
+            // which rules out duplicates a size check would read as clean.
+            const bool faithful =
+                rep.loaded == rep.declared && rep.refused == 0 &&
+                (!rep.dictionary_was_empty || rep.inserted == rep.loaded);
+
+            if (!faithful) {
+                // Digests are at the FRONT of the file and paths at the back,
+                // so a tail cut restores EVERY digest and only some paths.
+                // Keeping them publishes full coverage over a partial
+                // dictionary -- pending says "nothing to do", the lost paths
+                // never come back, and the rewrite below makes it permanent.
+                // Coverage is cheap to re-derive; the paths are not.
+                c.harvested.clear();
+                rep.dropped_coverage = rep.archives != 0;
+                rep.archives = 0;
+            }
+            // What the FILE holds, not the dictionary: entries added before
+            // this call are not in it and would otherwise never be written.
+            c.written_paths = rep.loaded;
+            c.written_archives = rep.archives;
+            c.stale_file = !faithful;
+        }
+    }
+
+    switch (rep.result) {
+        case LoadReport::Result::kNoFile:
+            break;
+        case LoadReport::Result::kBadHeader:
+            log("path cache %s has an unrecognised header; starting fresh", path.c_str());
+            break;
+        case LoadReport::Result::kUnreadable:
+            log("path cache %s could not be read; starting fresh, and it will be overwritten",
+                path.c_str());
+            break;
+        case LoadReport::Result::kLoaded:
+            if (rep.loaded != rep.declared)
+                log("path cache: restored %u of %u paths from %s (file is truncated or corrupt)",
+                    rep.loaded, rep.declared, path.c_str());
+            else if (rep.refused)
+                log("path cache: restored %u paths from %s, refusing %u unusable records",
+                    rep.loaded - rep.refused, path.c_str(), rep.refused);
+            else
+                log("path cache: restored %u paths and %u harvested archives from %s", rep.loaded,
+                    rep.archives, path.c_str());
+            // Its own line: this is the one that costs the caller time.
+            if (rep.dropped_coverage)
+                log("path cache: the restore was incomplete, so every archive will be harvested "
+                    "again rather than trusting coverage recorded for paths that did not survive");
+            break;
+    }
+    return REDFS_OK;
+}
+
+redfs_status path_cache_flush() {
+    PathCache& c = path_cache();
+
+    char message[512] = {0};
+    bool failed = false;
+
+    {
+        std::lock_guard<std::mutex> lock(c.mutex);
+        if (!c.enabled) return REDFS_OK;
+
+        std::vector<const char*> strings;
+        {
+            Dictionary& d = dict();
+            std::lock_guard<std::mutex> dlock(d.mutex);
+            merge_pending(d);
+            if (!c.stale_file && d.sorted.size() == c.written_paths &&
+                c.harvested.size() == c.written_archives)
+                return REDFS_OK;  // nothing learned since the last write
+            strings.reserve(d.sorted.size());
+            for (const auto& e : d.sorted) strings.push_back(e.str);
+        }
+        // The image is built with the dictionary lock released, which is safe
+        // only because Arena never moves or frees an interned string. A
+        // concurrent add just leaves the cache dirty for the next flush.
+
+        std::vector<uint8_t> out;
+        out.reserve(strings.size() * 64 + 64);
+        put_u32(out, kPathMagic);
+        put_u32(out, kPathVersion);
+        put_u32(out, static_cast<uint32_t>(c.harvested.size()));
+        put_u32(out, static_cast<uint32_t>(strings.size()));
+
+        // Sorted: an unordered_set's iteration order is not a promise, and the
+        // same depot should give the same bytes. `strings` is already ordered.
+        std::vector<uint64_t> fps(c.harvested.begin(), c.harvested.end());
+        std::sort(fps.begin(), fps.end());
+        for (uint64_t fp : fps) put_u64(out, fp);
+
+        for (const char* s : strings) {
+            const size_t n = std::strlen(s);
+            put_u32(out, static_cast<uint32_t>(n));
+            out.insert(out.end(), s, s + n);
+        }
+
+        // Sibling plus rename, so a crash mid-write cannot corrupt a file that
+        // was previously good. At 40 MB that window is not theoretical.
+        const std::string tmp = c.file + ".tmp";
+        FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (!f) {
+            std::snprintf(message, sizeof(message), "cannot write %s", tmp.c_str());
+            failed = true;
+        } else {
+            // fwrite reports bytes buffered, not bytes on disk -- on a share or
+            // a synced folder the failure surfaces only at flush or close, so
+            // fwrite alone would promote a truncated file over a good one.
+            bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
+            if (ok) ok = std::fflush(f) == 0 && ::_commit(::_fileno(f)) == 0;
+            if (std::fclose(f) != 0) ok = false;  // close either way, then judge
+
+            if (!ok) {
+                std::remove(tmp.c_str());
+                std::snprintf(message, sizeof(message), "cannot write %s", tmp.c_str());
+                failed = true;
+            } else if (!::MoveFileExA(tmp.c_str(), c.file.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                // One step: deleting the destination first leaves a window with
+                // no file at all, and a rename that then fails (a scanner
+                // holding the path is enough) destroys the good copy.
+                std::remove(tmp.c_str());
+                std::snprintf(message, sizeof(message), "cannot replace %s (error %lu)",
+                              c.file.c_str(), ::GetLastError());
+                failed = true;
+            } else {
+                c.written_paths = static_cast<uint32_t>(strings.size());
+                c.written_archives = static_cast<uint32_t>(c.harvested.size());
+                c.stale_file = false;
+                std::snprintf(message, sizeof(message),
+                              "path cache: wrote %zu paths and %zu harvested archives (%zu bytes)",
+                              strings.size(), c.harvested.size(), out.size());
+            }
+        }
+    }
+
+    if (failed) return fail(REDFS_E_IO, "%s", message);
+    log("%s", message);
+    return REDFS_OK;
+}
+
+void path_cache_close() {
+    // Guarded, not a bare flush call, for two reasons. The reset below must
+    // happen even when the write throws -- flush builds ~40 MB in memory, so
+    // bad_alloc is its realistic failure, and unwinding leaves a cache that
+    // still reports itself open. And this is the only place the status is
+    // visible at all: redfs.h declares this void and redfs_shutdown discards
+    // it, so without the line an unwritable target loses a session in silence.
+    redfs_status st = REDFS_OK;
+    try {
+        st = path_cache_flush();
+    } catch (...) {
+        st = REDFS_E_IO;
+    }
+    if (st != REDFS_OK)
+        log("path cache: the final write failed (%s); nothing learned this session was saved",
+            redfs_status_string(st));
+
+    PathCache& c = path_cache();
+    std::lock_guard<std::mutex> lock(c.mutex);
+    c.harvested.clear();
+    c.enabled = false;
+    c.written_paths = 0;
+    c.written_archives = 0;
+    c.stale_file = false;
+    // The dictionary is NOT cleared: closing means "stop persisting", not
+    // "forget", and interned pointers callers hold must stay valid.
+}
+
+redfs_status path_cache_pending(const redfs_depot* depot, uint32_t* out_indices, uint32_t capacity,
+                                uint32_t* out_count) {
+    if (!depot || (!out_indices && capacity)) return REDFS_E_INVALID_ARG;
+    if (out_count) *out_count = 0;
+
+    PathCache& c = path_cache();
+    std::lock_guard<std::mutex> lock(c.mutex);
+    // Without a cache the answer is always "all of them", from a call that
+    // computed nothing -- and a caller acting on it re-teaches every run.
+    // redfs_cache_warm refuses the structurally identical call.
+    if (!c.enabled)
+        return fail(REDFS_E_INVALID_ARG,
+                    "redfs_path_cache_pending requires an open path cache -- without one no "
+                    "archive has been recorded as harvested and the answer is meaningless");
+
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < depot->archives.size(); ++i) {
+        if (c.harvested.count(archive_fingerprint(depot->archives[i]))) continue;
+        // The TOTAL, not the number delivered, so a first call with capacity 0
+        // sizes a buffer the second is guaranteed to fit.
+        if (total < capacity) out_indices[total] = i;
+        ++total;
+    }
+    if (out_count) *out_count = total;
+    return REDFS_OK;
+}
+
+redfs_status path_cache_mark(const redfs_depot* depot, uint32_t archive_index) {
+    if (!depot) return REDFS_E_INVALID_ARG;
+    if (archive_index >= depot->archives.size())
+        return fail(REDFS_E_INVALID_ARG, "archive index %u is past the %zu mounted", archive_index,
+                    depot->archives.size());
+
+    PathCache& c = path_cache();
+    std::lock_guard<std::mutex> lock(c.mutex);
+    if (!c.enabled)
+        return fail(REDFS_E_INVALID_ARG, "redfs_path_cache_mark requires an open path cache");
+    c.harvested.insert(archive_fingerprint(depot->archives[archive_index]));
+    return REDFS_OK;
 }
 
 }  // namespace redfs

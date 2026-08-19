@@ -31,6 +31,7 @@ these disagrees with `redfs.h`, the header wins.
 | [done/mesh-geometry.md](done/mesh-geometry.md) | chunk decoding, and computing the bounding boxes the format does not store |
 | [done/api-design.md](done/api-design.md) | why the API is shaped this way, including what was cut |
 | [done/caching.md](done/caching.md) | the persistent mesh cache, its file format and its invalidation |
+| [done/path-cache.md](done/path-cache.md) | persisting the dictionary — why it is never invalidated, only merged, and what that costs to get wrong |
 | [done/verification.md](done/verification.md) | how correctness was established — five independent oracles, and what the sweep found |
 | [done/testing.md](done/testing.md) | unit tests, leak detection, ASan, fuzzing, static analysis — and the out-of-bounds read they caught |
 

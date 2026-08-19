@@ -235,6 +235,50 @@ A mesh handle is a `shared_ptr` internally, so `redfs_mesh_close` is always
 correct to call, cached or not, and a handle stays valid across
 `redfs_cache_close`.
 
+### The path cache
+
+Filling the dictionary from import tables means reading every file that has them
+— minutes on a modded install. Write it once instead:
+
+```c
+redfs_path_cache_open(depot, "redfs_paths.cache");
+
+uint32_t n = 0;
+redfs_path_cache_pending(depot, NULL, 0, &n);       /* how many need reading */
+uint32_t* todo = malloc(n * sizeof *todo);
+redfs_path_cache_pending(depot, todo, n, &n);
+
+for (uint32_t i = 0; i < n; ++i) {
+    /* read the files whose redfs_file_info.archive_index == todo[i];
+       parsing them is what teaches the dictionary their imports */
+    redfs_path_cache_mark(depot, todo[i]);
+}
+redfs_path_cache_close();                            /* flushes */
+```
+
+This is **not** the mesh cache's kind of cache, and the difference is the whole
+design:
+
+- **It is never discarded.** A hash → name mapping is a fact about the *string*,
+  so removing a mod, patching the game or re-cooking an archive cannot make a
+  restored entry wrong. Restore only ever adds. A name for a file no longer
+  installed keeps resolving — that is the existing dictionary contract, not a
+  stale answer, and the read still returns `REDFS_E_NOT_FOUND`.
+- What the file **does** track is which archives it already read, one fingerprint
+  each. So installing a mod costs harvesting that mod, not the whole depot.
+  Mount order does not matter, and neither does mounting more archives after
+  opening the cache — `redfs_path_cache_pending` is computed against the depot as
+  it is when you ask.
+- Opening it also switches the dictionary on, exactly as `redfs_path_enable`
+  does. Restoring names while import learning stayed off would hand you a full
+  dictionary that never grew again.
+
+`redfs_path_cache_mark` is per archive on purpose: call it as each one finishes,
+so a teach interrupted halfway loses only what it had not got to.
+
+See [docs/done/path-cache.md](docs/done/path-cache.md) for the file format and
+the three ways this fails silently if built the obvious way.
+
 ### Textures
 
 ```c

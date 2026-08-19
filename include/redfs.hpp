@@ -554,6 +554,36 @@ public:
         return computed;
     }
 
+    // --- path cache ----------------------------------------------------------
+
+    /// Restores the hash -> path dictionary from disk instead of relearning it,
+    /// and records which archives it has already read. Unlike the mesh cache it
+    /// is never discarded, only merged into -- see redfs.h.
+    Status enable_path_cache(const char* file) const { return redfs_path_cache_open(h_, file); }
+    static Status flush_path_cache() { return redfs_path_cache_flush(); }
+    static void close_path_cache() { redfs_path_cache_close(); }
+
+    /// Indices of the mounted archives not yet harvested into the dictionary.
+    /// Empty on failure, which for this call is only "no path cache is open".
+    std::vector<uint32_t> unharvested_archives() const {
+        uint32_t n = 0;
+        if (redfs_path_cache_pending(h_, nullptr, 0, &n) != REDFS_OK) return {};
+        const uint32_t capacity = n;
+        std::vector<uint32_t> out(capacity);
+        // Sized from the first call's TOTAL, so the second cannot overflow it.
+        if (capacity && redfs_path_cache_pending(h_, out.data(), capacity, &n) != REDFS_OK)
+            return {};
+        // min, not n: a mount between the calls raises the total, and resizing
+        // UP would zero-fill the tail and report archive 0 as needing work.
+        out.resize(n < capacity ? n : capacity);
+        return out;
+    }
+
+    /// Call after finishing one archive, not after the whole sweep.
+    Status mark_archive_harvested(uint32_t archive_index) const {
+        return redfs_path_cache_mark(h_, archive_index);
+    }
+
     // --- enumeration ---------------------------------------------------------
 
     /// `fn` returns false to stop early.
