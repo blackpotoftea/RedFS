@@ -854,7 +854,14 @@ REDFS_API void redfs_set_log(redfs_log_fn fn, void* user);
  */
 REDFS_API int redfs_oodle_available(void);
 
-/* Human-readable reason for the last failure on this thread. */
+/* Human-readable reason for the last failure on this thread.
+ *
+ * Valid immediately after a call that returned a non-OK redfs_status, and EMPTY
+ * when that call recorded no detail beyond the status. Every such entry point
+ * clears it on the way in, so it can never hand you the reason some earlier,
+ * unrelated call failed -- but a call that returned REDFS_OK leaves whatever it
+ * logged along the way, so only read it after a failure. redfs_status_string
+ * does not disturb it, so printing both is safe. */
 REDFS_API const char* redfs_last_error(void);
 
 #ifdef __cplusplus

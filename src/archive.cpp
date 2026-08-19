@@ -240,7 +240,17 @@ redfs_status resolve_part(const redfs_depot* depot, uint64_t hash, uint32_t part
     if (!ar) return REDFS_E_NOT_FOUND;
     const uint32_t start = ar->entry_seg_start(loc.entry);
     const uint32_t end = ar->entry_seg_end(loc.entry);
-    if (start >= end || end > ar->segment_count()) return REDFS_E_CORRUPT;
+    // Two different things, told apart because they are: one is a file with no
+    // content, the other is an index pointing past its own segment table. Both
+    // used to return a bare REDFS_E_CORRUPT with no message at all, so a load
+    // order reporting hundreds of these gave the caller nothing to act on.
+    if (start >= end)
+        return fail(REDFS_E_CORRUPT, "%llu in %s lists no content segments (%u..%u)",
+                    static_cast<unsigned long long>(hash), ar->path().c_str(), start, end);
+    if (end > ar->segment_count())
+        return fail(REDFS_E_CORRUPT, "%llu in %s ends at segment %u, past the %u it holds",
+                    static_cast<unsigned long long>(hash), ar->path().c_str(), end,
+                    ar->segment_count());
 
     out->archive = ar;
     if (part == REDFS_PART_ALL) {

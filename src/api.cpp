@@ -37,6 +37,20 @@ void emit(const char* message) {
     const LogSink sink = g_log.load(std::memory_order_relaxed);
     if (sink.fn) sink.fn(message, sink.user);
 }
+
+// First statement of every public entry point that returns a redfs_status.
+//
+// Only fail() writes the slot and nothing used to clear it, so after a failure
+// that returned a bare status -- there are dozens, and callers cannot know
+// which -- redfs_last_error() still held whatever last failed on this thread,
+// possibly thousands of files earlier. A wrong reason reads exactly like a right
+// one, which made the accessor unusable for the case it exists for. Empty is the
+// honest answer; stale is not.
+//
+// NOT done by the accessors: redfs_status_string() between a failed call and
+// redfs_last_error() is the natural way to report one, and clearing there would
+// wipe the message on its way to being printed.
+void clear_error() { t_last_error[0] = 0; }
 }  // namespace
 
 void log(const char* fmt, ...) {
@@ -606,6 +620,7 @@ static redfs_status depot_open_impl(const char* game_dir, uint32_t flags,
 }
 
 redfs_status redfs_depot_open(const char* game_dir, uint32_t flags, redfs_depot** out_depot) {
+    clear_error();
     if (!out_depot) return REDFS_E_INVALID_ARG;
     *out_depot = nullptr;
     REDFS_GUARD(depot_open_impl(game_dir, flags, out_depot));
@@ -621,6 +636,7 @@ static redfs_status depot_open_empty_impl(redfs_depot** out_depot) {
 }
 
 redfs_status redfs_depot_open_empty(redfs_depot** out_depot) {
+    clear_error();
     if (!out_depot) return REDFS_E_INVALID_ARG;
     *out_depot = nullptr;
     REDFS_GUARD(depot_open_empty_impl(out_depot));
@@ -643,6 +659,7 @@ static redfs_status depot_mount_impl(redfs_depot* depot, const char* archive_pat
 }
 
 redfs_status redfs_depot_mount(redfs_depot* depot, const char* archive_path) {
+    clear_error();
     if (!depot || !archive_path) return REDFS_E_INVALID_ARG;
     REDFS_GUARD(depot_mount_impl(depot, archive_path));
 }
@@ -673,6 +690,7 @@ static redfs_status depot_mount_dir_impl(redfs_depot* depot, const char* dir,
 }
 
 redfs_status redfs_depot_mount_dir(redfs_depot* depot, const char* dir, uint32_t* out_mounted) {
+    clear_error();
     if (!depot || !dir) return REDFS_E_INVALID_ARG;
     if (out_mounted) *out_mounted = 0;
     REDFS_GUARD(depot_mount_dir_impl(depot, dir, out_mounted));
@@ -737,6 +755,7 @@ uint64_t redfs_hash_parse(const char* decimal) {
 // is read whole, its decompressed size comes from the file itself, and every
 // intern grows the dictionary -- so they need the ABI's exception barrier.
 redfs_status redfs_path_load(const redfs_depot* depot, const char* list_file, uint32_t* out_kept) {
+    clear_error();
     // Filtering against the depot is the whole point of this call; a null depot
     // is not a "keep every line" mode.
     if (!depot || !list_file) return REDFS_E_INVALID_ARG;
@@ -770,19 +789,25 @@ const char* redfs_path_from_hash(uint64_t hash) {
 // memory, so both allocate from data the caller does not control and need the
 // ABI's exception barrier. pending and mark are guarded for consistency.
 redfs_status redfs_path_cache_open(const redfs_depot* depot, const char* cache_file) {
+    clear_error();
     REDFS_GUARD(path_cache_open(depot, cache_file));
 }
 
-redfs_status redfs_path_cache_flush(void) { REDFS_GUARD(path_cache_flush()); }
+redfs_status redfs_path_cache_flush(void) {
+    clear_error();
+    REDFS_GUARD(path_cache_flush());
+}
 
 void redfs_path_cache_close(void) { REDFS_GUARD_VOID(path_cache_close()); }
 
 redfs_status redfs_path_cache_pending(const redfs_depot* depot, uint32_t* out_indices,
                                       uint32_t capacity, uint32_t* out_count) {
+    clear_error();
     REDFS_GUARD(path_cache_pending(depot, out_indices, capacity, out_count));
 }
 
 redfs_status redfs_path_cache_mark(const redfs_depot* depot, uint32_t archive_index) {
+    clear_error();
     REDFS_GUARD(path_cache_mark(depot, archive_index));
 }
 
@@ -795,6 +820,7 @@ redfs_status redfs_path_cache_mark(const redfs_depot* depot, uint32_t archive_in
 // where it would defeat the call. paths_find validates the rest.
 redfs_status redfs_find(const redfs_depot* depot, const char* pattern, redfs_find_fn fn,
                         void* user, uint32_t* out_matched) {
+    clear_error();
     REDFS_GUARD(paths_find(depot, pattern, fn, user, out_matched));
 }
 
@@ -806,6 +832,7 @@ int redfs_exists(const redfs_depot* depot, uint64_t hash) {
 }
 
 redfs_status redfs_stat(const redfs_depot* depot, uint64_t hash, redfs_file_info* out_info) {
+    clear_error();
     if (!depot || !out_info) return REDFS_E_INVALID_ARG;
     Located loc{};
     if (!depot->locate(hash, &loc)) return REDFS_E_NOT_FOUND;
@@ -814,6 +841,7 @@ redfs_status redfs_stat(const redfs_depot* depot, uint64_t hash, redfs_file_info
 }
 
 redfs_status redfs_enumerate(const redfs_depot* depot, redfs_enum_fn fn, void* user) {
+    clear_error();
     if (!depot || !fn) return REDFS_E_INVALID_ARG;
     for (const auto& ref : depot->refs) {
         Located loc{depot->archives[ref.archive], ref.entry, ref.archive};
@@ -833,18 +861,21 @@ redfs_status redfs_enumerate(const redfs_depot* depot, redfs_enum_fn fn, void* u
 
 redfs_status redfs_part_size(const redfs_depot* depot, uint64_t hash, uint32_t part,
                              uint64_t* out_size) {
+    clear_error();
     if (!depot || !out_size) return REDFS_E_INVALID_ARG;
     return read_part(depot, hash, part, nullptr, 0, out_size);
 }
 
 redfs_status redfs_read_into(const redfs_depot* depot, uint64_t hash, uint32_t part, void* dst,
                              uint64_t capacity, uint64_t* out_written) {
+    clear_error();
     if (!depot || !dst) return REDFS_E_INVALID_ARG;
     return read_part(depot, hash, part, static_cast<uint8_t*>(dst), capacity, out_written);
 }
 
 redfs_status redfs_read(const redfs_depot* depot, uint64_t hash, uint32_t part,
                         redfs_blob* out_blob) {
+    clear_error();
     if (!depot || !out_blob) return REDFS_E_INVALID_ARG;
     *out_blob = redfs_blob{};
 
@@ -919,6 +950,7 @@ static redfs_status open_resource_impl(const redfs_depot* depot, uint64_t hash,
 }
 
 redfs_status redfs_open(const redfs_depot* depot, uint64_t hash, redfs_resource** out_resource) {
+    clear_error();
     if (!depot || !out_resource) return REDFS_E_INVALID_ARG;
     *out_resource = nullptr;
     REDFS_GUARD(open_resource_impl(depot, hash, out_resource));
@@ -926,6 +958,7 @@ redfs_status redfs_open(const redfs_depot* depot, uint64_t hash, redfs_resource*
 
 redfs_status redfs_open_path(const redfs_depot* depot, const char* depot_path,
                              redfs_resource** out_resource) {
+    clear_error();
     if (!depot || !depot_path || !out_resource) return REDFS_E_INVALID_ARG;
     *out_resource = nullptr;
     REDFS_GUARD(open_resource_impl(depot, redfs_hash(depot_path), out_resource));
@@ -960,6 +993,7 @@ uint32_t redfs_resource_buffer_count(const redfs_resource* resource) {
 
 redfs_status redfs_resource_buffer(const redfs_resource* resource, uint32_t index,
                                    redfs_blob* out_blob) {
+    clear_error();
     if (!resource || !out_blob) return REDFS_E_INVALID_ARG;
     *out_blob = redfs_blob{};
     // Bounds-checked against the count on the handle rather than left to
@@ -973,6 +1007,7 @@ redfs_status redfs_resource_buffer(const redfs_resource* resource, uint32_t inde
 
 redfs_status redfs_read_async(const redfs_depot* depot, uint64_t hash, uint32_t part,
                               redfs_read_fn cb, void* user) {
+    clear_error();
     if (!depot || !cb) return REDFS_E_INVALID_ARG;
     // A refusal is reported through the RETURN VALUE, never by invoking the
     // callback here: a callback is exactly where the next read gets queued, so
@@ -1016,6 +1051,7 @@ void redfs_shutdown(void) {
 // --- CR2W --------------------------------------------------------------------
 
 redfs_status redfs_cr2w_open(const void* data, uint64_t size, redfs_cr2w** out_cr2w) {
+    clear_error();
     if (!data || !out_cr2w) return REDFS_E_INVALID_ARG;
     auto* f = new redfs_cr2w();
     const redfs_status st = cr2w_parse(data, size, f);
@@ -1068,6 +1104,7 @@ const char* redfs_cr2w_import_type(const redfs_cr2w* cr2w, uint32_t index) {
 
 redfs_status redfs_cr2w_get(const redfs_cr2w* cr2w, uint32_t chunk, const char* prop_path,
                             redfs_value* out_value) {
+    clear_error();
     if (!cr2w || !out_value) return REDFS_E_INVALID_ARG;
     *out_value = redfs_value{};
     return cr2w_find(cr2w, chunk, prop_path, out_value);
@@ -1075,18 +1112,21 @@ redfs_status redfs_cr2w_get(const redfs_cr2w* cr2w, uint32_t chunk, const char* 
 
 redfs_status redfs_cr2w_walk(const redfs_cr2w* cr2w, uint32_t chunk, const char* prop_path,
                              redfs_prop_fn fn, void* user) {
+    clear_error();
     if (!cr2w) return REDFS_E_INVALID_ARG;
     return cr2w_walk(cr2w, chunk, prop_path, fn, user);
 }
 
 redfs_status redfs_cr2w_walk_array(const redfs_cr2w* cr2w, const redfs_value* array,
                                    redfs_elem_fn fn, void* user) {
+    clear_error();
     if (!cr2w) return REDFS_E_INVALID_ARG;
     return cr2w_walk_array(cr2w, array, fn, user);
 }
 
 redfs_status redfs_cr2w_get_in(const redfs_cr2w* cr2w, const redfs_value* parent,
                                const char* prop_path, redfs_value* out_value) {
+    clear_error();
     if (!cr2w || !out_value) return REDFS_E_INVALID_ARG;
     *out_value = redfs_value{};
     return cr2w_get_in(cr2w, parent, prop_path, out_value);
@@ -1094,6 +1134,7 @@ redfs_status redfs_cr2w_get_in(const redfs_cr2w* cr2w, const redfs_value* parent
 
 redfs_status redfs_cr2w_walk_in(const redfs_cr2w* cr2w, const redfs_value* parent,
                                 const char* prop_path, redfs_prop_fn fn, void* user) {
+    clear_error();
     if (!cr2w) return REDFS_E_INVALID_ARG;
     return cr2w_walk_in(cr2w, parent, prop_path, fn, user);
 }
@@ -1102,11 +1143,13 @@ redfs_status redfs_cr2w_walk_in(const redfs_cr2w* cr2w, const redfs_value* paren
 
 redfs_status redfs_texture_desc_of(const redfs_depot* depot, uint64_t hash,
                                    redfs_texture_desc* out_desc) {
+    clear_error();
     if (!depot || !out_desc) return REDFS_E_INVALID_ARG;
     REDFS_GUARD(texture_desc_of(depot, hash, out_desc));
 }
 
 redfs_status redfs_texture_read_dds(const redfs_depot* depot, uint64_t hash, redfs_blob* out_blob) {
+    clear_error();
     if (!depot || !out_blob) return REDFS_E_INVALID_ARG;
     *out_blob = redfs_blob{};
     redfs_status st;
@@ -1123,6 +1166,7 @@ redfs_status redfs_texture_read_dds(const redfs_depot* depot, uint64_t hash, red
 
 redfs_status redfs_texture_read_raw(const redfs_depot* depot, uint64_t hash,
                                     redfs_texture_desc* out_desc, redfs_blob* out_blob) {
+    clear_error();
     if (!depot || !out_blob) return REDFS_E_INVALID_ARG;
     *out_blob = redfs_blob{};
     redfs_status st;
@@ -1139,23 +1183,27 @@ redfs_status redfs_texture_read_raw(const redfs_depot* depot, uint64_t hash,
 
 redfs_status redfs_audio_probe(const redfs_depot* depot, uint64_t hash,
                                redfs_audio_format* out_format) {
+    clear_error();
     if (!depot || !out_format) return REDFS_E_INVALID_ARG;
     REDFS_GUARD(audio_probe(depot, hash, out_format));
 }
 
 redfs_status redfs_audio_info_of(const redfs_depot* depot, uint64_t hash,
                                  redfs_audio_info* out_info) {
+    clear_error();
     if (!depot || !out_info) return REDFS_E_INVALID_ARG;
     REDFS_GUARD(audio_info_of(depot, hash, out_info));
 }
 
 redfs_status redfs_audio_info_parse(const void* data, uint64_t size, redfs_audio_info* out_info) {
+    clear_error();
     if (!data || !out_info) return REDFS_E_INVALID_ARG;
     return audio_info_parse(data, size, out_info);
 }
 
 redfs_status redfs_audio_walk_chunks(const void* data, uint64_t size, redfs_riff_chunk_fn fn,
                                      void* user) {
+    clear_error();
     if (!data) return REDFS_E_INVALID_ARG;
     return audio_walk_chunks(data, size, fn, user);
 }
@@ -1174,6 +1222,7 @@ const char* redfs_audio_codec_name(redfs_audio_codec codec) {
 
 redfs_status redfs_mesh_desc_of(const redfs_depot* depot, uint64_t hash,
                                 redfs_mesh_desc* out_desc) {
+    clear_error();
     if (!depot || !out_desc) return REDFS_E_INVALID_ARG;
     REDFS_GUARD(mesh_desc_of(depot, hash, out_desc));
 }
@@ -1181,6 +1230,7 @@ redfs_status redfs_mesh_desc_of(const redfs_depot* depot, uint64_t hash,
 // --- mesh chunks -------------------------------------------------------------
 
 redfs_status redfs_mesh_open(const redfs_depot* depot, uint64_t hash, redfs_mesh** out_mesh) {
+    clear_error();
     if (!depot || !out_mesh) return REDFS_E_INVALID_ARG;
     *out_mesh = nullptr;
 
@@ -1265,10 +1315,14 @@ const char* redfs_mesh_chunk_material(const redfs_mesh* mesh, uint32_t appearanc
 // builds the whole serialized image in memory, so both can throw on input the
 // caller does not control.
 redfs_status redfs_cache_open(const redfs_depot* depot, const char* cache_file) {
+    clear_error();
     REDFS_GUARD(cache_open(depot, cache_file));
 }
 
-redfs_status redfs_cache_flush(void) { REDFS_GUARD(cache_flush()); }
+redfs_status redfs_cache_flush(void) {
+    clear_error();
+    REDFS_GUARD(cache_flush());
+}
 
 void redfs_cache_close(void) { REDFS_GUARD_VOID(cache_close()); }
 
@@ -1283,6 +1337,7 @@ uint32_t redfs_cache_entry_count(void) {
 
 redfs_status redfs_cache_warm(const redfs_depot* depot, const uint64_t* hashes, uint32_t count,
                               uint32_t* out_computed) {
+    clear_error();
     if (!depot || (!hashes && count)) return REDFS_E_INVALID_ARG;
     // Without a cache on this depot mesh_acquire never inserts, so every
     // geometry decompress below would be thrown away and `computed` would stay 0

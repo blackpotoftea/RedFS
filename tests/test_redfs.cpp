@@ -3152,6 +3152,73 @@ TEST(api, null_arguments_are_rejected) {
     CHECK(redfs_mesh_chunk_at(nullptr, 0) == nullptr);
 }
 
+TEST(api, last_error_is_never_a_stale_message) {
+    // Only fail() writes the slot and nothing cleared it, so after any of the
+    // dozens of bare-status returns redfs_last_error() still held whatever last
+    // failed on this thread -- possibly thousands of files earlier. A wrong
+    // reason reads exactly like a right one, which is worse than none.
+    TempDepot d("stale_error.archive", one_file_archive("base\\err\\present.bin", 0x5E));
+    if (!d.depot) return;
+
+    // A failure that DOES record a message.
+    redfs_depot* bogus = nullptr;
+    CHECK(redfs_depot_open("Z:\\definitely\\not\\a\\game", REDFS_SCAN_ALL, &bogus) != REDFS_OK);
+    CHECK(std::strlen(redfs_last_error()) > 0);
+
+    // A failure that does not. It must not inherit the one above.
+    redfs_file_info info{};
+    CHECK_ERR(redfs_stat(d.depot, redfs_hash("base\\err\\no_such_file.bin"), &info),
+              REDFS_E_NOT_FOUND);
+    CHECK_STR(redfs_last_error(), "");
+
+    // Same for a rejected argument, which is the other bare-status family.
+    CHECK(redfs_depot_open("Z:\\definitely\\not\\a\\game", REDFS_SCAN_ALL, &bogus) != REDFS_OK);
+    CHECK(std::strlen(redfs_last_error()) > 0);
+    CHECK_ERR(redfs_stat(nullptr, 0, &info), REDFS_E_INVALID_ARG);
+    CHECK_STR(redfs_last_error(), "");
+
+    // And redfs_status_string must not disturb a message on its way to a log:
+    // reporting a failure as "status: reason" is the documented pattern.
+    CHECK(redfs_depot_open("Z:\\definitely\\not\\a\\game", REDFS_SCAN_ALL, &bogus) != REDFS_OK);
+    redfs_status_string(REDFS_E_CORRUPT);
+    CHECK(std::strlen(redfs_last_error()) > 0);
+}
+
+TEST(api, a_corrupt_segment_range_says_which_kind) {
+    // Both conditions returned a bare REDFS_E_CORRUPT with no message, so a load
+    // order reporting hundreds of these gave the caller nothing to act on -- and
+    // "this entry lists no content" is a different thing from "this index points
+    // past its own segment table".
+    {
+        ArchiveBuilder ab;
+        const uint64_t key = redfs_hash("base\\err\\empty_range.bin");
+        ab.add(key, std::vector<uint8_t>(16, 0x11));
+        ab.segment_range(0, 3, 3);  // start == end: no content segments
+        TempDepot d("empty_range.archive", ab.build());
+        if (!d.depot) return;
+
+        redfs_blob b{};
+        CHECK_ERR(redfs_read(d.depot, key, REDFS_PART_ALL, &b), REDFS_E_CORRUPT);
+        const std::string msg = test::own(redfs_last_error());
+        CHECK(msg.find("no content segments") != std::string::npos);
+        redfs_blob_free(&b);
+    }
+    {
+        ArchiveBuilder ab;
+        const uint64_t key = redfs_hash("base\\err\\past_table.bin");
+        ab.add(key, std::vector<uint8_t>(16, 0x22));
+        ab.segment_range(0, 0, 4096);  // end past the segment table
+        TempDepot d("past_table.archive", ab.build());
+        if (!d.depot) return;
+
+        redfs_blob b{};
+        CHECK_ERR(redfs_read(d.depot, key, REDFS_PART_ALL, &b), REDFS_E_CORRUPT);
+        const std::string msg = test::own(redfs_last_error());
+        CHECK(msg.find("past the") != std::string::npos);
+        redfs_blob_free(&b);
+    }
+}
+
 TEST(api, double_free_is_safe) {
     ArchiveBuilder ab;
     const uint64_t key = redfs_hash("base\\dbl.bin");
