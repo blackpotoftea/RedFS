@@ -340,6 +340,12 @@ and the remaining checks are self-contained.
   loaded into Cyberpunk's process. Loader-lock behaviour, RED4ext teardown and
   contention with the engine's own I/O are covered only by the lifecycle tests'
   approximation of them (see `testing.md`).
+- **Neither mod scan path is covered.** The reference install has no
+  `archive/pc/mod` folder and no REDmod folders under `mods/`, so both discovery
+  paths, including REDmod's recursive search and its reversed ordering, are
+  exercised only by synthesized fixtures and never against real mod content. The
+  ordering rules are derived from WolvenKit's `ArchiveManager` and covered by
+  unit tests, not confirmed against a modded install.
 - **No round-trip against WolvenKit's own extraction.** Building the WolvenKit CLI
   was judged not worth the time given the oracles above, but a byte-for-byte
   comparison on a sample would be the strongest check available.

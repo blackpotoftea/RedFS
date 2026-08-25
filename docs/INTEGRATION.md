@@ -122,6 +122,13 @@ struct has only ever grown by appending, so field reads still land and only the
 *stride* is wrong — walking the chunk array returns plausible garbage from the
 second element on.
 
+The check does not cover additions. It bumps for struct layout and for the
+meaning of a call, so `redfs_find` was added without a bump, correctly. A new
+header against an older DLL therefore reports 2 on both sides and passes, then
+fails at load with *entry point redfs_find could not be found*. That failure is
+loud and immediate, but it comes from the loader and not from the check: one
+integer compared with `==` cannot express "has `redfs_find`".
+
 `redfs::Depot::open()` checks it and returns `nullopt`. That is the one facade
 failure that never reaches the DLL, so `redfs_last_error()` is empty for it; report
 the two version numbers yourself.
