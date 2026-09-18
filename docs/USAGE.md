@@ -17,7 +17,10 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-MSVC 2022 (C++20), CMake ≥ 3.21, Windows x64. Nothing to fetch. Out of `build/`:
+MSVC 2022 (C++23 — the build pins `/std:c++23preview`, so the toolset has to be new
+enough to carry that switch; v14.44 is what it is tested against), CMake ≥ 3.21,
+Windows x64. Nothing to fetch. `redfs.h`/`redfs.hpp` themselves still compile at
+C++20 for a caller that has not moved. Out of `build/`:
 
 | artifact | what it is |
 |---|---|

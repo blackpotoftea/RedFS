@@ -1,8 +1,17 @@
 cmake_minimum_required(VERSION 3.21)
 project(RedFS VERSION 0.1.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# CMake 3.28 spells C++23 on MSVC as /std:c++latest, which tracks the working draft and moves with
+# every toolset update. Pinned to the named switch instead, so a standalone build and an in-tree one
+# compile RedFS identically -- NightCityNet adds this directory and pins the same two variables, and
+# a bug that only shows up under one of two flag sets is an expensive kind to chase.
+if(MSVC)
+    set(CMAKE_CXX23_STANDARD_COMPILE_OPTION  "-std:c++23preview")
+    set(CMAKE_CXX23_EXTENSION_COMPILE_OPTION "-std:c++23preview")
+endif()
 
 option(REDFS_BUILD_SHARED "Build RedFS.dll alongside the static library" ON)
 option(REDFS_BUILD_CLI    "Build the redfs_cli verification harness"     ON)
@@ -98,7 +107,7 @@ if(REDFS_RED4EXT_SDK)
     target_link_libraries(redfs_red4ext_plugin PRIVATE redfs_static)
     target_include_directories(redfs_red4ext_plugin PRIVATE "${REDFS_RED4EXT_SDK}/include")
     # The SDK needs a recent standard and leans on Windows headers being unpolluted.
-    target_compile_features(redfs_red4ext_plugin PRIVATE cxx_std_20)
+    target_compile_features(redfs_red4ext_plugin PRIVATE cxx_std_23)
     set_target_properties(redfs_red4ext_plugin PROPERTIES OUTPUT_NAME RedFS.SmokeTest)
     message(STATUS "RED4ext plugin enabled (SDK: ${REDFS_RED4EXT_SDK})")
 endif()
