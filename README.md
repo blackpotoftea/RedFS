@@ -23,9 +23,11 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-C++20, MSVC, Windows x64, no external dependencies. Oodle is bound by name at
-runtime. The build produces `redfs_static.lib`, `RedFS.dll`, two tools
-(`redfs_cli`, `redfs_verify`) and a worked example (`example_chest`).
+C++23 (`/std:c++23preview`), MSVC, Windows x64, no external dependencies. The
+public headers stay C++20-compatible, so linking RedFS does not move your own
+project's standard. Oodle is bound by name at runtime. The build produces
+`redfs_static.lib`, `RedFS.dll`, two tools (`redfs_cli`, `redfs_verify`) and a
+worked example (`example_chest`).
 
 Link it:
 
@@ -485,3 +487,14 @@ in [docs/roadmap.md](docs/roadmap.md).
   container formats, path hashing, the texture and mesh pipelines, API
   rationale, caching, and how correctness was established
 - **[docs/roadmap.md](docs/roadmap.md)** — what is not built
+
+## License
+
+MIT — see [LICENSE](LICENSE). Link it into a closed-source mod if you want to;
+nothing here asks anything back beyond keeping the copyright notice.
+
+RedFS is an independent implementation. It is not a port of
+[WolvenKit](https://github.com/WolvenKit/WolvenKit) (GPL-3.0) and carries none of
+its code — what it took is knowledge of the on-disk formats, plus deliberate
+behavioural parity where disagreeing with WolvenKit would mean disagreeing with
+the game. [docs/README.md](docs/README.md#sources) sets out that line in full.

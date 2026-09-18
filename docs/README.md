@@ -61,8 +61,20 @@ there under "considered and rejected", with reasons.
 
 ## Sources
 
-The formats were derived from [WolvenKit](https://github.com/WolvenKit/WolvenKit)'s
-C# implementation, principally `WolvenKit.RED4/Archive/` and
-`WolvenKit.Modkit/RED4/Tools/`, then confirmed against a live 2.3 + Phantom
-Liberty install. WolvenKit is the reference for this format, and its `texconv.dll`
-serves as one of the verification oracles.
+RedFS is an independent implementation in C++. No WolvenKit code was copied into
+it; nothing here is a port or a transliteration of their C#.
+
+What it took from [WolvenKit](https://github.com/WolvenKit/WolvenKit) is knowledge
+of the on-disk formats -- field layouts, offsets, what each header means -- read
+out of their C# as reference documentation, principally `WolvenKit.RED4/Archive/`
+and `WolvenKit.Modkit/RED4/Tools/`, and then confirmed against a live 2.3 +
+Phantom Liberty install. Where a comment in `src/` says a routine "mirrors" or
+"matches" theirs, it means the observable behaviour agrees deliberately, because
+the game is the thing both are reading and disagreeing with WolvenKit would mean
+disagreeing with the game. WolvenKit remains the reference implementation for
+this format, and its `texconv.dll` serves as one of the verification oracles.
+
+RedFS is MIT-licensed (see `LICENSE`); WolvenKit is GPL-3.0. That difference is
+deliberate and rests on the separation above -- a file format is a fact, not an
+expression of it. If you believe any part of this tree crosses that line, open an
+issue and it will be rewritten or removed.

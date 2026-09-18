@@ -51,7 +51,8 @@ which is why it never fell out of the generic path.
 
 ## `.opusinfo` layout
 
-Derived from `WolvenKit.Modkit/RED4/Tools/OpusInfo.cs`. Little-endian.
+Field layout read out of `WolvenKit.Modkit/RED4/Tools/OpusInfo.cs`, which is
+the reference implementation for it; the reader here is our own. Little-endian.
 
 ```
 0x00   12   header      'S' 'N' 'D' ' ' 02 00 00 F0 00 00 00 00
