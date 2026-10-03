@@ -131,6 +131,14 @@ void mutate(std::vector<uint8_t>& data, Rng& rng) {
 // Each target consumes one mutated input and must return without crashing. Any
 // status is acceptable; the contract is memory safety, not success.
 
+// Walks every element, descending into any that is itself an array -- the way a
+// caller reads a C2dArray's rows -- so the inner-array sizing is fuzzed too.
+int walk_elems(uint32_t, const redfs_value* v, void* user) {
+    if (v->kind == REDFS_KIND_ARRAY)
+        redfs_cr2w_walk_array(static_cast<redfs_cr2w*>(user), v, walk_elems, user);
+    return 1;
+}
+
 void fuzz_cr2w(const std::vector<uint8_t>& data) {
     redfs_cr2w* f = nullptr;
     if (redfs_cr2w_open(data.data(), data.size(), &f) != REDFS_OK) return;
@@ -159,9 +167,7 @@ void fuzz_cr2w(const std::vector<uint8_t>& data) {
             [](const char*, const redfs_value* val, void* user) -> int {
                 if (val->kind == REDFS_KIND_ARRAY) {
                     auto* handle = static_cast<redfs_cr2w*>(user);
-                    redfs_cr2w_walk_array(
-                        handle, val,
-                        [](uint32_t, const redfs_value*, void*) -> int { return 1; }, nullptr);
+                    redfs_cr2w_walk_array(handle, val, walk_elems, handle);
                 }
                 return 1;
             },
@@ -242,6 +248,34 @@ int main(int argc, char** argv) {
         b.begin_chunk("Simple");
         b.prop_u32("value", 7);
         b.prop_array_cname("names", {"x", "y", "z"});
+        b.end_chunk();
+        cr2w_corpus.push_back(b.build());
+    }
+    {
+        // A C2dArray: String headers, array:array:String rows, and a material
+        // template's [3]array:<struct> with empty slots.
+        auto str = [](fixture::Buf& out, const char* s) {
+            const size_t n = std::strlen(s);
+            out.u8(static_cast<uint8_t>(0x80 | n));
+            out.raw(s, n);
+        };
+        fixture::Cr2wBuilder b;
+        b.begin_chunk("C2dArray");
+        fixture::Buf headers;
+        str(headers, "Name");
+        str(headers, "Value");
+        b.prop_array("headers", "String", 2, headers.bytes.data(), headers.size());
+        fixture::Buf rows;
+        const char* cells[3][2] = {{"a", "1"}, {"bb", "22"}, {"ccc", ""}};
+        for (const auto& row : cells) {
+            rows.u32(2);
+            for (const char* cell : row) str(rows, cell);
+        }
+        b.prop_array("data", "array:String", 3, rows.bytes.data(), rows.size());
+        fixture::Buf slots;
+        slots.u32(3);
+        for (int i = 0; i < 3; ++i) slots.u32(0);
+        b.prop("samplerStates", "[3]array:SamplerStateInfo", slots.bytes.data(), slots.size());
         b.end_chunk();
         cr2w_corpus.push_back(b.build());
     }

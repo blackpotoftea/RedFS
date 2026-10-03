@@ -1073,6 +1073,260 @@ TEST(cr2w, fixed_size_array_spelling_is_handled) {
     });
 }
 
+namespace {
+// One UTF-8 String/CString element: VLQ prefix 0x80 | len (negative => UTF-8).
+void put_string(fixture::Buf& b, const char* s) {
+    const size_t n = std::strlen(s);
+    b.u8(static_cast<uint8_t>(0x80 | n));
+    b.raw(s, n);
+}
+
+// The same text as UTF-16: a positive prefix counts code units, two bytes each.
+void put_string_utf16(fixture::Buf& b, const char* s) {
+    const size_t n = std::strlen(s);
+    b.u8(static_cast<uint8_t>(n));
+    for (size_t i = 0; i < n; ++i) b.u16(static_cast<uint8_t>(s[i]));
+}
+
+// Collects an array:array:String as rows of text.
+struct Table {
+    std::vector<std::vector<std::string>> rows;
+    redfs_status inner = REDFS_OK;
+    const redfs_cr2w* f = nullptr;
+};
+int collect_row(uint32_t, const redfs_value* v, void* user) {
+    auto* t = static_cast<Table*>(user);
+    if (v->kind != REDFS_KIND_ARRAY) {
+        t->inner = REDFS_E_CORRUPT;
+        return 0;
+    }
+    ElemCollect cells;
+    t->inner = redfs_cr2w_walk_array(t->f, v, collect_elems, &cells);
+    t->rows.push_back(cells.names);
+    return t->inner == REDFS_OK;
+}
+
+// Walks an array of any depth the way a caller would -- every ARRAY element
+// walked in turn -- collecting the integer leaves, the deepest level reached,
+// and the first failure from any level.
+struct Descent {
+    const redfs_cr2w* f = nullptr;
+    std::vector<uint64_t> leaves;
+    int depth = 0;
+    int deepest = 0;
+    redfs_status status = REDFS_OK;
+};
+int descend_elems(uint32_t, const redfs_value* v, void* user) {
+    auto* d = static_cast<Descent*>(user);
+    if (v->kind == REDFS_KIND_UINT) d->leaves.push_back(v->as.u);
+    if (v->kind != REDFS_KIND_ARRAY) return 1;
+    if (++d->depth > d->deepest) d->deepest = d->depth;
+    const redfs_status st = redfs_cr2w_walk_array(d->f, v, descend_elems, d);
+    --d->depth;
+    if (st != REDFS_OK && d->status == REDFS_OK) d->status = st;
+    return st == REDFS_OK;
+}
+redfs_status descend(const redfs_cr2w* f, const char* prop, Descent* d) {
+    d->f = f;
+    redfs_value arr{};
+    const redfs_status got = redfs_cr2w_get(f, 0, prop, &arr);
+    if (got != REDFS_OK) return got;
+    const redfs_status st = redfs_cr2w_walk_array(f, &arr, descend_elems, d);
+    return st != REDFS_OK ? st : d->status;
+}
+}  // namespace
+
+TEST(cr2w, string_table_headers_and_rows) {
+    // C2dArray -- the .csv tables -- declares `headers` as array:String and
+    // `data` as array:array:String. "String" is the RTTI name for CString, and
+    // was unrecognised; the rows are arrays inside an array, which
+    // classify_elements had no layout for, so it guessed a stride and sheared
+    // them. Five rows of two columns, the shape of community_system.csv, with one
+    // empty cell and one UTF-16 cell (the game writes UTF-8, but the format
+    // allows both and a mod's tool may not agree).
+    Cr2wBuilder b;
+    b.begin_chunk("C2dArray");
+
+    fixture::Buf headers;
+    put_string(headers, "Name");
+    put_string_utf16(headers, "Value");
+    b.prop_array("headers", "String", 2, headers.bytes.data(), headers.size());
+
+    const char* cells[5][2] = {{"a", "1"}, {"bb", "22"}, {"ccc", ""}, {"d", "4444"}, {"e", "5"}};
+    fixture::Buf data;
+    for (size_t r = 0; r < 5; ++r) {
+        data.u32(2);
+        put_string(data, cells[r][0]);
+        if (r == 3)
+            put_string_utf16(data, cells[r][1]);
+        else
+            put_string(data, cells[r][1]);
+    }
+    b.prop_array("data", "array:String", 5, data.bytes.data(), data.size());
+    b.end_chunk();
+
+    with_cr2w(b.build(), [&](redfs_cr2w* f) {
+        redfs_value arr{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "headers", &arr));
+        CHECK_EQ((int)arr.kind, (int)REDFS_KIND_ARRAY);
+        ElemCollect h;
+        CHECK_OK(redfs_cr2w_walk_array(f, &arr, collect_elems, &h));
+        CHECK_EQ(h.names.size(), 2u);
+        if (h.names.size() == 2) {
+            CHECK_STR(h.names[0].c_str(), "Name");
+            CHECK_STR(h.names[1].c_str(), "Value");
+        }
+
+        CHECK_OK(redfs_cr2w_get(f, 0, "data", &arr));
+        CHECK_EQ((int)arr.kind, (int)REDFS_KIND_ARRAY);
+        CHECK_EQ(arr.as.u, 5ull);
+        Table t;
+        t.f = f;
+        CHECK_OK(redfs_cr2w_walk_array(f, &arr, collect_row, &t));
+        CHECK_OK(t.inner);
+        CHECK_EQ(t.rows.size(), 5u);
+        for (size_t r = 0; r < t.rows.size() && r < 5; ++r) {
+            CHECK_EQ(t.rows[r].size(), 2u);
+            if (t.rows[r].size() != 2) continue;
+            CHECK_STR(t.rows[r][0].c_str(), cells[r][0]);
+            CHECK_STR(t.rows[r][1].c_str(), cells[r][1]);
+        }
+    });
+}
+
+TEST(cr2w, inner_arrays_of_every_measurable_kind) {
+    // array_end sizes fixed-width elements by count * width, walks text and
+    // arrays one at a time, and accepts an empty inner array of ANY element type
+    // -- material templates carry [3]array:SamplerStateInfo with empty slots,
+    // which no element rule could size but which need none.
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+
+    // Rows of 3, 0 and 1 Uint16s: fixed width, including an empty row.
+    fixture::Buf fixed;
+    fixed.u32(3);
+    fixed.u16(1);
+    fixed.u16(2);
+    fixed.u16(3);
+    fixed.u32(0);
+    fixed.u32(1);
+    fixed.u16(4);
+    b.prop_array("fixed", "array:Uint16", 3, fixed.bytes.data(), fixed.size());
+
+    // The other two array spellings as the inner type; both are count-prefixed.
+    fixture::Buf pairs;
+    pairs.u32(2);
+    pairs.u32(10);
+    pairs.u32(20);
+    pairs.u32(2);
+    pairs.u32(30);
+    pairs.u32(40);
+    b.prop_array("statics", "static:2,Uint32", 2, pairs.bytes.data(), pairs.size());
+    b.prop_array("brackets", "[2]Uint32", 2, pairs.bytes.data(), pairs.size());
+
+    // Three empty slots of a struct type -- the skin.mt shape.
+    fixture::Buf slots;
+    slots.u32(3);
+    for (int i = 0; i < 3; ++i) slots.u32(0);
+    b.prop("samplerStates", "[3]array:SamplerStateInfo", slots.bytes.data(), slots.size());
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        Descent d;
+        CHECK_OK(descend(f, "fixed", &d));
+        CHECK_EQ(d.leaves.size(), 4u);
+        if (d.leaves.size() == 4) {
+            CHECK_EQ(d.leaves[0], 1ull);
+            CHECK_EQ(d.leaves[2], 3ull);
+            CHECK_EQ(d.leaves[3], 4ull);
+        }
+
+        for (const char* name : {"statics", "brackets"}) {
+            Descent p;
+            CHECK_OK(descend(f, name, &p));
+            CHECK_EQ(p.leaves.size(), 4u);
+            if (p.leaves.size() == 4) {
+                CHECK_EQ(p.leaves[0], 10ull);
+                CHECK_EQ(p.leaves[3], 40ull);
+            }
+        }
+
+        redfs_value arr{};
+        CHECK_OK(redfs_cr2w_get(f, 0, "samplerStates", &arr));
+        uint32_t empty_slots = 0;
+        CHECK_OK(redfs_cr2w_walk_array(
+            f, &arr,
+            [](uint32_t, const redfs_value* v, void* user) -> int {
+                if (v->kind == REDFS_KIND_ARRAY && v->as.u == 0) ++*static_cast<uint32_t*>(user);
+                return 1;
+            },
+            &empty_slots));
+        CHECK_EQ(empty_slots, 3u);
+    });
+}
+
+TEST(cr2w, nested_arrays_are_bounded) {
+    // Inner arrays have no enclosing extent, so nothing about them may be
+    // guessed or trusted: a row claiming more elements than it holds fails, a
+    // non-empty inner array of a type with no known width (an enum or struct)
+    // fails, and nesting depth is capped because type names are file data.
+    Cr2wBuilder b;
+    b.begin_chunk("Root");
+
+    // One row claiming four billion elements, holding one. As text it must stop
+    // at the payload; as Uint32 it must not stride count * 4 past it.
+    fixture::Buf overclaim_text;
+    overclaim_text.u32(0xFFFFFFFFu);
+    put_string(overclaim_text, "only");
+    b.prop_array("overclaimText", "array:String", 1, overclaim_text.bytes.data(),
+                 overclaim_text.size());
+    fixture::Buf overclaim_fixed;
+    overclaim_fixed.u32(0xFFFFFFFFu);
+    overclaim_fixed.u32(7);
+    b.prop_array("overclaimFixed", "array:Uint32", 1, overclaim_fixed.bytes.data(),
+                 overclaim_fixed.size());
+
+    fixture::Buf unknown;
+    unknown.u32(1);
+    unknown.u16(b.name("SomeValue"));
+    b.prop_array("unknown", "array:ESomeEnum", 1, unknown.bytes.data(), unknown.size());
+
+    // `inner` array levels below the property's own, each holding one element,
+    // ending in a single Uint8.
+    auto nest = [&](const char* name, int inner) {
+        std::string type = "Uint8";
+        fixture::Buf bytes;
+        for (int i = 0; i < inner; ++i) {
+            type = "array:" + type;
+            bytes.u32(1);
+        }
+        bytes.u8(7);
+        b.prop_array(name, type, 1, bytes.bytes.data(), bytes.size());
+    };
+    nest("atCap", 8);    // kMaxArrayDepth inner levels: readable to the leaf
+    nest("pastCap", 9);  // one more: rejected
+    b.end_chunk();
+
+    with_cr2w(b.build(), [](redfs_cr2w* f) {
+        Descent d;
+        CHECK_ERR(descend(f, "overclaimText", &d), REDFS_E_CORRUPT);
+        Descent e;
+        CHECK_ERR(descend(f, "overclaimFixed", &e), REDFS_E_CORRUPT);
+        Descent u;
+        CHECK_ERR(descend(f, "unknown", &u), REDFS_E_CORRUPT);
+
+        Descent at;
+        CHECK_OK(descend(f, "atCap", &at));
+        CHECK_EQ(at.deepest, 8);
+        CHECK_EQ(at.leaves.size(), 1u);
+        if (at.leaves.size() == 1) CHECK_EQ(at.leaves[0], 7ull);
+
+        Descent past;
+        CHECK_ERR(descend(f, "pastCap", &past), REDFS_E_CORRUPT);
+        CHECK(past.leaves.empty());
+    });
+}
+
 TEST(cr2w, repeated_string_reads_do_not_grow_the_handle) {
     // Every CString decode used to allocate and retain a fresh std::string with no
     // dedup, so a per-frame query grew the handle until it was closed. Decoding

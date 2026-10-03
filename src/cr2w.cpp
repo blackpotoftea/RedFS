@@ -41,20 +41,25 @@ bool starts_with(const char* s, const char* prefix) {
 
 // CDPR's LEB128 variant: first octet keeps the sign in bit 7 and the
 // continuation flag in bit 6; later octets are plain LEB128.
-int32_t read_vlq(const uint8_t*& p, const uint8_t* end) {
+//
+// The magnitude is accumulated unsigned and negated in 64-bit. Five octets carry
+// 34 bits, so a hostile prefix can set bit 31; as int32 that magnitude is
+// INT32_MIN, and negating it is signed overflow -- undefined behaviour, reachable
+// from any CString, String or NodeRef in a mod's file.
+int64_t read_vlq(const uint8_t*& p, const uint8_t* end) {
     if (p >= end) return 0;
     uint8_t b = *p++;
     const bool negative = (b & 0x80) != 0;
-    int32_t value = b & 0x3F;
+    uint32_t value = b & 0x3F;
     int shift = 6;
     bool more = (b & 0x40) != 0;
     while (more && p < end && shift < 32) {
         b = *p++;
-        value |= static_cast<int32_t>(b & 0x7F) << shift;
+        value |= static_cast<uint32_t>(b & 0x7F) << shift;
         shift += 7;
         more = (b & 0x80) != 0;
     }
-    return negative ? -value : value;
+    return negative ? -static_cast<int64_t>(value) : static_cast<int64_t>(value);
 }
 
 // One step of the TLV walk. `name` and `type` default to "" rather than null
@@ -174,13 +179,26 @@ const char* element_type(const char* array_type) {
     return array_type;
 }
 
+// The text types: a VLQ length prefix, then the characters. "String" is the RTTI
+// name the game writes for CString -- C2dArray (the .csv tables) declares
+// `headers` as array:String and `data` as array:array:String. NodeRef shares the
+// encoding; see fixed_width.
+bool is_string_type(const char* type) {
+    return std::strcmp(type, "CString") == 0 || std::strcmp(type, "String") == 0 ||
+           std::strcmp(type, "NodeRef") == 0;
+}
+
+// The three array spellings element_type understands.
+bool is_array_type(const char* type) {
+    return starts_with(type, "array:") || starts_with(type, "static:") || type[0] == '[';
+}
+
 // End of a CString element: a VLQ length prefix, then the characters. UTF-16
 // when the prefix is positive, UTF-8 when negative.
 const uint8_t* cstring_end(const uint8_t* p, const uint8_t* limit) {
     const uint8_t* cursor = p;
-    const int32_t prefix = read_vlq(cursor, limit);
-    const uint64_t chars = static_cast<uint64_t>(prefix < 0 ? -static_cast<int64_t>(prefix)
-                                                            : prefix);
+    const int64_t prefix = read_vlq(cursor, limit);
+    const uint64_t chars = static_cast<uint64_t>(prefix < 0 ? -prefix : prefix);
     const uint64_t bytes = prefix > 0 ? chars * 2 : chars;
     if (static_cast<uint64_t>(limit - cursor) < bytes) return nullptr;
     return cursor + bytes;
@@ -189,7 +207,8 @@ const uint8_t* cstring_end(const uint8_t* p, const uint8_t* limit) {
 // How the elements of an array are laid out.
 //
 // The type name alone is not always enough. fixed_width knows the primitives and
-// the pointer-ish types; CString is self-describing; a struct is a TLV body. What
+// the pointer-ish types; text is self-describing; an array is a count and its own
+// elements, measured one level down; a struct is a TLV body. What
 // is left is a name we do not recognise -- in practice an enum, serialised as a
 // 2-byte name-table index like CName but under a per-enum type name.
 //
@@ -199,17 +218,54 @@ const uint8_t* cstring_end(const uint8_t* p, const uint8_t* limit) {
 // low byte is zero (name index >= 256) -- indistinguishable from a struct's
 // leading zero.
 struct ElementLayout {
-    enum Kind { kFixed, kCString, kStruct } kind;
+    enum Kind { kFixed, kCString, kArray, kStruct } kind;
     uint64_t stride;  // meaningful when kind == kFixed
 };
+
+// Nesting bound for array_end. Type names come from the file's own name table,
+// so "array:array:...:Uint8" is as deep as a mod cares to make it; game data
+// nests two.
+constexpr int kMaxArrayDepth = 8;
+
+// End of an array value -- u32 count, then elements -- or nullptr if it does not
+// parse. This sizes an element that is itself an array, which has no enclosing
+// extent of its own, so classify_elements' divide-evenly guess is unavailable:
+// an inner element type that is not fixed-width, text, or another array fails
+// rather than being guessed at -- unless the count is zero, which needs no
+// element measured. That case is common: material templates carry
+// [3]array:SamplerStateInfo with empty slots.
+const uint8_t* array_end(const char* type, const uint8_t* p, const uint8_t* limit, int depth) {
+    if (depth > kMaxArrayDepth || limit - p < 4) return nullptr;
+    const uint32_t count = rd32(p);
+    p += 4;
+    if (count == 0) return p;
+    const char* elem = element_type(type);
+    if (const uint32_t w = fixed_width(elem)) {
+        const uint64_t bytes = static_cast<uint64_t>(count) * w;
+        if (static_cast<uint64_t>(limit - p) < bytes) return nullptr;
+        return p + bytes;
+    }
+    const bool text = is_string_type(elem);
+    if (!text && !is_array_type(elem)) return nullptr;
+    // Every element consumes at least one byte, so a hostile count is bounded by
+    // the payload, not by the u32.
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint8_t* end = text ? cstring_end(p, limit) : array_end(elem, p, limit, depth + 1);
+        if (!end || end <= p) return nullptr;
+        p = end;
+    }
+    return p;
+}
 
 ElementLayout classify_elements(const char* elem, const uint8_t* first, const uint8_t* limit,
                                 uint32_t count) {
     if (const uint32_t w = fixed_width(elem)) return {ElementLayout::kFixed, w};
     // NodeRef is length-prefixed like CString, so it has to walk rather than
     // stride; see fixed_width for why it is not in the fixed table.
-    if (std::strcmp(elem, "CString") == 0 || std::strcmp(elem, "NodeRef") == 0)
-        return {ElementLayout::kCString, 0};
+    if (is_string_type(elem)) return {ElementLayout::kCString, 0};
+    // Before the divide-evenly guess: a row array that happens to divide evenly
+    // would otherwise stride through its rows as fixed-width blobs.
+    if (is_array_type(elem)) return {ElementLayout::kArray, 0};
 
     if (count > 0) {
         const uint64_t avail = static_cast<uint64_t>(limit - first);
@@ -246,6 +302,9 @@ redfs_status cr2w_walk_array(const redfs_cr2w* f, const redfs_value* array, redf
                 break;
             case ElementLayout::kCString:
                 end = cstring_end(p, limit);
+                break;
+            case ElementLayout::kArray:
+                end = array_end(elem, p, limit, 1);
                 break;
             case ElementLayout::kStruct:
                 end = struct_end(p, limit);
@@ -311,7 +370,7 @@ void cr2w_decode(const redfs_cr2w* f, const char* type, const uint8_t* data, uin
     } else if (eq("CName") && size >= 2) {
         out->kind = REDFS_KIND_NAME;
         out->as.s = f->name(rd16(data));
-    } else if (eq("CString") || eq("NodeRef")) {
+    } else if (is_string_type(type)) {
         // NodeRef shares CString's encoding exactly (see fixed_width). The engine
         // interns it into a hash pool; RedFS hands back the text, which is what a
         // caller resolving a node reference actually wants.
@@ -330,9 +389,8 @@ void cr2w_decode(const redfs_cr2w* f, const char* type, const uint8_t* data, uin
             // is cached like any other result.
             std::string decoded;
             const uint8_t* p = data;
-            const int32_t prefix = read_vlq(p, data + size);
-            const uint64_t chars =
-                static_cast<uint64_t>(prefix < 0 ? -static_cast<int64_t>(prefix) : prefix);
+            const int64_t prefix = read_vlq(p, data + size);
+            const uint64_t chars = static_cast<uint64_t>(prefix < 0 ? -prefix : prefix);
 
             if (prefix > 0) {  // UTF-16
                 if (static_cast<uint64_t>(data + size - p) >= chars * 2) {
@@ -386,8 +444,7 @@ void cr2w_decode(const redfs_cr2w* f, const char* type, const uint8_t* data, uin
                             ? f->str(f->imports[idx - 1].str_offset)
                             : "";
         }
-    } else if (starts_with(type, "array:") || starts_with(type, "static:") ||
-               starts_with(type, "[")) {
+    } else if (is_array_type(type)) {
         if (size >= 4) {
             out->kind = REDFS_KIND_ARRAY;
             out->as.u = rd32(data);

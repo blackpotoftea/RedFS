@@ -101,7 +101,7 @@ ctest --test-dir build               # unit + 4000-iteration fuzz + lifecycle
 | path hashing | 4 | canonical FNV vectors, normalisation, edge cases, decimal round trip |
 | archive index and segments | 7 | round trip, buffers as separate parts, not-found, `read_into` sizing, mount-order overrides, garbage and truncated indices rejected |
 | mount layering | 8 | install scan order, scan flags, deep override chains, REDmod folder order, nested REDmod archives ordered by full path, remount after adding a mod |
-| CR2W | 15 | every value kind, enums, dotted paths into nested structs, handles, deferred buffers (incl. the lowercase spelling), imports, `walk` with early stop, fixed-width / enum / string arrays, repeated string reads, malformed documents, out-of-range chunk index |
+| CR2W | 19 | every value kind, enums, dotted paths into nested structs, handles, deferred buffers (incl. the lowercase spelling), imports, `walk` with early stop, fixed-width / enum / string arrays, **`String` tables and arrays inside arrays** (fixed-width, text and `static:`/`[N]` inner elements, empty inner arrays, the depth cap at its exact boundary, overstated inner counts), repeated string reads, malformed documents, out-of-range chunk index |
 | textures | 4 | descriptor and format mapping, non-texture rejection, **emitted DDS describes its own payload**, absurd mip count rejected rather than spun on |
 | meshes | 5 | chunk decoding, bounds arithmetic, appearances, non-mesh rejection, declared counts not trusted, impossible position stride, **`desc_of` and `mesh_open` agree** |
 | audio | 4 | WEM header parse, PCM duration derivation, RIFF chunk walking, malformed WEM |

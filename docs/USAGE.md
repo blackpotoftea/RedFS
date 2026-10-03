@@ -393,7 +393,7 @@ if (redfs_cr2w_get(f, chunk, "someStruct.someField", &v) == REDFS_OK) {
         case REDFS_KIND_UINT:   use(v.as.u); break;
         case REDFS_KIND_FLOAT:  use(v.as.f); break;
         case REDFS_KIND_NAME:   use(v.as.s); break;    /* CName, or an enum   */
-        case REDFS_KIND_STRING: use(v.as.s); break;    /* CString, or an rRef */
+        case REDFS_KIND_STRING: use(v.as.s); break;    /* CString/String, or an rRef */
         case REDFS_KIND_HANDLE: use(v.as.chunk); break;   /* chunk index, -1 if null */
         case REDFS_KIND_BUFFER: redfs_read(depot, key, v.as.buffer, &buf); break;
         case REDFS_KIND_ARRAY:  redfs_cr2w_walk_array(f, &v, visit, user); break;
@@ -406,6 +406,10 @@ Two kinds deserve attention. `REDFS_KIND_BUFFER` carries an attached-buffer inde
 you pass straight to `redfs_read` — that is how bulk payloads are reached.
 `REDFS_KIND_ARRAY` puts the *declared* element count in `as.u`; prefer
 `redfs_cr2w_walk_array`, which stops early when an element does not decode.
+An element that is itself an array — a `.csv` table's `data` is
+`array:array:String`, one array per row — arrives as another `REDFS_KIND_ARRAY`;
+walk it the same way. An inner array of enums or structs cannot be sized and
+returns `REDFS_E_CORRUPT` unless it is empty.
 
 `redfs_cr2w_walk` enumerates a chunk or a nested struct; `redfs_cr2w_get_in` and
 `redfs_cr2w_walk_in` do the same rooted at a struct value you already resolved,
@@ -744,7 +748,7 @@ Set `REDFS_VERBOSE=1` for internal logging on any of them.
 
 - **`redfs_cr2w` borrows its bytes.** Free the blob only after
   `redfs_cr2w_close`, and copy anything you keep past it.
-- **A `redfs_cr2w` handle is single-threaded.** Decoding a `CString` caches it on
+- **A `redfs_cr2w` handle is single-threaded.** Decoding a `CString` or `String` caches it on
   the handle, so two threads calling `redfs_cr2w_get` on the *same* handle mutate
   the same containers with no lock — heap corruption, not a stale read. One handle
   per thread; the depot underneath is still shared, and the typed helpers are

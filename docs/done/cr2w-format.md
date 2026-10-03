@@ -161,12 +161,11 @@ where it says "var" the value is self-delimiting.
 | `Int64` `Uint64` | 8 | int / uint | |
 | `Double` | 8 | float | |
 | `TweakDBID` | 8 | uint | raw `u64`, not resolved to a name |
-| `NodeRef` | 8 | uint | **wrong — see below** |
 | `handle:X` `whandle:X` | 4 | handle | `i32 - 1` is a chunk index; `-1` is null |
 | `rRef:X` `raRef:X` | 2 | string | `u16 - 1` indexes the **import table**; RedFS returns that import's depot path, or `""` for 0 / out of range |
 | `DataBuffer` | 4 | buffer / raw | `v > 0x80000000` → buffer index `(v ^ 0x80000000) - 1`; `v == 0x80000000` → null; `v < 0x80000000` → `v` **inline** bytes follow and the value is left raw |
 | `SerializationDeferredDataBuffer` | 2 | buffer | `u16 - 1` is a buffer index; 0 is null; matched **case-insensitively** |
-| `CString` | var | string | VLQ length prefix, then the characters |
+| `CString` `String` `NodeRef` | var | string | VLQ length prefix, then the characters |
 | `array:X` `static:N,X` `[N]X` | var | array | `u32` count, then the elements |
 | *unrecognised, exactly 2 bytes* | 2 | name | an enum, stored as a name-table index |
 | *unrecognised, ≥ 3 bytes starting `00`* | var | struct | a nested TLV body |
@@ -178,20 +177,22 @@ those map 1:1 onto the archive segments after the first one — segment
 to `redfs_read`. (`ArchiveWriter` appends one segment per `BufferInfo`, in order,
 which is what pins the correspondence.)
 
-### `NodeRef` is decoded incorrectly
+### Three names for one string encoding
 
-In CR2W, `NodeRef` is a **VLQ length-prefixed string** — the same encoding as
-`CString` — which WolvenKit hashes into `NodeRefPool` after reading
-(`Red4Reader.ReadNodeRef`). `CR2WReader` does not override that method; the only
-overrides are in `RedPackageReader` and the save-file parser, neither of which
-handles CR2W chunk data.
+`String` is the RTTI name the game writes for `CString`: C2dArray, the cooked
+form of the `.csv` tables, declares `headers` as `array:String` and `data` as
+`array:array:String`. WolvenKit reads it with `ReadCString`. RedFS matched only
+`CString` until the tables were read, so a `String` decoded raw — or, at exactly
+2 bytes, as an enum name — and an `array:String` was sized by guessing.
 
-RedFS treats `NodeRef` as a raw 8-byte integer, in both `fixed_width` (array
-striding) and `cr2w_decode`. A `NodeRef` property therefore decodes to whatever
-the first 8 bytes of its length prefix and characters happen to be, and a
-`NodeRef` array strides by 8 instead of walking the strings. Nothing in the
-shipped feature set — textures, meshes — reads a `NodeRef`, which is why this has
-not surfaced. It is recorded here rather than quietly documented as correct.
+`NodeRef` is the same encoding again (`Red4Reader.ReadNodeRef` calls
+`ReadLengthPrefixedString`; its only overrides, in `RedPackageReader` and the
+save-file parser, are not on the CR2W path). RedFS once treated it as an 8-byte
+integer, which strode an `array:NodeRef` through variable-length strings; it now
+decodes to the text.
+
+`is_string_type` holds all three, and every place that sizes or decodes text
+goes through it.
 
 ### Bit fields are not handled
 
@@ -235,7 +236,7 @@ document as if it were payload.
 
 ## VLQ
 
-CDPR's LEB128 variant, used for `CString` and `NodeRef` lengths. The first octet
+CDPR's LEB128 variant, used for `CString`, `String` and `NodeRef` lengths. The first octet
 is special: bit 7 is the **sign**, bit 6 is the **continuation** flag, bits 0–5
 are the low value bits. Later octets are ordinary LEB128 (bit 7 continues, bits
 0–6 carry value). At most five octets — WolvenKit throws if the fifth still has
@@ -247,6 +248,10 @@ The sign selects the encoding, not the length:
 |---|---|---|
 | positive | UTF-16 | `n` code units, `2n` bytes |
 | negative | UTF-8 | `n` bytes |
+
+Five octets carry 34 bits, so a hostile prefix can set bit 31. `read_vlq`
+accumulates the magnitude unsigned and returns it as `int64_t`: as an `int32_t`
+that magnitude is `INT32_MIN`, and negating it is undefined behaviour.
 
 WolvenKit's writer always emits the negative form, noting that every string seen
 in CP77 so far has been UTF-8.
@@ -270,18 +275,45 @@ element sized and decoded as if it were that array.
 `classify_elements` then decides how to step, in this order:
 
 1. **Known fixed width** (`fixed_width`): step by that many bytes.
-2. **`CString`**: self-delimiting, step past the VLQ prefix and its characters.
-3. **Divides evenly**: for an element type name RedFS does not recognise — in
+2. **Text** (`CString`, `String`, `NodeRef`): self-delimiting, step past the VLQ
+   prefix and its characters.
+3. **Another array** (`array:array:String` and the like): measure each element
+   with `array_end` — see below.
+4. **Divides evenly**: for an element type name RedFS does not recognise — in
    practice an enum — if the payload divides exactly by the count and the quotient
    is 1 – 8 bytes, step by that quotient.
-4. **Otherwise a struct**: measure each element by walking its TLV to the
+5. **Otherwise a struct**: measure each element by walking its TLV to the
    terminator.
 
-Step 3 has to come before step 4. Guessing "struct" first misfires on any enum
+Step 3 has to come before step 4: a row array that happens to divide evenly would
+otherwise be strode through as fixed-width blobs, which is exactly how the
+`.csv` tables used to read (`<3 bytes>` per row, then corrupt).
+
+Step 4 has to come before step 5. Guessing "struct" first misfires on any enum
 whose name index is a multiple of 256, because its low byte is zero and therefore
 indistinguishable from a struct's leading zero. The 1 – 8 bound is deliberately
 tight so that a struct array which happens to divide evenly is not mistaken for a
 uniform one.
+
+### Arrays inside arrays
+
+An element that is itself an array is its own `u32` count followed by its own
+elements. `array_end` measures one by the same rules one level down, with one
+difference: the divide-evenly guess needs the array's total extent, and an inner
+array has none until it has been measured. So an inner array's elements must be
+fixed-width, text, or arrays again; anything else — an enum, a struct — is
+rejected as corrupt rather than guessed at. The exception, within the depth cap, is a count of zero,
+which needs no element measured: material templates carry
+`[3]array:SamplerStateInfo` with empty slots.
+
+Nesting is capped at eight inner levels (`kMaxArrayDepth`), because type names are
+file data and a mod can write `array:` as many times as it likes. Game data nests
+two. Every element must advance the cursor, so a hostile count costs at most the
+payload, not four billion iterations.
+
+`walk_array` hands each inner array to the callback as a `REDFS_KIND_ARRAY` value
+spanning exactly the bytes `array_end` measured, so the caller walks a row with
+another `redfs_cr2w_walk_array`.
 
 Because struct elements are measured forward from where the previous one ended,
 iteration is O(total bytes) rather than O(n²) — which is what makes walking a
@@ -293,7 +325,7 @@ mesh's per-chunk arrays cheap.
 alive. Values returned by `get` / `walk` point directly into that blob — no
 copies, no allocation on the query path.
 
-The one exception is `CString`, which needs decoding into a real buffer. Those are
+The one exception is text (`CString`, `String`, `NodeRef`), which needs decoding into a real buffer. Those are
 owned by the handle so `redfs_value::as.s` stays valid as long as the handle does,
 and they are cached by source pointer so a property queried every frame allocates
 once instead of growing the handle.
